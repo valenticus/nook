@@ -55,7 +55,9 @@ pub fn name_ok(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 1024
         && Path::new(path).is_absolute()
-        && !path.chars().any(|c| c.is_control() || FORBIDDEN.contains(&c))
+        && !path
+            .chars()
+            .any(|c| c.is_control() || FORBIDDEN.contains(&c))
 }
 
 /// Whether a path is an existing folder fit to be launched.
@@ -65,18 +67,33 @@ pub fn launchable(path: &str) -> bool {
 
 /// Two paths are the same folder: Windows does not tell `D:\Work` from `d:\work`, other systems do.
 fn same(a: &str, b: &str) -> bool {
-    let (a, b) = (a.trim_end_matches(['\\', '/']), b.trim_end_matches(['\\', '/']));
-    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+    let (a, b) = (
+        a.trim_end_matches(['\\', '/']),
+        b.trim_end_matches(['\\', '/']),
+    );
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// A folder's own name: the last part of its path.
 pub fn folder_name(path: &str) -> String {
-    path.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().filter(|n| !n.is_empty()).unwrap_or(path).to_string()
+    path.trim_end_matches(['\\', '/'])
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// The list with `path` at its front — once, at `at` — and no more than MAX_PROJECTS of them.
 pub fn remember(entries: &[Entry], path: &str, at: u64) -> Vec<Entry> {
-    let mut next = vec![Entry { path: path.to_string(), at }];
+    let mut next = vec![Entry {
+        path: path.to_string(),
+        at,
+    }];
     next.extend(entries.iter().filter(|e| !same(&e.path, path)).cloned());
     next.truncate(MAX_PROJECTS);
     next
@@ -92,12 +109,19 @@ fn entries(store: &Store) -> Vec<Entry> {
         .get(KEY)
         .get("recent")
         .and_then(Value::as_array)
-        .map(|all| all.iter().filter_map(|v| serde_json::from_value::<Entry>(v.clone()).ok()).collect())
+        .map(|all| {
+            all.iter()
+                .filter_map(|v| serde_json::from_value::<Entry>(v.clone()).ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A session was seen running in `cwd`: it goes to the front of the list. A folder that cannot be launched is not kept.
@@ -119,7 +143,11 @@ pub fn list(store: &Store) -> Vec<Project> {
     entries(store)
         .into_iter()
         .filter(|e| launchable(&e.path))
-        .map(|e| Project { name: folder_name(&e.path), path: e.path, at: e.at })
+        .map(|e| Project {
+            name: folder_name(&e.path),
+            path: e.path,
+            at: e.at,
+        })
         .collect()
 }
 
@@ -131,8 +159,12 @@ fn chosen(store: &Store, path: &str) -> Option<String> {
 /// Opens the folder in VS Code: `code` found on PATH as the app finds it for a session's ↗, given the
 /// folder as its one argument. False when there is no `code`, or it did not start.
 pub fn open_in_code(store: &Store, path: &str) -> bool {
-    let Some(folder) = chosen(store, path) else { return false };
-    let Some(code) = crate::platform::find_on_path("code") else { return false };
+    let Some(folder) = chosen(store, path) else {
+        return false;
+    };
+    let Some(code) = crate::platform::find_on_path("code") else {
+        return false;
+    };
     let mut cmd = Command::new(code);
     cmd.arg(&folder);
     crate::platform::no_console(&mut cmd).spawn().is_ok()
@@ -151,29 +183,48 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, at: u64) -> Entry {
-        Entry { path: path.into(), at }
+        Entry {
+            path: path.into(),
+            at,
+        }
     }
 
     fn here() -> String {
         // A folder that exists, as an absolute path.
-        std::env::temp_dir().to_string_lossy().trim_end_matches(['\\', '/']).to_string()
+        std::env::temp_dir()
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_string()
     }
 
     #[test]
     fn a_name_with_anything_a_command_line_could_read_is_refused() {
         let base = here();
         assert!(name_ok(&base));
-        for bad in ["\"", "%", "^", "&", "|", "<", ">", ";", "\n", "\r", "\t", "\u{7}", "\0"] {
-            assert!(!name_ok(&format!("{base}{bad}x")), "{bad:?} must be refused");
-            assert!(!name_ok(&format!("{base}x{bad}")), "{bad:?} must be refused");
+        for bad in [
+            "\"", "%", "^", "&", "|", "<", ">", ";", "\n", "\r", "\t", "\u{7}", "\0",
+        ] {
+            assert!(
+                !name_ok(&format!("{base}{bad}x")),
+                "{bad:?} must be refused"
+            );
+            assert!(
+                !name_ok(&format!("{base}x{bad}")),
+                "{bad:?} must be refused"
+            );
         }
         // Spaces, brackets and accents are plain names.
-        assert!(name_ok(&format!("{base}{}my project (2) é", std::path::MAIN_SEPARATOR)));
+        assert!(name_ok(&format!(
+            "{base}{}my project (2) é",
+            std::path::MAIN_SEPARATOR
+        )));
     }
 
     #[test]
     fn a_path_that_is_not_absolute_is_refused() {
-        for relative in ["", ".", "..", "src", "-rf", "--help", "code", "..\\x", "../x", "x/y"] {
+        for relative in [
+            "", ".", "..", "src", "-rf", "--help", "code", "..\\x", "../x", "x/y",
+        ] {
             assert!(!name_ok(relative), "{relative:?} must be refused");
         }
         assert!(!name_ok(&"a".repeat(2000)));
@@ -183,7 +234,11 @@ mod tests {
     fn only_an_existing_folder_is_launchable() {
         let base = here();
         assert!(launchable(&base));
-        assert!(!launchable(&format!("{base}{}nook-no-such-folder-{}", std::path::MAIN_SEPARATOR, std::process::id())));
+        assert!(!launchable(&format!(
+            "{base}{}nook-no-such-folder-{}",
+            std::path::MAIN_SEPARATOR,
+            std::process::id()
+        )));
         // A file is not a folder.
         let file = std::env::temp_dir().join(format!("nook-projects-{}.txt", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
@@ -198,9 +253,14 @@ mod tests {
         let list = remember(&[a.clone(), b.clone()], "/work/b", 9);
         assert_eq!(list, vec![entry("/work/b", 9), a.clone()]);
         let list = remember(&list, "/work/c", 10);
-        assert_eq!(list.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["/work/c", "/work/b", "/work/a"]);
+        assert_eq!(
+            list.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            ["/work/c", "/work/b", "/work/a"]
+        );
         // Past the cap the oldest go.
-        let mut long: Vec<Entry> = (0..MAX_PROJECTS as u64).map(|i| entry(&format!("/w/{i}"), i)).collect();
+        let mut long: Vec<Entry> = (0..MAX_PROJECTS as u64)
+            .map(|i| entry(&format!("/w/{i}"), i))
+            .collect();
         long = remember(&long, "/w/new", 99);
         assert_eq!(long.len(), MAX_PROJECTS);
         assert_eq!(long[0].path, "/w/new");

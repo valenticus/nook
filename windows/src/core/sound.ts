@@ -12,7 +12,7 @@ export const SOUND_NAMES = [
 
 export type SoundName = (typeof SOUND_NAMES)[number];
 
-class SoundEngine {
+export class SoundEngine {
   enabled = true;
   volume = 0.12;
 
@@ -31,7 +31,7 @@ class SoundEngine {
       const ctx = new Ctor();
       this.ctx = ctx;
       const master = ctx.createGain();
-      master.gain.value = this.volume;
+      master.gain.value = this.enabled ? this.volume : 0;
       master.connect(ctx.destination);
       this.master = master;
       await Promise.all(
@@ -77,19 +77,20 @@ class SoundEngine {
 
   setVolume(v: number) {
     this.volume = Math.max(0, Math.min(0.2, v));
-    if (this.master) this.master.gain.value = this.volume;
+    if (this.master) this.master.gain.value = this.enabled ? this.volume : 0;
   }
 
   setEnabled(on: boolean) {
     this.enabled = on;
+    if (this.master) this.master.gain.value = on ? this.volume : 0;
   }
 
-  play(name: SoundName | string) {
-    if (!this.enabled) return;
+  play(name: SoundName | string): boolean {
+    if (!this.enabled) return false;
     const ctx = this.ctx;
     const master = this.master;
     const buf = this.buffers.get(name);
-    if (!ctx || !master || !buf) return;
+    if (!ctx || !master || !buf) return false;
     if (this.idleTimer != null) {
       window.clearTimeout(this.idleTimer);
       this.idleTimer = null;
@@ -99,6 +100,7 @@ class SoundEngine {
     src.buffer = buf;
     src.connect(master);
     src.start();
+    return true;
   }
 }
 

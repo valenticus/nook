@@ -9,6 +9,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    /// "auto" follows the Windows/WebView locale; explicit choices are "uk" or "en".
+    pub language: String,
     pub sound_enabled: bool,
     pub sound_volume: f64,
     pub auto_close_interval: f64,
@@ -98,6 +100,10 @@ pub struct Settings {
     /// Settings → Codex: Codex's sessions are shown beside Claude Code's.
     #[serde(default = "default_true")]
     pub show_codex_sessions: bool,
+    /// Explicit opt-in to run the Codex Desktop app-server against the user's existing profile.
+    #[cfg(feature = "codex-quota")]
+    #[serde(default)]
+    pub codex_quota_enabled: bool,
     /// Settings → About: Nook asks GitHub for its latest release once a day
     /// (update.rs). Off until the user switches it on: it is the one thing that
     /// uses the network.
@@ -127,7 +133,11 @@ fn default_hide_shortcut() -> String {
 /// anything else (the file was edited by hand). The settings window only ever
 /// writes one that was registered.
 fn hide_shortcut(said: &str) -> String {
-    if crate::shortcut::check(said).is_ok() { said.trim().to_string() } else { default_hide_shortcut() }
+    if crate::shortcut::check(said).is_ok() {
+        said.trim().to_string()
+    } else {
+        default_hide_shortcut()
+    }
 }
 
 /// What the agents shortcut is out of the box: no Ctrl+Alt with a letter (AltGr).
@@ -137,7 +147,11 @@ fn default_agents_shortcut() -> String {
 
 /// The agents shortcut as it is kept, as `hide_shortcut` keeps its own.
 fn agents_shortcut(said: &str) -> String {
-    if crate::shortcut::check(said).is_ok() { said.trim().to_string() } else { default_agents_shortcut() }
+    if crate::shortcut::check(said).is_ok() {
+        said.trim().to_string()
+    } else {
+        default_agents_shortcut()
+    }
 }
 
 fn default_true() -> bool {
@@ -146,16 +160,20 @@ fn default_true() -> bool {
 
 /// The delay as it is kept: one of the choices, or the default for anything else.
 pub fn folded_auto_hide(said: f64) -> f64 {
-    if FOLDED_AUTO_HIDE.contains(&said) { said } else { default_folded_auto_hide() }
+    if FOLDED_AUTO_HIDE.contains(&said) {
+        said
+    } else {
+        default_folded_auto_hide()
+    }
 }
 
 /// Everything the compact island can show a number for.
-pub const COMPACT_METRICS: &[&str] = &["cpu", "gpu", "ram", "usage5h", "usage7d", "waiting"];
+pub const COMPACT_METRICS: &[&str] = &["usage5h", "usage7d", "waiting"];
 /// As many of them as it has room for.
 pub const MAX_COMPACT_METRICS: usize = 3;
 
 fn default_compact_metrics() -> Vec<String> {
-    ["cpu", "ram", "usage5h"].map(String::from).to_vec()
+    ["usage5h", "usage7d", "waiting"].map(String::from).to_vec()
 }
 
 /// A choice of compact metrics as it is kept: the ones Nook knows, each once,
@@ -164,11 +182,34 @@ fn default_compact_metrics() -> Vec<String> {
 pub fn compact_metrics(picked: &[String]) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     for metric in picked {
-        if kept.len() < MAX_COMPACT_METRICS && COMPACT_METRICS.contains(&metric.as_str()) && !kept.contains(metric) {
+        if kept.len() < MAX_COMPACT_METRICS
+            && COMPACT_METRICS.contains(&metric.as_str())
+            && !kept.contains(metric)
+        {
             kept.push(metric.clone());
         }
     }
-    kept
+    if !picked.is_empty() && kept.is_empty() {
+        return default_compact_metrics();
+    }
+    if kept.iter().any(|metric| metric == "usage5h" || metric == "usage7d") {
+        let mut paired: Vec<String> = Vec::new();
+        let mut inserted_quota_pair = false;
+        for metric in kept {
+            if metric == "usage5h" || metric == "usage7d" {
+                if !inserted_quota_pair {
+                    paired.push("usage5h".to_string());
+                    paired.push("usage7d".to_string());
+                }
+                inserted_quota_pair = true;
+            } else {
+                paired.push(metric);
+            }
+        }
+        paired
+    } else {
+        kept
+    }
 }
 
 /// What `theme` can say, and `reduce_motion`: the first of each is the default.
@@ -197,7 +238,11 @@ fn default_shelf_order() -> Vec<String> {
 
 /// One of `known`, or the first of them: a word Nook does not know is not kept.
 pub fn one_of(known: &[&str], said: &str) -> String {
-    known.iter().find(|word| **word == said).unwrap_or(&known[0]).to_string()
+    known
+        .iter()
+        .find(|word| **word == said)
+        .unwrap_or(&known[0])
+        .to_string()
 }
 
 /// The widgets Nook knows among `said`, each once, in the order said.
@@ -237,6 +282,7 @@ impl Settings {
     /// Holds what a page, or a file edited by hand, said to what Nook knows.
     /// Nothing that fails here is an error: the nearest valid choice is kept.
     pub fn validated(mut self) -> Self {
+        self.language = one_of(&["auto", "uk", "en"], &self.language);
         self.compact_metrics = compact_metrics(&self.compact_metrics);
         self.dock = one_of(crate::dock::DOCKS, &self.dock);
         self.theme = one_of(THEMES, &self.theme);
@@ -252,9 +298,15 @@ impl Settings {
             self.agents_list_x = None;
             self.agents_list_y = None;
         }
-        self.agents_list_w = self.agents_list_w.filter(|w| (crate::agents::MIN_WIDTH as u32..=crate::agents::MAX_WIDTH as u32).contains(w));
-        self.agents_list_h = self.agents_list_h.filter(|h| (crate::agents::MIN_HEIGHT as u32..=crate::agents::MAX_CAP as u32).contains(h));
-        self.agents_list_fade_opacity = self.agents_list_fade_opacity.clamp(*FADE_OPACITY.start(), *FADE_OPACITY.end());
+        self.agents_list_w = self.agents_list_w.filter(|w| {
+            (crate::agents::MIN_WIDTH as u32..=crate::agents::MAX_WIDTH as u32).contains(w)
+        });
+        self.agents_list_h = self.agents_list_h.filter(|h| {
+            (crate::agents::MIN_HEIGHT as u32..=crate::agents::MAX_CAP as u32).contains(h)
+        });
+        self.agents_list_fade_opacity = self
+            .agents_list_fade_opacity
+            .clamp(*FADE_OPACITY.start(), *FADE_OPACITY.end());
         self
     }
 }
@@ -262,6 +314,7 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            language: "auto".into(),
             sound_enabled: true,
             sound_volume: 0.12,
             auto_close_interval: 15.0,
@@ -299,6 +352,8 @@ impl Default for Settings {
             hide_in_fullscreen: true,
             show_cursor_sessions: true,
             show_codex_sessions: true,
+            #[cfg(feature = "codex-quota")]
+            codex_quota_enabled: false,
             check_updates: false,
         }
     }
@@ -308,6 +363,94 @@ pub use crate::platform::{config_dir, local_dir};
 
 pub fn hook_exe_path() -> PathBuf {
     local_dir().join("bin").join(crate::platform::HOOK_EXE)
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    #[test]
+    fn dev_data_paths_use_a_separate_namespace() {
+        let config = config_dir();
+        let local = local_dir();
+        if cfg!(feature = "nook-dev") {
+            let expected = if cfg!(windows) { "NookDev" } else { "nook-dev" };
+            assert_eq!(config.file_name().and_then(|s| s.to_str()), Some(expected));
+            assert_eq!(local.file_name().and_then(|s| s.to_str()), Some(expected));
+        } else if cfg!(feature = "nook-standalone") {
+            let expected = if cfg!(windows) {
+                "NookStandalone"
+            } else {
+                "nook-standalone"
+            };
+            assert_eq!(config.file_name().and_then(|s| s.to_str()), Some(expected));
+            assert_eq!(local.file_name().and_then(|s| s.to_str()), Some(expected));
+            assert_eq!(
+                hook_exe_path().file_name().and_then(|s| s.to_str()),
+                Some(crate::platform::HOOK_EXE)
+            );
+        } else {
+            let expected = if cfg!(windows) { "Nook" } else { "nook" };
+            assert_eq!(config.file_name().and_then(|s| s.to_str()), Some(expected));
+            assert_eq!(local.file_name().and_then(|s| s.to_str()), Some(expected));
+        }
+    }
+
+    #[test]
+    fn dev_window_configuration_matches_production_except_title() {
+        let production: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let dev: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.nook-dev.conf.json")).unwrap();
+        assert_eq!(dev["productName"], "Nook Dev");
+        assert_eq!(dev["identifier"], "io.github.zubairbinshaukat.nook.dev");
+        assert_eq!(dev["mainBinaryName"], "nook-dev");
+
+        let production_window = &production["app"]["windows"][0];
+        let mut dev_window = dev["app"]["windows"][0].clone();
+        assert_eq!(dev_window["title"], "Nook Dev");
+        dev_window["title"] = production_window["title"].clone();
+        assert_eq!(dev_window, *production_window);
+
+        assert_eq!(
+            dev["bundle"]["windows"]["nsis"]["installerHooks"],
+            "nsis/dev-hooks.nsh"
+        );
+        let dev_uninstall_hook = include_str!("../nsis/dev-hooks.nsh");
+        assert!(!dev_uninstall_hook.contains("$LOCALAPPDATA\\Nook"));
+    }
+
+    #[test]
+    fn standalone_identity_is_separate_from_original_and_dev() {
+        let production: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let standalone: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.nook-standalone.conf.json")).unwrap();
+        assert_eq!(production["version"], "0.2.2");
+        assert_eq!(production["productName"], "Nook");
+        assert_eq!(production["identifier"], "io.github.zubairbinshaukat.nook");
+        assert_eq!(standalone["productName"], "Nook Personal Edition");
+        assert_eq!(standalone["version"], "0.1.0");
+        assert_eq!(standalone["identifier"], "io.github.valenticus.nook");
+        assert_eq!(standalone["mainBinaryName"], "nook-standalone");
+        assert_ne!(standalone["identifier"], "io.github.zubairbinshaukat.nook");
+        assert_ne!(
+            standalone["identifier"],
+            "io.github.zubairbinshaukat.nook.dev"
+        );
+        assert_eq!(
+            standalone["bundle"]["resources"]
+                ["../target-nook-standalone/release/nook-hook-standalone.exe"],
+            "nook-hook-standalone.exe"
+        );
+        assert!(standalone["bundle"]["resources"]["../target/release/nook-hook.exe"].is_null());
+        assert_eq!(
+            standalone["bundle"]["resources"]["../../LICENSE"],
+            "LICENSE"
+        );
+        assert_eq!(standalone["bundle"]["resources"]["../../NOTICE"], "NOTICE");
+        assert!(standalone["bundle"]["windows"]["nsis"]["installerHooks"].is_null());
+    }
 }
 
 fn settings_path() -> PathBuf {
@@ -359,20 +502,63 @@ mod tests {
     }
 
     #[test]
+    fn language_defaults_to_auto_and_rejects_unknown_preferences() {
+        let old: Settings = serde_json::from_str(r#"{"soundEnabled":false}"#).unwrap();
+        assert_eq!(old.language, "auto");
+        assert_eq!(Settings::default().language, "auto");
+        for language in ["auto", "uk", "en"] {
+            assert_eq!(
+                Settings {
+                    language: language.into(),
+                    ..Settings::default()
+                }
+                .validated()
+                .language,
+                language
+            );
+        }
+        assert_eq!(
+            Settings {
+                language: "fr".into(),
+                ..Settings::default()
+            }
+            .validated()
+            .language,
+            "auto"
+        );
+    }
+
+    #[test]
+    fn selected_language_survives_settings_serialization() {
+        for language in ["uk", "en"] {
+            let selected = Settings { language: language.into(), ..Settings::default() };
+            let stored = serde_json::to_string(&selected).unwrap();
+            let restored: Settings = serde_json::from_str(&stored).unwrap();
+            assert_eq!(restored.language, language);
+        }
+    }
+
+    #[test]
     fn the_hide_shortcut_is_kept_when_it_can_be_taken_and_is_the_default_when_it_cannot() {
         let said = r#"{"hideShortcut":" Ctrl+Shift+F9 ","hideShortcutEnabled":false}"#;
         let settings = serde_json::from_str::<Settings>(said).unwrap().validated();
         assert_eq!(settings.hide_shortcut, "Ctrl+Shift+F9");
         assert!(!settings.hide_shortcut_enabled);
         for bad in ["", "N", "Ctrl+Alt+Delete", "Ctrl+C", "nonsense"] {
-            let settings = Settings { hide_shortcut: bad.into(), ..Settings::default() }.validated();
+            let settings = Settings {
+                hide_shortcut: bad.into(),
+                ..Settings::default()
+            }
+            .validated();
             assert_eq!(settings.hide_shortcut, "Ctrl+Alt+N", "{bad:?}");
         }
     }
 
     #[test]
     fn the_agents_list_is_off_by_default_and_an_older_file_loads_without_it() {
-        let old: Settings = serde_json::from_str(r#"{"soundEnabled":false,"hideShortcut":"Ctrl+Shift+F9"}"#).unwrap();
+        let old: Settings =
+            serde_json::from_str(r#"{"soundEnabled":false,"hideShortcut":"Ctrl+Shift+F9"}"#)
+                .unwrap();
         assert!(!old.show_agents_list);
         assert_eq!((old.agents_list_x, old.agents_list_y), (None, None));
         assert_eq!(old.agents_list_w, None);
@@ -380,13 +566,31 @@ mod tests {
         assert!(old.agents_shortcut_enabled);
         assert!(!Settings::default().show_agents_list);
         // Written in camelCase, and read back as written.
-        let on = Settings { show_agents_list: true, agents_list_x: Some(-1200), agents_list_y: Some(40), ..Settings::default() }.validated();
+        let on = Settings {
+            show_agents_list: true,
+            agents_list_x: Some(-1200),
+            agents_list_y: Some(40),
+            ..Settings::default()
+        }
+        .validated();
         let json = serde_json::to_string(&on).unwrap();
-        for key in [r#""showAgentsList":true"#, r#""agentsListX":-1200"#, r#""agentsListY":40"#, r#""agentsShortcut":"Ctrl+Shift+L""#] {
+        for key in [
+            r#""showAgentsList":true"#,
+            r#""agentsListX":-1200"#,
+            r#""agentsListY":40"#,
+            r#""agentsShortcut":"Ctrl+Shift+L""#,
+        ] {
             assert!(json.contains(key), "{key} in {json}");
         }
         let back = serde_json::from_str::<Settings>(&json).unwrap().validated();
-        assert_eq!((back.show_agents_list, back.agents_list_x, back.agents_list_y), (true, Some(-1200), Some(40)));
+        assert_eq!(
+            (
+                back.show_agents_list,
+                back.agents_list_x,
+                back.agents_list_y
+            ),
+            (true, Some(-1200), Some(40))
+        );
     }
 
     #[test]
@@ -396,17 +600,33 @@ mod tests {
         assert_eq!(settings.agents_shortcut, "Ctrl+Shift+F9");
         assert!(!settings.agents_shortcut_enabled);
         for bad in ["", "L", "Ctrl+Alt+Delete", "Ctrl+C", "nonsense"] {
-            let settings = Settings { agents_shortcut: bad.into(), ..Settings::default() }.validated();
+            let settings = Settings {
+                agents_shortcut: bad.into(),
+                ..Settings::default()
+            }
+            .validated();
             assert_eq!(settings.agents_shortcut, "Ctrl+Shift+L", "{bad:?}");
         }
         // Half a position is no position.
-        let half = Settings { agents_list_x: Some(10), agents_list_y: None, ..Settings::default() }.validated();
+        let half = Settings {
+            agents_list_x: Some(10),
+            agents_list_y: None,
+            ..Settings::default()
+        }
+        .validated();
         assert_eq!((half.agents_list_x, half.agents_list_y), (None, None));
     }
 
     #[test]
     fn the_agents_list_width_is_kept_between_its_limits_or_dropped() {
-        let width = |w: Option<u32>| Settings { agents_list_w: w, ..Settings::default() }.validated().agents_list_w;
+        let width = |w: Option<u32>| {
+            Settings {
+                agents_list_w: w,
+                ..Settings::default()
+            }
+            .validated()
+            .agents_list_w
+        };
         assert_eq!(width(Some(280)), Some(280));
         assert_eq!(width(Some(400)), Some(400));
         assert_eq!(width(Some(640)), Some(640));
@@ -415,14 +635,33 @@ mod tests {
         }
         assert_eq!(width(None), None);
         // Written in camelCase, and read back as written.
-        let json = serde_json::to_string(&Settings { agents_list_w: Some(412), ..Settings::default() }.validated()).unwrap();
+        let json = serde_json::to_string(
+            &Settings {
+                agents_list_w: Some(412),
+                ..Settings::default()
+            }
+            .validated(),
+        )
+        .unwrap();
         assert!(json.contains(r#""agentsListW":412"#), "{json}");
-        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap().agents_list_w, Some(412));
+        assert_eq!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .agents_list_w,
+            Some(412)
+        );
     }
 
     #[test]
     fn the_agents_list_height_cap_is_kept_between_its_limits_or_dropped() {
-        let cap = |h: Option<u32>| Settings { agents_list_h: h, ..Settings::default() }.validated().agents_list_h;
+        let cap = |h: Option<u32>| {
+            Settings {
+                agents_list_h: h,
+                ..Settings::default()
+            }
+            .validated()
+            .agents_list_h
+        };
         for good in [72, 300, 520, 2000] {
             assert_eq!(cap(Some(good)), Some(good));
         }
@@ -431,60 +670,138 @@ mod tests {
         }
         assert_eq!(cap(None), None);
         // A file from before it loads with the default; written in camelCase, read back as written.
-        assert_eq!(serde_json::from_str::<Settings>(r#"{"agentsListW":400}"#).unwrap().agents_list_h, None);
-        let json = serde_json::to_string(&Settings { agents_list_h: Some(333), ..Settings::default() }.validated()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Settings>(r#"{"agentsListW":400}"#)
+                .unwrap()
+                .agents_list_h,
+            None
+        );
+        let json = serde_json::to_string(
+            &Settings {
+                agents_list_h: Some(333),
+                ..Settings::default()
+            }
+            .validated(),
+        )
+        .unwrap();
         assert!(json.contains(r#""agentsListH":333"#), "{json}");
-        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap().agents_list_h, Some(333));
+        assert_eq!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .agents_list_h,
+            Some(333)
+        );
     }
 
     #[test]
     fn the_agents_list_fades_by_default_and_its_opacity_is_held_to_its_range() {
-        let old: Settings = serde_json::from_str(r#"{"soundEnabled":false,"agentsListW":400}"#).unwrap();
+        let old: Settings =
+            serde_json::from_str(r#"{"soundEnabled":false,"agentsListW":400}"#).unwrap();
         assert!(old.agents_list_fade);
         assert_eq!(old.agents_list_fade_opacity, 50);
         let defaults = Settings::default().validated();
-        assert_eq!((defaults.agents_list_fade, defaults.agents_list_fade_opacity), (true, 50));
-        let opacity = |said: u32| Settings { agents_list_fade_opacity: said, ..Settings::default() }.validated().agents_list_fade_opacity;
-        assert_eq!((opacity(0), opacity(19), opacity(20), opacity(55), opacity(90), opacity(91), opacity(5000)), (20, 20, 20, 55, 90, 90, 90));
-        let off = Settings { agents_list_fade: false, agents_list_fade_opacity: 35, ..Settings::default() }.validated();
+        assert_eq!(
+            (defaults.agents_list_fade, defaults.agents_list_fade_opacity),
+            (true, 50)
+        );
+        let opacity = |said: u32| {
+            Settings {
+                agents_list_fade_opacity: said,
+                ..Settings::default()
+            }
+            .validated()
+            .agents_list_fade_opacity
+        };
+        assert_eq!(
+            (
+                opacity(0),
+                opacity(19),
+                opacity(20),
+                opacity(55),
+                opacity(90),
+                opacity(91),
+                opacity(5000)
+            ),
+            (20, 20, 20, 55, 90, 90, 90)
+        );
+        let off = Settings {
+            agents_list_fade: false,
+            agents_list_fade_opacity: 35,
+            ..Settings::default()
+        }
+        .validated();
         let json = serde_json::to_string(&off).unwrap();
         for key in [r#""agentsListFade":false"#, r#""agentsListFadeOpacity":35"#] {
             assert!(json.contains(key), "{key} in {json}");
         }
         let back = serde_json::from_str::<Settings>(&json).unwrap().validated();
-        assert_eq!((back.agents_list_fade, back.agents_list_fade_opacity), (false, 35));
+        assert_eq!(
+            (back.agents_list_fade, back.agents_list_fade_opacity),
+            (false, 35)
+        );
     }
 
     #[test]
-    fn the_compact_metrics_default_when_a_file_has_none_and_are_kept_to_what_is_known() {
+    fn compact_choices_default_and_old_values_are_filtered() {
         let words = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // A file from before them: the default three.
+        // Old settings can contain choices the current app no longer supports.
         let old: Settings = serde_json::from_str(r#"{"soundEnabled":false}"#).unwrap();
-        assert_eq!(old.compact_metrics, words(&["cpu", "ram", "usage5h"]));
+        assert_eq!(old.compact_metrics, words(&["usage5h", "usage7d", "waiting"]));
         assert_eq!(Settings::default().compact_metrics, old.compact_metrics);
         // Saved in camelCase, read back in the order picked.
-        let picked = Settings { compact_metrics: words(&["waiting", "usage7d"]), ..Settings::default() };
+        let picked = Settings {
+            compact_metrics: words(&["waiting", "usage7d"]),
+            ..Settings::default()
+        };
         let json = serde_json::to_string(&picked).unwrap();
         assert!(json.contains(r#""compactMetrics":["waiting","usage7d"]"#));
-        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap().compact_metrics, picked.compact_metrics);
+        assert_eq!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .compact_metrics,
+            picked.compact_metrics
+        );
         // None at all is a choice.
-        assert_eq!(serde_json::from_str::<Settings>(r#"{"compactMetrics":[]}"#).unwrap().compact_metrics, words(&[]));
+        assert_eq!(
+            serde_json::from_str::<Settings>(r#"{"compactMetrics":[]}"#)
+                .unwrap()
+                .compact_metrics,
+            words(&[])
+        );
 
         // Unknown ones go, a repeat counts once, and the fourth is one too many.
-        assert_eq!(compact_metrics(&words(&["disk", "ram", "ram", "cpu", "", "RAM"])), words(&["ram", "cpu"]));
-        assert_eq!(compact_metrics(&words(&["cpu", "ram", "usage5h", "usage7d", "waiting"])), words(&["cpu", "ram", "usage5h"]));
-        assert_eq!(compact_metrics(&words(&["waiting", "bogus", "usage7d", "cpu", "ram"])), words(&["waiting", "usage7d", "cpu"]));
+        assert_eq!(
+            compact_metrics(&words(&[
+                "cpu", "gpu", "ram", "usage5h", "usage7d", "waiting"
+            ])),
+            words(&["usage5h", "usage7d", "waiting"])
+        );
+        assert_eq!(
+            compact_metrics(&words(&["waiting", "bogus", "usage7d", "usage5h"])),
+            words(&["waiting", "usage5h", "usage7d"])
+        );
         assert_eq!(compact_metrics(&[]), words(&[]));
-        // The graphics processor is one of them.
-        assert_eq!(compact_metrics(&words(&["gpu", "cpu", "GPU", "gpu"])), words(&["gpu", "cpu"]));
+        assert_eq!(
+            compact_metrics(&words(&["cpu", "gpu", "ram"])),
+            words(&["usage5h", "usage7d", "waiting"])
+        );
     }
 
     #[test]
     fn a_file_from_before_the_new_window_loads_with_its_defaults() {
         let words = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let old: Settings = serde_json::from_str(r#"{"soundEnabled":false,"compactMetrics":["ram"]}"#).unwrap();
+        let old: Settings = serde_json::from_str::<Settings>(
+            r#"{"soundEnabled":false,"compactMetrics":["ram","usage5h"]}"#,
+        )
+        .unwrap()
+        .validated();
         assert!(!old.sound_enabled);
-        assert_eq!(old.compact_metrics, words(&["ram"]));
+        assert_eq!(old.compact_metrics, words(&["usage5h", "usage7d"]));
+        let legacy_only: Settings =
+            serde_json::from_str::<Settings>(r#"{"compactMetrics":["cpu","gpu","ram"]}"#)
+                .unwrap()
+                .validated();
+        assert_eq!(legacy_only.compact_metrics, words(&["usage5h", "usage7d", "waiting"]));
         assert_eq!(old.theme, "system");
         assert_eq!(old.reduce_motion, "system");
         assert_eq!(old.bot_theme, "cream");
@@ -492,10 +809,16 @@ mod tests {
         assert_eq!(old.shelf_hidden, words(&[]));
         // The defaults are valid as they are, and are written in camelCase.
         let json = serde_json::to_string(&Settings::default().validated()).unwrap();
-        for key in [r#""theme":"system""#, r#""reduceMotion":"system""#, r#""botTheme":"cream""#, r#""shelfHidden":[]"#] {
+        for key in [
+            r#""theme":"system""#,
+            r#""reduceMotion":"system""#,
+            r#""botTheme":"cream""#,
+            r#""shelfHidden":[]"#,
+        ] {
             assert!(json.contains(key), "{key} in {json}");
         }
-        assert!(json.contains(r#""shelfOrder":["media","todo","timer","reminders","mirror","projects"]"#));
+        assert!(json
+            .contains(r#""shelfOrder":["media","todo","timer","reminders","mirror","projects"]"#));
     }
 
     #[test]
@@ -519,10 +842,19 @@ mod tests {
 
         // The order always holds every widget once: unknown ids go, a repeat
         // counts once, and what was left out follows in the usual order.
-        assert_eq!(shelf_order(&words(&["projects", "media"])), words(&["projects", "media", "todo", "timer", "reminders", "mirror"]));
-        assert_eq!(shelf_order(&words(&["timer", "bogus", "timer", "", "Media"])), words(&["timer", "media", "todo", "reminders", "mirror", "projects"]));
+        assert_eq!(
+            shelf_order(&words(&["projects", "media"])),
+            words(&["projects", "media", "todo", "timer", "reminders", "mirror"])
+        );
+        assert_eq!(
+            shelf_order(&words(&["timer", "bogus", "timer", "", "Media"])),
+            words(&["timer", "media", "todo", "reminders", "mirror", "projects"])
+        );
         assert_eq!(shelf_order(&[]), words(SHELF_WIDGETS));
-        assert_eq!(shelf_hidden(&words(&["mirror", "mirror", "camera", "todo"])), words(&["mirror", "todo"]));
+        assert_eq!(
+            shelf_hidden(&words(&["mirror", "mirror", "camera", "todo"])),
+            words(&["mirror", "todo"])
+        );
         assert_eq!(shelf_hidden(&[]), words(&[]));
 
         // All of it at once, as `save_settings` and `load` do.
@@ -532,7 +864,7 @@ mod tests {
             bot_theme: "lilac".into(),
             shelf_order: words(&["mirror", "nope"]),
             shelf_hidden: words(&["nope", "media"]),
-            compact_metrics: words(&["disk", "cpu", "gpu"]),
+            compact_metrics: words(&["disk", "cpu", "gpu", "ram", "usage5h"]),
             ..Settings::default()
         }
         .validated();
@@ -542,18 +874,27 @@ mod tests {
         assert_eq!(said.shelf_order[0], "mirror");
         assert_eq!(said.shelf_order.len(), SHELF_WIDGETS.len());
         assert_eq!(said.shelf_hidden, words(&["media"]));
-        assert_eq!(said.compact_metrics, words(&["cpu", "gpu"]));
+        assert_eq!(said.compact_metrics, words(&["usage5h", "usage7d"]));
     }
 
     #[test]
     fn the_visibility_settings_default_and_are_held_to_their_choices() {
         // A file from before them: a minute, hide whatever the sessions do, stay out of full-screen apps.
-        let old: Settings = serde_json::from_str(r#"{"soundEnabled":false,"compactMetrics":["ram"]}"#).unwrap();
+        let old: Settings =
+            serde_json::from_str(r#"{"soundEnabled":false,"compactMetrics":["ram","usage5h"]}"#)
+                .unwrap();
         assert_eq!(old.folded_auto_hide, 60.0);
         assert!(!old.hide_only_when_idle);
         assert!(old.hide_in_fullscreen);
         let defaults = Settings::default();
-        assert_eq!((defaults.folded_auto_hide, defaults.hide_only_when_idle, defaults.hide_in_fullscreen), (60.0, false, true));
+        assert_eq!(
+            (
+                defaults.folded_auto_hide,
+                defaults.hide_only_when_idle,
+                defaults.hide_in_fullscreen
+            ),
+            (60.0, false, true)
+        );
 
         // Each choice is kept, "never" among them; anything else is a minute.
         for choice in FOLDED_AUTO_HIDE {
@@ -562,50 +903,115 @@ mod tests {
         for said in [-1.0, 1.0, 7.5, 61.0, 3600.0, f64::NAN, f64::INFINITY] {
             assert_eq!(folded_auto_hide(said), 60.0, "{said}");
         }
-        let said = Settings { folded_auto_hide: 12.0, hide_only_when_idle: true, hide_in_fullscreen: false, ..Settings::default() }.validated();
-        assert_eq!((said.folded_auto_hide, said.hide_only_when_idle, said.hide_in_fullscreen), (60.0, true, false));
+        let said = Settings {
+            folded_auto_hide: 12.0,
+            hide_only_when_idle: true,
+            hide_in_fullscreen: false,
+            ..Settings::default()
+        }
+        .validated();
+        assert_eq!(
+            (
+                said.folded_auto_hide,
+                said.hide_only_when_idle,
+                said.hide_in_fullscreen
+            ),
+            (60.0, true, false)
+        );
 
         // Written in camelCase, and read back as written.
-        let never = Settings { folded_auto_hide: 0.0, hide_only_when_idle: true, hide_in_fullscreen: false, ..Settings::default() };
+        let never = Settings {
+            folded_auto_hide: 0.0,
+            hide_only_when_idle: true,
+            hide_in_fullscreen: false,
+            ..Settings::default()
+        };
         let json = serde_json::to_string(&never).unwrap();
-        for key in [r#""foldedAutoHide":0.0"#, r#""hideOnlyWhenIdle":true"#, r#""hideInFullscreen":false"#] {
+        for key in [
+            r#""foldedAutoHide":0.0"#,
+            r#""hideOnlyWhenIdle":true"#,
+            r#""hideInFullscreen":false"#,
+        ] {
             assert!(json.contains(key), "{key} in {json}");
         }
         let back = serde_json::from_str::<Settings>(&json).unwrap().validated();
-        assert_eq!((back.folded_auto_hide, back.hide_only_when_idle, back.hide_in_fullscreen), (0.0, true, false));
+        assert_eq!(
+            (
+                back.folded_auto_hide,
+                back.hide_only_when_idle,
+                back.hide_in_fullscreen
+            ),
+            (0.0, true, false)
+        );
         // A page that sends whole numbers is read too.
-        assert_eq!(serde_json::from_str::<Settings>(r#"{"foldedAutoHide":10}"#).unwrap().folded_auto_hide, 10.0);
+        assert_eq!(
+            serde_json::from_str::<Settings>(r#"{"foldedAutoHide":10}"#)
+                .unwrap()
+                .folded_auto_hide,
+            10.0
+        );
     }
 
     #[test]
     fn playful_reactions_are_on_unless_a_file_says_otherwise() {
         // A file from before the setting: on.
-        let old: Settings = serde_json::from_str(r#"{"soundEnabled":false,"botTheme":"mint"}"#).unwrap();
+        let old: Settings =
+            serde_json::from_str(r#"{"soundEnabled":false,"botTheme":"mint"}"#).unwrap();
         assert!(old.playful_reactions);
         assert!(Settings::default().playful_reactions);
         // Written in camelCase, kept through `validated`, and read back as written.
-        let off = Settings { playful_reactions: false, ..Settings::default() }.validated();
+        let off = Settings {
+            playful_reactions: false,
+            ..Settings::default()
+        }
+        .validated();
         let json = serde_json::to_string(&off).unwrap();
         assert!(json.contains(r#""playfulReactions":false"#), "{json}");
-        assert!(!serde_json::from_str::<Settings>(&json).unwrap().validated().playful_reactions);
+        assert!(
+            !serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .validated()
+                .playful_reactions
+        );
     }
 
     #[test]
     fn the_dock_is_the_top_by_default_and_held_to_its_choices() {
         // A file from before docks: the top, as the island always was.
-        let old: Settings = serde_json::from_str(r#"{"soundEnabled":false,"screen":"cursor"}"#).unwrap();
+        let old: Settings =
+            serde_json::from_str(r#"{"soundEnabled":false,"screen":"cursor"}"#).unwrap();
         assert_eq!(old.dock, "top");
         assert_eq!(old.dock(), crate::dock::Dock::Top);
         assert_eq!(Settings::default().dock, "top");
         for dock in crate::dock::DOCKS {
-            let kept = Settings { dock: (*dock).into(), ..Settings::default() }.validated();
+            let kept = Settings {
+                dock: (*dock).into(),
+                ..Settings::default()
+            }
+            .validated();
             assert_eq!(kept.dock, *dock);
         }
         for bad in ["", "Bottom", "middle", "bottom "] {
-            assert_eq!(Settings { dock: bad.into(), ..Settings::default() }.validated().dock, "top", "{bad:?}");
+            assert_eq!(
+                Settings {
+                    dock: bad.into(),
+                    ..Settings::default()
+                }
+                .validated()
+                .dock,
+                "top",
+                "{bad:?}"
+            );
         }
         // Written in camelCase, and read back as written.
-        let json = serde_json::to_string(&Settings { dock: "bottom".into(), ..Settings::default() }.validated()).unwrap();
+        let json = serde_json::to_string(
+            &Settings {
+                dock: "bottom".into(),
+                ..Settings::default()
+            }
+            .validated(),
+        )
+        .unwrap();
         assert!(json.contains(r#""dock":"bottom""#), "{json}");
         let back = serde_json::from_str::<Settings>(&json).unwrap().validated();
         assert_eq!(back.dock(), crate::dock::Dock::Bottom);
@@ -613,11 +1019,24 @@ mod tests {
 
     #[test]
     fn the_shortcut_is_saved_and_read_back() {
-        let settings = Settings { expand_shortcut: "Ctrl+Shift+KeyK".into(), expand_shortcut_enabled: false, ..Settings::default() };
+        let settings = Settings {
+            expand_shortcut: "Ctrl+Shift+KeyK".into(),
+            expand_shortcut_enabled: false,
+            ..Settings::default()
+        };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""expandShortcut":"Ctrl+Shift+KeyK""#));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.expand_shortcut, "Ctrl+Shift+KeyK");
         assert!(!back.expand_shortcut_enabled);
+    }
+
+    #[cfg(feature = "codex-quota")]
+    #[test]
+    fn codex_quota_profile_access_defaults_to_explicitly_disabled() {
+        let settings = Settings::default();
+        assert!(!settings.codex_quota_enabled);
+        let json = serde_json::to_value(settings).unwrap();
+        assert_eq!(json["codexQuotaEnabled"], false);
     }
 }

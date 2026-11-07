@@ -1,0 +1,33 @@
+.nook-dev-sim { margin-top: 18px; }
+.nook-dev-sim-box { padding-block: 10px; }
+.nook-dev-sim-note { margin: 2px 0 10px; }
+.nook-dev-sim-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.nook-dev-sim-action { min-height: 30px; height: auto; padding: 5px 9px; white-space: normal; text-align: left; }
+.nook-dev-alert-title { margin-top: 18px; }
+.nook-dev-alert-status { margin: 8px 0 0; padding: 9px; border-radius: 8px; background: var(--surface-2); color: var(--text-2); font: 11px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 440px) {
+  .nook-dev-sim-row { align-items: stretch; }
+  .nook-dev-sim-action { flex: 1 1 135px; }
+}
+
+.sp-shelf-trace {
+  margin: 20px 0 0 34px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.sp-shelf-trace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.sp-shelf-trace-status {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-2);
+  font-size: 11px;
+}

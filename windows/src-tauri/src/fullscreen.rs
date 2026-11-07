@@ -62,13 +62,21 @@ pub struct Foreground {
     pub own: bool,
     /// It is on the display the island is on.
     pub on_island_display: bool,
-    /// A maximised window with a title bar: it fills a display whose taskbar
-    /// hides itself, and is still an ordinary window.
+    /// A maximised window with a title bar: the existing production heuristic.
     pub framed_maximised: bool,
+    /// Windows' raw maximised state, used by the Dev-only custom-skin heuristic.
+    pub maximised: bool,
+    /// Whether Windows reports a standard title bar. Logged by Dev diagnostics.
+    pub captioned: bool,
 }
 
 /// The desktop and the taskbar: they fill the display, and are no app.
-const SHELL_CLASSES: &[&str] = &["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+const SHELL_CLASSES: &[&str] = &[
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+];
 
 /// The programs of the Windows shell. What they bring in front — the Start
 /// menu, Search, the notification centre and quick settings, the touch
@@ -89,7 +97,10 @@ const SHELL_PROCESSES: &[&str] = &[
 
 /// True when the window belongs to the shell rather than to an app.
 fn is_shell(front: &Foreground) -> bool {
-    SHELL_CLASSES.contains(&front.class.as_str()) || SHELL_PROCESSES.iter().any(|p| p.eq_ignore_ascii_case(&front.process))
+    SHELL_CLASSES.contains(&front.class.as_str())
+        || SHELL_PROCESSES
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(&front.process))
 }
 
 /// True when the island should stay out of the way.
@@ -108,12 +119,22 @@ fn is_shell(front: &Foreground) -> bool {
 ///   and "busy" says only that a full-screen app runs somewhere, maybe on
 ///   another display: taken alone, it hid the island at a plain click.
 pub fn is_fullscreen(front: Option<&Foreground>, notification: Notification) -> bool {
-    let shell_says = matches!(notification, Notification::D3dFullScreen | Notification::Presentation);
+    let shell_says = matches!(
+        notification,
+        Notification::D3dFullScreen | Notification::Presentation
+    );
     match front {
         None => shell_says,
         Some(front) if front.own || is_shell(front) => false,
         Some(front) if !front.on_island_display => false,
-        Some(front) => shell_says || (front.rect.covers(&front.monitor) && !front.framed_maximised),
+        Some(front) => {
+            let ordinary_maximised = if cfg!(feature = "nook-dev") {
+                front.maximised
+            } else {
+                front.framed_maximised
+            };
+            shell_says || (front.rect.covers(&front.monitor) && !ordinary_maximised)
+        }
     }
 }
 
@@ -140,58 +161,235 @@ impl Steady {
 mod tests {
     use super::*;
 
-    const DISPLAY: Rect = Rect { left: 0, top: 0, right: 1920, bottom: 1080 };
+    const DISPLAY: Rect = Rect {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    };
 
     fn window(rect: Rect, class: &str) -> Foreground {
-        Foreground { rect, monitor: DISPLAY, class: class.into(), process: "app.exe".into(), own: false, on_island_display: true, framed_maximised: false }
+        Foreground {
+            rect,
+            monitor: DISPLAY,
+            class: class.into(),
+            process: "app.exe".into(),
+            own: false,
+            on_island_display: true,
+            framed_maximised: false,
+            maximised: false,
+            captioned: true,
+        }
     }
 
     #[test]
     fn a_window_that_covers_the_islands_display_is_full_screen() {
         // A video in a browser, a borderless game: exactly the display.
-        assert!(is_fullscreen(Some(&window(DISPLAY, "Chrome_WidgetWin_1")), Notification::Normal));
-        assert!(is_fullscreen(Some(&window(DISPLAY, "UnityWndClass")), Notification::Busy));
+        assert!(is_fullscreen(
+            Some(&window(DISPLAY, "Chrome_WidgetWin_1")),
+            Notification::Normal
+        ));
+        assert!(is_fullscreen(
+            Some(&window(DISPLAY, "UnityWndClass")),
+            Notification::Busy
+        ));
         // A pixel past it on every side still covers it.
-        assert!(is_fullscreen(Some(&window(Rect { left: -1, top: -1, right: 1921, bottom: 1081 }, "X")), Notification::Unknown));
+        assert!(is_fullscreen(
+            Some(&window(
+                Rect {
+                    left: -1,
+                    top: -1,
+                    right: 1921,
+                    bottom: 1081
+                },
+                "X"
+            )),
+            Notification::Unknown
+        ));
         // An ordinary window, and a maximised one above the taskbar (its frame hangs 8 px over the other edges).
-        assert!(!is_fullscreen(Some(&window(Rect { left: 200, top: 100, right: 1400, bottom: 900 }, "Notepad")), Notification::Normal));
-        assert!(!is_fullscreen(Some(&window(Rect { left: -8, top: -8, right: 1928, bottom: 1040 }, "Notepad")), Notification::Normal));
+        assert!(!is_fullscreen(
+            Some(&window(
+                Rect {
+                    left: 200,
+                    top: 100,
+                    right: 1400,
+                    bottom: 900
+                },
+                "Notepad"
+            )),
+            Notification::Normal
+        ));
+        assert!(!is_fullscreen(
+            Some(&window(
+                Rect {
+                    left: -8,
+                    top: -8,
+                    right: 1928,
+                    bottom: 1040
+                },
+                "Notepad"
+            )),
+            Notification::Normal
+        ));
         // One row short of the display is not full-screen.
-        assert!(!is_fullscreen(Some(&window(Rect { bottom: 1079, ..DISPLAY }, "X")), Notification::Normal));
+        assert!(!is_fullscreen(
+            Some(&window(
+                Rect {
+                    bottom: 1079,
+                    ..DISPLAY
+                },
+                "X"
+            )),
+            Notification::Normal
+        ));
         // A display that says nothing of its size covers nothing.
-        let nowhere = Foreground { monitor: Rect::default(), ..window(DISPLAY, "X") };
+        let nowhere = Foreground {
+            monitor: Rect::default(),
+            ..window(DISPLAY, "X")
+        };
         assert!(!is_fullscreen(Some(&nowhere), Notification::Normal));
     }
 
+    #[cfg(feature = "nook-dev")]
     #[test]
-    fn a_maximised_window_with_its_title_bar_is_an_ordinary_window() {
+    fn vlc_skin_windowed_maximised_and_fullscreen_states_are_distinct() {
+        let windowed = Foreground {
+            class: "SkinWindowClass".into(),
+            process: "vlc.exe".into(),
+            ..window(
+                Rect {
+                    left: 100,
+                    top: 80,
+                    right: 1280,
+                    bottom: 900,
+                },
+                "SkinWindowClass",
+            )
+        };
+        assert!(!is_fullscreen(Some(&windowed), Notification::Normal));
+
+        let display_covering = Rect {
+            left: -8,
+            top: -8,
+            right: 1928,
+            bottom: 1088,
+        };
+        let maximised = Foreground {
+            rect: display_covering,
+            maximised: true,
+            captioned: false,
+            ..windowed.clone()
+        };
+        assert!(!is_fullscreen(Some(&maximised), Notification::Normal));
+
+        let fullscreen = Foreground {
+            rect: display_covering,
+            maximised: false,
+            ..windowed
+        };
+        assert!(is_fullscreen(Some(&fullscreen), Notification::Normal));
+    }
+
+    #[test]
+    fn maximised_window_classification_preserves_the_dev_custom_skin_case() {
         // The taskbar hides itself: a maximised window then covers the display.
-        let over = Rect { left: -8, top: -8, right: 1928, bottom: 1088 };
-        let maximised = Foreground { framed_maximised: true, ..window(over, "Notepad") };
+        let over = Rect {
+            left: -8,
+            top: -8,
+            right: 1928,
+            bottom: 1088,
+        };
+        let maximised = Foreground {
+            framed_maximised: true,
+            maximised: true,
+            ..window(over, "Notepad")
+        };
         assert!(!is_fullscreen(Some(&maximised), Notification::Normal));
         assert!(!is_fullscreen(Some(&maximised), Notification::Busy));
+        let skinned_maximised = Foreground {
+            maximised: true,
+            captioned: false,
+            class: "SkinWindowClass".into(),
+            process: "vlc.exe".into(),
+            ..window(over, "VLC")
+        };
+        #[cfg(feature = "nook-dev")]
+        {
+            assert!(!is_fullscreen(
+                Some(&skinned_maximised),
+                Notification::Normal
+            ));
+            assert!(!is_fullscreen(Some(&skinned_maximised), Notification::Busy));
+        }
+        #[cfg(not(feature = "nook-dev"))]
+        assert!(is_fullscreen(
+            Some(&skinned_maximised),
+            Notification::Normal
+        ));
         // The same rectangle with no title bar is a borderless full-screen window.
-        assert!(is_fullscreen(Some(&window(over, "Game")), Notification::Normal));
+        assert!(is_fullscreen(
+            Some(&window(over, "Game")),
+            Notification::Normal
+        ));
     }
 
     #[test]
     fn the_desktop_and_nooks_own_windows_never_count() {
-        for class in ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
-            assert!(!is_fullscreen(Some(&window(DISPLAY, class)), Notification::Normal), "{class}");
-            assert!(!is_fullscreen(Some(&window(DISPLAY, class)), Notification::Presentation), "{class}");
+        for class in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+        ] {
+            assert!(
+                !is_fullscreen(Some(&window(DISPLAY, class)), Notification::Normal),
+                "{class}"
+            );
+            assert!(
+                !is_fullscreen(Some(&window(DISPLAY, class)), Notification::Presentation),
+                "{class}"
+            );
         }
         // The island took the keyboard to be typed in: it is in front, and hides nothing from itself.
-        let own = Foreground { own: true, ..window(DISPLAY, "Tauri Window") };
+        let own = Foreground {
+            own: true,
+            ..window(DISPLAY, "Tauri Window")
+        };
         assert!(!is_fullscreen(Some(&own), Notification::Normal));
         assert!(!is_fullscreen(Some(&own), Notification::D3dFullScreen));
         // A class that only starts the same is another window.
-        assert!(is_fullscreen(Some(&window(DISPLAY, "WorkerWindow")), Notification::Normal));
+        assert!(is_fullscreen(
+            Some(&window(DISPLAY, "WorkerWindow")),
+            Notification::Normal
+        ));
     }
 
     #[test]
     fn another_display_is_none_of_the_islands_business() {
-        let elsewhere = Foreground { on_island_display: false, monitor: Rect { left: 1920, top: 0, right: 3840, bottom: 1080 }, ..window(Rect { left: 1920, top: 0, right: 3840, bottom: 1080 }, "Game") };
-        for said in [Notification::Normal, Notification::Busy, Notification::D3dFullScreen, Notification::Presentation] {
+        let elsewhere = Foreground {
+            on_island_display: false,
+            monitor: Rect {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1080,
+            },
+            ..window(
+                Rect {
+                    left: 1920,
+                    top: 0,
+                    right: 3840,
+                    bottom: 1080,
+                },
+                "Game",
+            )
+        };
+        for said in [
+            Notification::Normal,
+            Notification::Busy,
+            Notification::D3dFullScreen,
+            Notification::Presentation,
+        ] {
             assert!(!is_fullscreen(Some(&elsewhere), said), "{said:?}");
         }
     }
@@ -199,7 +397,15 @@ mod tests {
     #[test]
     fn the_shell_is_believed_for_what_a_rectangle_cannot_say() {
         // Presentation mode, or an exclusive Direct3D app, with a window in front on the island's display.
-        let small = window(Rect { left: 200, top: 100, right: 1400, bottom: 900 }, "POWERPNT");
+        let small = window(
+            Rect {
+                left: 200,
+                top: 100,
+                right: 1400,
+                bottom: 900,
+            },
+            "POWERPNT",
+        );
         assert!(is_fullscreen(Some(&small), Notification::Presentation));
         assert!(is_fullscreen(Some(&small), Notification::D3dFullScreen));
         // "Busy" alone says a full-screen app runs somewhere: the rectangle decides.
@@ -228,13 +434,28 @@ mod tests {
             ("XamlExplorerHostIslandWindow", "explorer.exe"),
             ("XamlExplorerHostIslandWindow_WASDK", "EXPLORER.EXE"),
         ] {
-            let flyout = Foreground { process: process.into(), ..window(DISPLAY, class) };
-            assert!(!is_fullscreen(Some(&flyout), Notification::Normal), "{class} {process}");
-            assert!(!is_fullscreen(Some(&flyout), Notification::Busy), "{class} {process}");
+            let flyout = Foreground {
+                process: process.into(),
+                ..window(DISPLAY, class)
+            };
+            assert!(
+                !is_fullscreen(Some(&flyout), Notification::Normal),
+                "{class} {process}"
+            );
+            assert!(
+                !is_fullscreen(Some(&flyout), Notification::Busy),
+                "{class} {process}"
+            );
         }
         // The same window from an app is full-screen; a name that only starts the same is an app.
-        assert!(is_fullscreen(Some(&window(DISPLAY, "Windows.UI.Core.CoreWindow")), Notification::Normal));
-        let lookalike = Foreground { process: "explorer.exe.game.exe".into(), ..window(DISPLAY, "Game") };
+        assert!(is_fullscreen(
+            Some(&window(DISPLAY, "Windows.UI.Core.CoreWindow")),
+            Notification::Normal
+        ));
+        let lookalike = Foreground {
+            process: "explorer.exe.game.exe".into(),
+            ..window(DISPLAY, "Game")
+        };
         assert!(is_fullscreen(Some(&lookalike), Notification::Normal));
     }
 

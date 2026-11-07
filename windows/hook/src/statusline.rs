@@ -64,7 +64,9 @@ pub fn run(args: &[String]) -> ! {
     }
     let started = Instant::now();
 
-    let code = previous_of(args).and_then(|previous| run_previous(&previous, &raw)).unwrap_or(0);
+    let code = previous_of(args)
+        .and_then(|previous| run_previous(&previous, &raw))
+        .unwrap_or(0);
 
     // The send gets what is left of the budget every forgotten event has.
     let left = crate::FIRE_AND_FORGET_BUDGET.saturating_sub(started.elapsed());
@@ -89,7 +91,10 @@ fn window_of(limits: &Value, name: &str) -> Option<Value> {
     let window = limits.get(name)?.as_object()?;
     let mut out = serde_json::Map::new();
     for field in WINDOW_FIELDS {
-        out.insert((*field).to_string(), window.get(*field).filter(|v| v.is_number())?.clone());
+        out.insert(
+            (*field).to_string(),
+            window.get(*field).filter(|v| v.is_number())?.clone(),
+        );
     }
     Some(Value::Object(out))
 }
@@ -99,8 +104,10 @@ fn window_of(limits: &Value, name: &str) -> Option<Value> {
 /// its first answer yet.
 fn limits_of(status: &Value) -> Option<Value> {
     let limits = status.get("rate_limits")?;
-    let windows: serde_json::Map<String, Value> =
-        WINDOWS.iter().filter_map(|name| Some(((*name).to_string(), window_of(limits, name)?))).collect();
+    let windows: serde_json::Map<String, Value> = WINDOWS
+        .iter()
+        .filter_map(|name| Some(((*name).to_string(), window_of(limits, name)?)))
+        .collect();
     (!windows.is_empty()).then_some(Value::Object(windows))
 }
 
@@ -112,7 +119,9 @@ fn model_of(status: &Value) -> Option<Value> {
         .iter()
         .filter_map(|field| {
             let name = model.get(*field)?.as_str()?.trim();
-            let short = !name.is_empty() && name.chars().count() <= MAX_MODEL_NAME && !name.chars().any(char::is_control);
+            let short = !name.is_empty()
+                && name.chars().count() <= MAX_MODEL_NAME
+                && !name.chars().any(char::is_control);
             short.then(|| ((*field).to_string(), Value::String(name.to_string())))
         })
         .collect();
@@ -123,8 +132,12 @@ fn model_of(status: &Value) -> Option<Value> {
 /// (200000, or 1000000 for the 1M variants): the one exact source of it, which
 /// a transcript does not give. A number in a believable range, or nothing.
 fn context_window_of(status: &Value) -> Option<u64> {
-    let size = status.pointer("/context_window/context_window_size")?.as_u64()?;
-    (MIN_CONTEXT_WINDOW..=MAX_CONTEXT_WINDOW).contains(&size).then_some(size)
+    let size = status
+        .pointer("/context_window/context_window_size")?
+        .as_u64()?;
+    (MIN_CONTEXT_WINDOW..=MAX_CONTEXT_WINDOW)
+        .contains(&size)
+        .then_some(size)
 }
 
 /// The one line Nook gets from a status line call: the event's name, the
@@ -185,10 +198,22 @@ fn previous_in(setting: &Value) -> Option<Previous> {
     }
     let args = match setting.get("args") {
         None => None,
-        Some(args) => Some(args.as_array()?.iter().map(|a| a.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?),
+        Some(args) => Some(
+            args.as_array()?
+                .iter()
+                .map(|a| a.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?,
+        ),
     };
-    let shell = setting.get("shell").and_then(Value::as_str).map(str::to_string);
-    Some(Previous { command: command.to_string(), args, shell })
+    let shell = setting
+        .get("shell")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(Previous {
+        command: command.to_string(),
+        args,
+        shell,
+    })
 }
 
 /// base64url without padding (RFC 4648 §5): the one way a JSON value crosses a
@@ -241,7 +266,11 @@ fn shell_command(previous: &Previous) -> Option<Command> {
 
 #[cfg(windows)]
 fn shell_command(previous: &Previous) -> Option<Command> {
-    let bash = if previous.shell.as_deref() == Some("powershell") { None } else { git_bash() };
+    let bash = if previous.shell.as_deref() == Some("powershell") {
+        None
+    } else {
+        git_bash()
+    };
     match bash {
         Some(bash) => {
             let mut command = Command::new(&bash);
@@ -258,8 +287,16 @@ fn shell_command(previous: &Previous) -> Option<Command> {
             Some(command)
         }
         None => {
-            let mut command = Command::new(on_path("pwsh.exe").or_else(|| on_path("powershell.exe"))?);
-            command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &previous.command]);
+            let mut command =
+                Command::new(on_path("pwsh.exe").or_else(|| on_path("powershell.exe"))?);
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &previous.command,
+            ]);
             Some(command)
         }
     }
@@ -270,23 +307,35 @@ fn shell_command(previous: &Previous) -> Option<Command> {
 fn git_bash() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     if let Some(named) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").map(PathBuf::from) {
-        let name = named.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let name = named
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         if ["bash.exe", "sh.exe", "bash", "sh"].contains(&name.as_str()) && named.is_file() {
             return Some(named);
         }
     }
-    let known = [r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"];
+    let known = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ];
     if let Some(found) = known.iter().map(PathBuf::from).find(|p| p.is_file()) {
         return Some(found);
     }
     // …\Git\cmd\git.exe → …\Git\bin\bash.exe
-    let beside_git = on_path("git.exe")?.parent()?.parent()?.join("bin").join("bash.exe");
+    let beside_git = on_path("git.exe")?
+        .parent()?
+        .parent()?
+        .join("bin")
+        .join("bash.exe");
     beside_git.is_file().then_some(beside_git)
 }
 
 #[cfg(windows)]
 fn on_path(name: &str) -> Option<std::path::PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(name)).find(|p| p.is_file())
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
 }
 
 /// A command whose first word is a `.sh` script is handed to bash by name, as
@@ -304,7 +353,11 @@ fn for_bash(command: &str) -> String {
             c => first.push(c),
         }
     }
-    if first.ends_with(".sh") { format!("bash {command}") } else { command.to_string() }
+    if first.ends_with(".sh") {
+        format!("bash {command}")
+    } else {
+        command.to_string()
+    }
 }
 
 /// Runs the user's status line on the bytes we were given, its output going
@@ -367,7 +420,10 @@ mod tests {
             "spend_limit": { "used_percentage": 62.8, "used_usd": 314.12 },
         }));
         let line = usage_line(&raw).unwrap();
-        assert!(line.ends_with('\n') && line.matches('\n').count() == 1, "one line, as the pipe reads it");
+        assert!(
+            line.ends_with('\n') && line.matches('\n').count() == 1,
+            "one line, as the pipe reads it"
+        );
         assert_eq!(
             sent(&raw),
             json!({
@@ -380,8 +436,20 @@ mod tests {
                 "model": { "id": "claude-opus-5", "display_name": "Opus" },
             })
         );
-        for kept_here in ["secret", "transcript", "provider", "cost", "12.5", "spend", "314", "left behind"] {
-            assert!(!line.contains(kept_here), "{kept_here} must not leave the relay");
+        for kept_here in [
+            "secret",
+            "transcript",
+            "provider",
+            "cost",
+            "12.5",
+            "spend",
+            "314",
+            "left behind",
+        ] {
+            assert!(
+                !line.contains(kept_here),
+                "{kept_here} must not leave the relay"
+            );
         }
     }
 
@@ -390,7 +458,10 @@ mod tests {
         let only = |limits: Value| sent(&status(limits))["rate_limits"].clone();
         let five = json!({ "used_percentage": 9, "resets_at": 1_738_425_600u64 });
         // One window alone.
-        assert_eq!(only(json!({ "five_hour": five })), json!({ "five_hour": five }));
+        assert_eq!(
+            only(json!({ "five_hour": five })),
+            json!({ "five_hour": five })
+        );
         // The other is there but is not what it should be: a string, half of it, null.
         for wrong in [
             json!({ "used_percentage": "41", "resets_at": 1 }),
@@ -400,7 +471,10 @@ mod tests {
             json!("41%"),
             json!(null),
         ] {
-            assert_eq!(only(json!({ "five_hour": five, "seven_day": wrong })), json!({ "five_hour": five }));
+            assert_eq!(
+                only(json!({ "five_hour": five, "seven_day": wrong })),
+                json!({ "five_hour": five })
+            );
         }
     }
 
@@ -411,15 +485,32 @@ mod tests {
             sent(br#"{"session_id":"s","cwd":"/secret","model":{"id":"claude-sonnet-5","display_name":"Sonnet"}}"#),
             json!({ "hook_event_name": "StatusLine", "session_id": "s", "model": { "id": "claude-sonnet-5", "display_name": "Sonnet" } })
         );
-        for limits in [json!(null), json!({}), json!([]), json!("none"), json!({ "five_hour": {}, "seven_day": 3 })] {
+        for limits in [
+            json!(null),
+            json!({}),
+            json!([]),
+            json!("none"),
+            json!({ "five_hour": {}, "seven_day": 3 }),
+        ] {
             assert!(sent(&status(limits)).get("rate_limits").is_none());
         }
         assert!(usage_line(br#"{"session_id":"s","cwd":"/secret"}"#).is_none());
         // A model that is no name: one of the two, or none of it.
         let model = |model: Value| model_of(&json!({ "model": model }));
-        assert_eq!(model(json!({ "id": " claude-opus-5 ", "display_name": 4 })), Some(json!({ "id": "claude-opus-5" })));
-        assert_eq!(model(json!({ "id": "x".repeat(MAX_MODEL_NAME + 1), "display_name": "Opus" })), Some(json!({ "display_name": "Opus" })));
-        for none in [json!("claude-opus-5"), json!({}), json!({ "id": "", "display_name": "a\nb" }), json!(null)] {
+        assert_eq!(
+            model(json!({ "id": " claude-opus-5 ", "display_name": 4 })),
+            Some(json!({ "id": "claude-opus-5" }))
+        );
+        assert_eq!(
+            model(json!({ "id": "x".repeat(MAX_MODEL_NAME + 1), "display_name": "Opus" })),
+            Some(json!({ "display_name": "Opus" }))
+        );
+        for none in [
+            json!("claude-opus-5"),
+            json!({}),
+            json!({ "id": "", "display_name": "a\nb" }),
+            json!(null),
+        ] {
             assert_eq!(model(none), None);
         }
         // Not JSON, or nothing: nothing.
@@ -437,7 +528,14 @@ mod tests {
         assert_eq!(with(json!(1_000_000))["context_window_size"], 1_000_000);
         // Only the size: the rest of that object stays behind.
         assert!(with(json!(1_000_000)).get("context_window").is_none());
-        for wrong in [json!(0), json!(5), json!(-1), json!("200000"), json!(null), json!(1e12)] {
+        for wrong in [
+            json!(0),
+            json!(5),
+            json!(-1),
+            json!("200000"),
+            json!(null),
+            json!(1e12),
+        ] {
             assert!(with(wrong).get("context_window_size").is_none());
         }
     }
@@ -445,7 +543,14 @@ mod tests {
     #[test]
     fn the_session_is_an_id_or_it_is_not_sent() {
         let limits = json!({ "five_hour": { "used_percentage": 1, "resets_at": 2 } });
-        let with = |session: Value| sent(json!({ "session_id": session, "rate_limits": limits }).to_string().as_bytes())["session_id"].clone();
+        let with = |session: Value| {
+            sent(
+                json!({ "session_id": session, "rate_limits": limits })
+                    .to_string()
+                    .as_bytes(),
+            )["session_id"]
+                .clone()
+        };
         assert_eq!(with(json!("abc")), json!("abc"));
         assert_eq!(with(json!(42)), Value::Null);
         assert_eq!(with(json!("x".repeat(MAX_SESSION_ID + 1))), Value::Null);
@@ -474,7 +579,11 @@ mod tests {
         let shell_form = "eyJ0eXBlIjoiY29tbWFuZCIsImNvbW1hbmQiOiJiYXNoIH4vLmNsYXVkZS9zdGF0dXNsaW5lLnNoIiwicGFkZGluZyI6MH0";
         assert_eq!(
             previous_of(&args(&["--previous", shell_form])),
-            Some(Previous { command: "bash ~/.claude/statusline.sh".into(), args: None, shell: None })
+            Some(Previous {
+                command: "bash ~/.claude/statusline.sh".into(),
+                args: None,
+                shell: None
+            })
         );
         // None, or one that is not there to read: no status line of the user's own.
         assert_eq!(previous_of(&[]), None);
@@ -486,13 +595,26 @@ mod tests {
     #[test]
     fn exec_form_is_a_program_and_its_arguments_and_shell_form_a_string() {
         let exec = previous_in(&json!({ "type": "command", "command": "node", "args": ["C:/x y/line.mjs", "--plain"] })).unwrap();
-        assert_eq!(exec.args.as_deref(), Some(&["C:/x y/line.mjs".to_string(), "--plain".to_string()][..]));
+        assert_eq!(
+            exec.args.as_deref(),
+            Some(&["C:/x y/line.mjs".to_string(), "--plain".to_string()][..])
+        );
         let command = command_for(&exec).unwrap();
         assert_eq!(command.get_program(), "node");
-        assert_eq!(command.get_args().collect::<Vec<_>>(), ["C:/x y/line.mjs", "--plain"]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["C:/x y/line.mjs", "--plain"]
+        );
 
         let shell = previous_in(&json!({ "type": "command", "command": " jq -r '.model.display_name' ", "shell": "powershell" })).unwrap();
-        assert_eq!(shell, Previous { command: "jq -r '.model.display_name'".into(), args: None, shell: Some("powershell".into()) });
+        assert_eq!(
+            shell,
+            Previous {
+                command: "jq -r '.model.display_name'".into(),
+                args: None,
+                shell: Some("powershell".into())
+            }
+        );
 
         // Not a command anybody can run: nothing is run.
         for not_one in [
@@ -510,8 +632,14 @@ mod tests {
 
     #[test]
     fn a_script_is_handed_to_bash_by_name() {
-        assert_eq!(for_bash("~/.claude/statusline.sh"), "bash ~/.claude/statusline.sh");
-        assert_eq!(for_bash("\"C:/a b/line.sh\" --x"), "bash \"C:/a b/line.sh\" --x");
+        assert_eq!(
+            for_bash("~/.claude/statusline.sh"),
+            "bash ~/.claude/statusline.sh"
+        );
+        assert_eq!(
+            for_bash("\"C:/a b/line.sh\" --x"),
+            "bash \"C:/a b/line.sh\" --x"
+        );
         assert_eq!(for_bash("jq -r .model"), "jq -r .model");
         assert_eq!(for_bash(""), "");
     }

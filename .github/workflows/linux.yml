@@ -100,6 +100,17 @@ jobs:
         run: |
           cargo build --release -p nook-hook
           cargo test --workspace
+          npm run check:dev-previews
+          npm run test:codex-quota-view
+          npm run test:compact-metrics
+          npm run test:frontend-output-isolation
+
+      - name: Test with Nook Dev feature
+        env:
+          # Tauri consumes this as a JSON overlay, not a path. These identity
+          # fields satisfy build.rs without weakening its isolation checks.
+          TAURI_CONFIG: '{"productName":"Nook Dev","identifier":"io.github.zubairbinshaukat.nook.dev","mainBinaryName":"nook-dev"}'
+        run: cargo test --workspace --features nook-dev
 
       # linuxdeploy is itself an AppImage; runners have no FUSE, so it unpacks
       # itself instead of mounting.

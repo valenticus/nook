@@ -6,8 +6,10 @@
 // the state, not to the island's frames.
 
 import { Bridge, onEvent } from "../core/bridge";
-import { State } from "../core/state";
+import { State, type ClaudeSession, type SessionAgent } from "../core/state";
 import { snapshotOf } from "./model";
+
+type AgentSession = ClaudeSession & { agent: Exclude<SessionAgent, "unknown"> };
 
 /** Changes come in runs: the rows go once, this long after the last of them. */
 const DEBOUNCE_MS = 150;
@@ -20,7 +22,8 @@ export function startAgentsFeed(): { poke: () => void } {
   const send = (force: boolean) => {
     timer = 0;
     if (!State.settings.showAgentsList) return;
-    const snapshot = snapshotOf(State.sessions, State.usage, Date.now());
+    const sessions = State.sessions.filter((session): session is AgentSession => session.agent !== "unknown");
+    const snapshot = snapshotOf(sessions, State.usage, Date.now());
     const text = JSON.stringify(snapshot);
     if (!force && text === last) return;
     last = text;

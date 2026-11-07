@@ -10,36 +10,55 @@ use tauri::WebviewWindow;
 
 use std::collections::HashMap;
 
-use ::windows::core::{w, BOOL, PCWSTR, PWSTR};
-use ::windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HLOCAL, HWND, LocalFree, LPARAM, POINT, RECT};
-use ::windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use ::windows::core::{BOOL, PWSTR};
+use ::windows::Win32::Foundation::{
+    CloseHandle, LocalFree, HANDLE, HLOCAL, HWND, LPARAM, POINT, RECT,
+};
+#[cfg(feature = "nook-dev")]
+use ::windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
+use ::windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use ::windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use ::windows::Win32::Security::{GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER};
-use ::windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_CSTATUS_NEW_DATA,
-    PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
+use ::windows::Win32::Security::{
+    GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
 };
-use ::windows::Win32::System::SystemInformation::{GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use ::windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
+use ::windows::Win32::System::SystemInformation::GetLocalTime;
 use ::windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetSystemTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
+    OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use ::windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use ::windows::Win32::UI::Shell::{
-    IVirtualDesktopManager, SHQueryUserNotificationState, VirtualDesktopManager, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    IVirtualDesktopManager, SHQueryUserNotificationState, VirtualDesktopManager, QUNS_BUSY,
+    QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetForegroundWindow, SetWindowLongPtrW,
-    ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    BringWindowToTop, ChildWindowFromPointEx, EnumWindows, GetAncestor, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WindowFromPoint, CWP_SKIPDISABLED,
+    CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE,
+    WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+};
+#[cfg(feature = "nook-dev")]
+use ::windows::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, GetTopWindow, GW_HWNDNEXT, WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
 use super::LocalTime;
 use crate::fullscreen::{self, Foreground, Notification};
-use crate::metrics::CpuTimes;
 use crate::target::Window;
 
-/// File name of the Claude Code relay.
+/// Relay name is fixed by the independently compiled app flavor.
+#[cfg(feature = "nook-dev")]
+pub const HOOK_EXE: &str = "nook-hook-dev.exe";
+#[cfg(feature = "nook-standalone")]
+pub const HOOK_EXE: &str = "nook-hook-standalone.exe";
+#[cfg(not(any(feature = "nook-dev", feature = "nook-standalone")))]
 pub const HOOK_EXE: &str = "nook-hook.exe";
 
 /// Environment variable holding the home directory.
@@ -55,7 +74,14 @@ pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("Nook")
+    let dir = if cfg!(feature = "nook-dev") {
+        "NookDev"
+    } else if cfg!(feature = "nook-standalone") {
+        "NookStandalone"
+    } else {
+        "Nook"
+    };
+    base.join(dir)
 }
 
 /// %LOCALAPPDATA%\Nook — where nook-hook.exe and the log live.
@@ -63,7 +89,14 @@ pub fn local_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("Nook")
+    let dir = if cfg!(feature = "nook-dev") {
+        "NookDev"
+    } else if cfg!(feature = "nook-standalone") {
+        "NookStandalone"
+    } else {
+        "Nook"
+    };
+    base.join(dir)
 }
 
 /// %APPDATA% and %LOCALAPPDATA% are already private to the user.
@@ -94,8 +127,8 @@ pub fn no_console(cmd: &mut Command) -> &mut Command {
 }
 
 pub fn open_url(url: &str) {
-    let _ = no_console(Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]))
-        .spawn();
+    let _ =
+        no_console(Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url])).spawn();
 }
 
 pub fn reveal_folder(path: &str) {
@@ -172,116 +205,9 @@ pub fn current_user_sid() -> Option<String> {
     }
 }
 
-// ── The machine ───────────────────────────────────────────────────────────────
+// -- Cursor ----------------------------------------------------------------
 
-/// Memory in use and memory installed, in bytes. One call, no allocation.
-pub fn memory() -> Option<(u64, u64)> {
-    let mut status = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
-    unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
-    Some((status.ullTotalPhys.saturating_sub(status.ullAvailPhys), status.ullTotalPhys))
-}
-
-/// What every processor has spent since the machine started, idle and in all.
-/// The system's kernel time counts the idle time in: kernel + user is everything.
-pub fn cpu_times() -> Option<CpuTimes> {
-    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
-    let (mut idle, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
-    unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).ok()? };
-    Some(CpuTimes { idle: ticks(idle), total: ticks(kernel).wrapping_add(ticks(user)) })
-}
-
-/// The graphics processor's performance counters — the `GPU Engine` set Task
-/// Manager reads: one instance per process and engine, each saying what share
-/// of that engine the process used since the reading before. One query, opened
-/// once and read on every tick; closed when dropped.
-///
-/// It stays on the thread that opened it (metrics.rs): a query handle is not
-/// shared.
-pub struct GpuCounters {
-    query: PDH_HQUERY,
-    counter: PDH_HCOUNTER,
-    /// What the instances are read into: the items, then their names. Kept
-    /// between ticks, in 8-byte words so that an item is aligned in it.
-    buffer: Vec<u64>,
-}
-
-impl GpuCounters {
-    /// Opens the query and adds every engine's counter. The counter is named
-    /// in English whatever the system's language. An error is the reason, for
-    /// the log: no such counters on this machine, or no right to read them.
-    pub fn open() -> Result<Self, String> {
-        unsafe {
-            let mut query = PDH_HQUERY::default();
-            let status = PdhOpenQueryW(PCWSTR::null(), 0, &mut query);
-            if status != 0 {
-                return Err(format!("PdhOpenQuery failed (0x{status:08X})"));
-            }
-            let mut counter = PDH_HCOUNTER::default();
-            let status = PdhAddEnglishCounterW(query, w!("\\GPU Engine(*)\\Utilization Percentage"), 0, &mut counter);
-            if status != 0 {
-                let _ = PdhCloseQuery(query);
-                return Err(format!("no GPU Engine counters (0x{status:08X})"));
-            }
-            Ok(Self { query, counter, buffer: Vec::new() })
-        }
-    }
-
-    /// Takes a reading of every instance: what the next `read` is worked out from.
-    pub fn collect(&mut self) -> Result<(), String> {
-        match unsafe { PdhCollectQueryData(self.query) } {
-            0 => Ok(()),
-            status => Err(format!("PdhCollectQueryData failed (0x{status:08X})")),
-        }
-    }
-
-    /// The graphics processor's use between the last two readings, in percent.
-    /// None when no engine has a value yet.
-    pub fn read(&mut self) -> Result<Option<f64>, String> {
-        const WORD: usize = std::mem::size_of::<u64>();
-        // The instances come and go with the processes: the room they need is
-        // asked for whenever what is kept has become too small.
-        for _ in 0..3 {
-            let mut size = (self.buffer.len() * WORD) as u32;
-            let mut count = 0u32;
-            let items = self.buffer.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-            let status = unsafe {
-                PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, (size > 0).then_some(items))
-            };
-            if status == PDH_MORE_DATA {
-                // A little more than asked: a process starting does not mean a second call next tick.
-                self.buffer = vec![0u64; (size as usize).div_ceil(WORD) + 512];
-                continue;
-            }
-            if status != 0 {
-                return Err(format!("PdhGetFormattedCounterArray failed (0x{status:08X})"));
-            }
-            let items = unsafe { std::slice::from_raw_parts(items.cast_const(), count as usize) };
-            let mut names: Vec<String> = Vec::with_capacity(items.len());
-            let mut values: Vec<f64> = Vec::with_capacity(items.len());
-            for item in items {
-                // An instance that appeared since the reading before has nothing to say yet.
-                if item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA && item.FmtValue.CStatus != PDH_CSTATUS_NEW_DATA {
-                    continue;
-                }
-                let Ok(name) = (unsafe { item.szName.to_string() }) else { continue };
-                names.push(name);
-                values.push(unsafe { item.FmtValue.Anonymous.doubleValue });
-            }
-            return Ok(crate::metrics::gpu_percent(names.iter().map(String::as_str).zip(values)));
-        }
-        Err("the GPU Engine instances would not hold still".into())
-    }
-}
-
-impl Drop for GpuCounters {
-    fn drop(&mut self) {
-        let _ = unsafe { PdhCloseQuery(self.query) };
-    }
-}
-
-// ── Cursor ────────────────────────────────────────────────────────────────────
-
-/// The 60 Hz poll reads the cursor and flips click-through from it.
+/// The poll reads the cursor and updates click-through while the island is shown.
 pub const CURSOR_POLL: bool = true;
 
 /// Cursor position in physical screen pixels.
@@ -299,6 +225,357 @@ fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
         return None;
     }
     Some(HWND(raw as *mut _))
+}
+
+/// Read back the effective WS_EX_TRANSPARENT bit after Tao's queued window update.
+#[cfg(feature = "nook-dev")]
+pub fn ignore_cursor_events_applied(win: &WebviewWindow) -> Option<bool> {
+    let style = read_extended_style(hwnd_of(win)?)?;
+    Some(style & WS_EX_TRANSPARENT.0 != 0)
+}
+
+#[cfg(feature = "nook-dev")]
+fn read_extended_style(hwnd: HWND) -> Option<u32> {
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if style == 0 && GetLastError().0 != 0 {
+            return None;
+        }
+        Some(style as u32)
+    }
+}
+
+#[cfg(feature = "nook-dev")]
+fn is_above_in_z_order(
+    nook_topmost: bool,
+    nook_rank: usize,
+    other_topmost: bool,
+    other_rank: usize,
+) -> bool {
+    if nook_topmost != other_topmost {
+        return other_topmost;
+    }
+    other_rank < nook_rank
+}
+
+#[cfg(feature = "nook-dev")]
+fn hwnd_label(hwnd: HWND) -> String {
+    format!("0x{:X}", hwnd.0 as usize)
+}
+
+#[cfg(feature = "nook-dev")]
+fn hwnd_rect(hwnd: HWND) -> String {
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+        format!("{},{},{},{}", rect.left, rect.top, rect.right, rect.bottom)
+    } else {
+        "unknown".into()
+    }
+}
+
+#[cfg(feature = "nook-dev")]
+fn window_class(hwnd: HWND) -> String {
+    let mut class = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, &mut class).max(0) as usize };
+    String::from_utf16_lossy(&class[..len.min(class.len())])
+}
+
+#[cfg(feature = "nook-dev")]
+fn window_process(hwnd: HWND) -> String {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    image_name(pid).unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(feature = "nook-dev")]
+fn window_identity(hwnd: HWND) -> String {
+    format!("{}/{}", window_process(hwnd), window_class(hwnd))
+}
+
+#[cfg(feature = "nook-dev")]
+fn window_input_styles(hwnd: HWND) -> String {
+    read_extended_style(hwnd).map_or_else(
+        || "unknown".into(),
+        |style| {
+            format!(
+                "transparent={},layered={},noactivate={},topmost={}",
+                style & WS_EX_TRANSPARENT.0 != 0,
+                style & WS_EX_LAYERED.0 != 0,
+                style & WS_EX_NOACTIVATE.0 != 0,
+                style & WS_EX_TOPMOST.0 != 0,
+            )
+        },
+    )
+}
+
+#[cfg(feature = "nook-dev")]
+unsafe extern "system" fn collect_child(hwnd: HWND, data: LPARAM) -> BOOL {
+    let children = unsafe { &mut *(data.0 as *mut Vec<HWND>) };
+    if children.len() < 12 {
+        children.push(hwnd);
+    }
+    BOOL::from(true)
+}
+
+#[cfg(feature = "nook-dev")]
+fn child_windows(hwnd: HWND) -> String {
+    let mut children = Vec::new();
+    let _ = unsafe {
+        EnumChildWindows(
+            Some(hwnd),
+            Some(collect_child),
+            LPARAM(&mut children as *mut _ as isize),
+        )
+    };
+    if children.is_empty() {
+        return "none".into();
+    }
+    children
+        .into_iter()
+        .map(|child| {
+            format!(
+                "{}:{}:{}:style={}",
+                hwnd_label(child),
+                window_class(child),
+                hwnd_rect(child),
+                window_input_styles(child)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+#[cfg(feature = "nook-dev")]
+fn window_parent_chain(hwnd: HWND) -> String {
+    let mut chain = Vec::new();
+    let mut current = hwnd;
+    for _ in 0..8 {
+        chain.push(format!(
+            "{}:{}:{}:style={}",
+            hwnd_label(current),
+            window_class(current),
+            hwnd_rect(current),
+            window_input_styles(current)
+        ));
+        let Ok(parent) = (unsafe { GetParent(current) }) else {
+            break;
+        };
+        if parent.is_invalid() || parent == current {
+            break;
+        }
+        current = parent;
+    }
+    chain.join("<-")
+}
+
+#[cfg(feature = "nook-dev")]
+fn child_hit_path(parent: HWND, screen_point: POINT, skip_transparent: bool) -> String {
+    let mut path = Vec::new();
+    let mut current = parent;
+    for _ in 0..8 {
+        let mut client_point = screen_point;
+        if !unsafe { ScreenToClient(current, &mut client_point) }.as_bool() {
+            break;
+        }
+        let mut flags = CWP_SKIPINVISIBLE | CWP_SKIPDISABLED;
+        if skip_transparent {
+            flags |= CWP_SKIPTRANSPARENT;
+        }
+        let child = unsafe { ChildWindowFromPointEx(current, client_point, flags) };
+        if child.is_invalid() || child == current {
+            break;
+        }
+        path.push(format!(
+            "{}:{}:{}:style={}",
+            hwnd_label(child),
+            window_class(child),
+            hwnd_rect(child),
+            window_input_styles(child)
+        ));
+        current = child;
+    }
+    if path.is_empty() {
+        "none".into()
+    } else {
+        path.join("<-")
+    }
+}
+
+#[cfg(feature = "nook-dev")]
+fn z_order_windows() -> Vec<HWND> {
+    let mut out = Vec::new();
+    let Ok(mut hwnd) = (unsafe { GetTopWindow(None) }) else {
+        return out;
+    };
+    for _ in 0..512 {
+        if hwnd.is_invalid() {
+            break;
+        }
+        out.push(hwnd);
+        let Ok(next) = (unsafe { GetWindow(hwnd, GW_HWNDNEXT) }) else {
+            break;
+        };
+        if next == hwnd {
+            break;
+        }
+        hwnd = next;
+    }
+    out
+}
+
+/// Minimal native observation for the Dev pointer-gate trace. It records no
+/// title, window text, PID, or executable path.
+#[cfg(feature = "nook-dev")]
+pub struct PointerGateSnapshot {
+    pub ignore_applied: Option<bool>,
+    pub point_hits_island: Option<bool>,
+    pub foreground: String,
+    pub native_windows: String,
+}
+
+#[cfg(feature = "nook-dev")]
+pub fn pointer_gate_snapshot(
+    win: &WebviewWindow,
+    cursor_x: f64,
+    cursor_y: f64,
+) -> PointerGateSnapshot {
+    let island = hwnd_of(win);
+    let point = POINT {
+        x: cursor_x.round() as i32,
+        y: cursor_y.round() as i32,
+    };
+    let under = unsafe { WindowFromPoint(point) };
+    let root = if under.is_invalid() {
+        under
+    } else {
+        unsafe { GetAncestor(under, GA_ROOT) }
+    };
+    let point_hits_island = island.map(|hwnd| !root.is_invalid() && root == hwnd);
+    let front = unsafe { GetForegroundWindow() };
+    let foreground = if front.is_invalid() {
+        "unknown/unknown".to_string()
+    } else {
+        format!("{} {}", hwnd_label(front), window_identity(front))
+    };
+    let point_hwnd = if under.is_invalid() {
+        "none".into()
+    } else {
+        hwnd_label(under)
+    };
+    let root_hwnd = if root.is_invalid() {
+        "none".into()
+    } else {
+        hwnd_label(root)
+    };
+    let point_identity = if root.is_invalid() {
+        "unknown/unknown".into()
+    } else {
+        window_identity(root)
+    };
+    let windows = z_order_windows();
+    let nook_rank = island.and_then(|hwnd| windows.iter().position(|item| *item == hwnd));
+    let nook_style = island.and_then(read_extended_style);
+    let mut vlc_count = 0usize;
+    let flags = |style: u32| {
+        format!(
+            "topmost={},transparent={},noactivate={},layered={}",
+            style & WS_EX_TOPMOST.0 != 0,
+            style & WS_EX_TRANSPARENT.0 != 0,
+            style & WS_EX_NOACTIVATE.0 != 0,
+            style & WS_EX_LAYERED.0 != 0,
+        )
+    };
+    let mut vlc_windows = Vec::new();
+    let mut vlc_above_nook = None;
+    for (rank, hwnd) in windows.iter().enumerate() {
+        if !window_process(*hwnd).eq_ignore_ascii_case("vlc.exe") {
+            continue;
+        }
+        vlc_count += 1;
+        let Some(style) = read_extended_style(*hwnd) else {
+            continue;
+        };
+        let topmost = style & WS_EX_TOPMOST.0 != 0;
+        let above = nook_rank.zip(nook_style).map(|(nook_rank, nook_style)| {
+            is_above_in_z_order(nook_style & WS_EX_TOPMOST.0 != 0, nook_rank, topmost, rank)
+        });
+        if above == Some(true) {
+            vlc_above_nook = Some(true);
+        } else if vlc_above_nook.is_none() {
+            vlc_above_nook = above;
+        }
+        if vlc_windows.len() < 8 {
+            vlc_windows.push(format!(
+                "{}:{}:z={rank}:{}",
+                hwnd_label(*hwnd),
+                window_class(*hwnd),
+                flags(style)
+            ));
+        }
+    }
+    if vlc_windows.is_empty() {
+        vlc_windows.push("none".into());
+    }
+    let island_bounds = island.map_or_else(|| "unknown".into(), hwnd_rect);
+    let island_owner = island
+        .and_then(|hwnd| unsafe { GetWindow(hwnd, GW_OWNER).ok() })
+        .map_or_else(
+            || "none".into(),
+            |hwnd| {
+                format!(
+                    "{}:{}:{}",
+                    hwnd_label(hwnd),
+                    window_class(hwnd),
+                    hwnd_rect(hwnd)
+                )
+            },
+        );
+    let island_children = island.map_or_else(|| "unknown".into(), child_windows);
+    let child_hit_all = island.map_or_else(
+        || "unknown".into(),
+        |hwnd| child_hit_path(hwnd, point, false),
+    );
+    let child_hit_skip_transparent = island.map_or_else(
+        || "unknown".into(),
+        |hwnd| child_hit_path(hwnd, point, true),
+    );
+    let point_chain = if under.is_invalid() {
+        "none".into()
+    } else {
+        window_parent_chain(under)
+    };
+    let native_windows = format!(
+        "nook_hwnd={} nook_bounds={} nook_owner={} nook_children=[{}] nook_styles={} nook_z={:?} vlc_above_nook={:?} vlc_window_count={} vlc_windows=[{}] child_hit_all=[{}] child_hit_skip_transparent=[{}] point_hwnd={} point_root={} point_chain=[{}] point_target={} ",
+        island.map_or_else(|| "unknown".into(), hwnd_label),
+        island_bounds, island_owner, island_children,
+        nook_style.map_or_else(|| "unknown".into(), flags),
+        nook_rank, vlc_above_nook, vlc_count, vlc_windows.join(";"), child_hit_all, child_hit_skip_transparent, point_hwnd, root_hwnd, point_chain, point_identity,
+    );
+    PointerGateSnapshot {
+        ignore_applied: island.and_then(|_| ignore_cursor_events_applied(win)),
+        point_hits_island,
+        foreground,
+        native_windows,
+    }
+}
+
+/// Cheap Dev-only readback for a pointer point inside the IslandRect. The
+/// caller expands this to full HWND/style diagnostics only when Windows hits
+/// another root window despite the Island being expected to receive input.
+#[cfg(feature = "nook-dev")]
+pub fn point_hits_island(win: &WebviewWindow, cursor_x: f64, cursor_y: f64) -> Option<bool> {
+    let island = hwnd_of(win)?;
+    let point = POINT {
+        x: cursor_x.round() as i32,
+        y: cursor_y.round() as i32,
+    };
+    let under = unsafe { WindowFromPoint(point) };
+    if under.is_invalid() {
+        return Some(false);
+    }
+    let root = unsafe { GetAncestor(under, GA_ROOT) };
+    Some(!root.is_invalid() && root == island)
 }
 
 /// WS_EX_NOACTIVATE keeps clicks from stealing focus; WS_EX_TOOLWINDOW keeps the
@@ -365,7 +642,11 @@ pub fn show_inactive(win: &WebviewWindow) {
     let _ = win.show();
     let Some(hwnd) = hwnd_of(win) else { return };
     unsafe {
-        if before != hwnd && !before.is_invalid() && GetForegroundWindow() == hwnd && IsWindow(Some(before)).as_bool() {
+        if before != hwnd
+            && !before.is_invalid()
+            && GetForegroundWindow() == hwnd
+            && IsWindow(Some(before)).as_bool()
+        {
             let _ = SetForegroundWindow(before);
         }
     }
@@ -395,7 +676,9 @@ const DESKTOP_LOOK: Duration = Duration::from_millis(500);
 /// hidden. Called again for the window it already follows, it starts nothing.
 /// The island is not one of its users.
 pub fn follow_desktops(win: &WebviewWindow, on: bool) {
-    let hwnd = hwnd_of(win).filter(|_| on).map_or(0, |hwnd| hwnd.0 as isize);
+    let hwnd = hwnd_of(win)
+        .filter(|_| on)
+        .map_or(0, |hwnd| hwnd.0 as isize);
     DESKTOP_WATCH.store(hwnd, Ordering::SeqCst);
     if hwnd == 0 || DESKTOP_RUNNING.swap(true, Ordering::SeqCst) {
         return;
@@ -404,7 +687,8 @@ pub fn follow_desktops(win: &WebviewWindow, on: bool) {
         watch_desktops();
         DESKTOP_RUNNING.store(false, Ordering::SeqCst);
         // Asked again between the last look and the flag going down: this thread carries on.
-        if DESKTOP_WATCH.load(Ordering::SeqCst) == 0 || DESKTOP_RUNNING.swap(true, Ordering::SeqCst) {
+        if DESKTOP_WATCH.load(Ordering::SeqCst) == 0 || DESKTOP_RUNNING.swap(true, Ordering::SeqCst)
+        {
             break;
         }
     });
@@ -415,7 +699,10 @@ fn watch_desktops() {
     // The manager is made on this thread and used only here. A thread that
     // was already in another apartment is fine too: the call is just not undone.
     let initialised = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
-    let manager = unsafe { CoCreateInstance::<_, IVirtualDesktopManager>(&VirtualDesktopManager, None, CLSCTX_ALL) }.ok();
+    let manager = unsafe {
+        CoCreateInstance::<_, IVirtualDesktopManager>(&VirtualDesktopManager, None, CLSCTX_ALL)
+    }
+    .ok();
     if let Some(manager) = manager {
         loop {
             let raw = DESKTOP_WATCH.load(Ordering::SeqCst);
@@ -451,12 +738,18 @@ fn window_under_cursor() -> Option<HWND> {
 /// Any call that fails leaves things as they are. Nothing here takes the focus.
 fn move_to_current_desktop(manager: &IVirtualDesktopManager, hwnd: HWND) {
     // What the manager says of a window; `default` when it cannot say.
-    let here = |window: HWND, default: bool| unsafe { manager.IsWindowOnCurrentVirtualDesktop(window) }.map_or(default, |on| on.as_bool());
+    let here = |window: HWND, default: bool| {
+        unsafe { manager.IsWindowOnCurrentVirtualDesktop(window) }
+            .map_or(default, |on| on.as_bool())
+    };
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() || here(hwnd, true) {
             return;
         }
-        for reference in [Some(GetForegroundWindow()), window_under_cursor()].into_iter().flatten() {
+        for reference in [Some(GetForegroundWindow()), window_under_cursor()]
+            .into_iter()
+            .flatten()
+        {
             if reference.is_invalid() || reference == hwnd || !here(reference, false) {
                 continue;
             }
@@ -471,7 +764,12 @@ fn move_to_current_desktop(manager: &IVirtualDesktopManager, hwnd: HWND) {
 // ── Full-screen apps ──────────────────────────────────────────────────────────
 
 fn rect_of(r: RECT) -> fullscreen::Rect {
-    fullscreen::Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom }
+    fullscreen::Rect {
+        left: r.left,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+    }
 }
 
 /// The window in front, as fullscreen.rs wants it described. None when there
@@ -485,7 +783,10 @@ fn foreground(island: Option<HWND>) -> Option<Foreground> {
         let mut rect = RECT::default();
         GetWindowRect(front, &mut rect).ok()?;
         let monitor = MonitorFromWindow(front, MONITOR_DEFAULTTONEAREST);
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         if !GetMonitorInfoW(monitor, &mut info).as_bool() {
             return None;
         }
@@ -494,6 +795,7 @@ fn foreground(island: Option<HWND>) -> Option<Foreground> {
         let mut pid = 0u32;
         GetWindowThreadProcessId(front, Some(&mut pid));
         let captioned = GetWindowLongPtrW(front, GWL_STYLE) as u32 & WS_CAPTION.0 == WS_CAPTION.0;
+        let maximised = IsZoomed(front).as_bool();
         Some(Foreground {
             rect: rect_of(rect),
             monitor: rect_of(info.rcMonitor),
@@ -501,8 +803,12 @@ fn foreground(island: Option<HWND>) -> Option<Foreground> {
             process: image_name(pid).unwrap_or_default(),
             own: pid == GetCurrentProcessId(),
             // With no island window to compare with, its display is taken to be this one.
-            on_island_display: island.is_none_or(|island| MonitorFromWindow(island, MONITOR_DEFAULTTONEAREST) == monitor),
-            framed_maximised: IsZoomed(front).as_bool() && captioned,
+            on_island_display: island.is_none_or(|island| {
+                MonitorFromWindow(island, MONITOR_DEFAULTTONEAREST) == monitor
+            }),
+            framed_maximised: maximised && captioned,
+            maximised,
+            captioned,
         })
     }
 }
@@ -526,6 +832,11 @@ pub fn fullscreen_verdict(island: Option<&WebviewWindow>) -> (bool, String) {
     let front = foreground(island.and_then(hwnd_of));
     let full = fullscreen::is_fullscreen(front.as_ref(), notification);
     let said = match &front {
+        Some(f) if cfg!(feature = "nook-dev") => format!(
+            "front class={} process={} rect={},{},{},{} display={},{},{},{} maximised={} captioned={} shell={notification:?}",
+            f.class, f.process, f.rect.left, f.rect.top, f.rect.right, f.rect.bottom,
+            f.monitor.left, f.monitor.top, f.monitor.right, f.monitor.bottom, f.maximised, f.captioned
+        ),
         Some(f) => format!(
             "front class={} process={} rect={},{},{},{} display={},{},{},{} framed_maximised={} shell={notification:?}",
             f.class, f.process, f.rect.left, f.rect.top, f.rect.right, f.rect.bottom,
@@ -555,13 +866,22 @@ pub fn image_name(pid: u32) -> Option<String> {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
-        let read = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let read = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
         let _ = CloseHandle(process);
         if !read {
             return None;
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
-        path.rsplit(['\\', '/']).next().filter(|name| !name.is_empty()).map(str::to_string)
+        path.rsplit(['\\', '/'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -575,7 +895,10 @@ pub fn top_windows() -> Vec<Window> {
         let mut title = [0u16; 512];
         let (class_len, title_len) = unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            (GetClassNameW(hwnd, &mut class).max(0) as usize, GetWindowTextW(hwnd, &mut title).max(0) as usize)
+            (
+                GetClassNameW(hwnd, &mut class).max(0) as usize,
+                GetWindowTextW(hwnd, &mut title).max(0) as usize,
+            )
         };
         out.push(Window {
             hwnd: hwnd.0 as isize,
@@ -584,7 +907,9 @@ pub fn top_windows() -> Vec<Window> {
             class: String::from_utf16_lossy(&class[..class_len]),
             title: String::from_utf16_lossy(&title[..title_len]),
             visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
-            owner: unsafe { GetWindow(hwnd, GW_OWNER) }.map(|owner| owner.0 as isize).unwrap_or(0),
+            owner: unsafe { GetWindow(hwnd, GW_OWNER) }
+                .map(|owner| owner.0 as isize)
+                .unwrap_or(0),
         });
         true.into()
     }
@@ -594,7 +919,9 @@ pub fn top_windows() -> Vec<Window> {
     // One look per process, not per window: an editor has many windows.
     let mut images: HashMap<u32, String> = HashMap::new();
     for window in &mut windows {
-        let image = images.entry(window.pid).or_insert_with(|| image_name(window.pid).unwrap_or_default().to_lowercase());
+        let image = images
+            .entry(window.pid)
+            .or_insert_with(|| image_name(window.pid).unwrap_or_default().to_lowercase());
         window.image = image.clone();
     }
     windows
@@ -719,7 +1046,10 @@ pub fn elevated_out_of_reach(hwnd: isize) -> bool {
     }
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)) };
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { return true };
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
+        return true;
+    };
     let elevated = token_elevated(process).unwrap_or(true);
     let _ = unsafe { CloseHandle(process) };
     elevated
@@ -728,8 +1058,14 @@ pub fn elevated_out_of_reach(hwnd: isize) -> bool {
 /// True once the Enter, Shift, Ctrl, Alt and Windows keys are all up, waiting up
 /// to `ms` for it: the user has just pressed Enter in the island.
 pub fn wait_keys_released(ms: u64) -> bool {
-    use ::windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT};
-    let down = || [VK_RETURN, VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN].iter().any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0);
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT,
+    };
+    let down = || {
+        [VK_RETURN, VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+            .iter()
+            .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+    };
     let until = Instant::now() + Duration::from_millis(ms);
     loop {
         if !down() {
@@ -746,15 +1082,23 @@ pub fn wait_keys_released(ms: u64) -> bool {
 /// and up for each unit of UTF-16; Enter as the key. Returns how many input
 /// events the system took, and how many there were.
 pub fn send_keys(keys: &[crate::reply_here::KeyAction]) -> (usize, usize) {
-    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
-        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
-        VIRTUAL_KEY, VK_RETURN,
-    };
     use crate::reply_here::KeyAction;
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_RETURN,
+    };
 
     let stroke = |vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
     };
     let mut events: Vec<INPUT> = Vec::with_capacity(keys.len() * 2);
     for key in keys {
@@ -763,7 +1107,11 @@ pub fn send_keys(keys: &[crate::reply_here::KeyAction]) -> (usize, usize) {
                 let mut units = [0u16; 2];
                 for unit in c.encode_utf16(&mut units) {
                     events.push(stroke(VIRTUAL_KEY(0), *unit, KEYEVENTF_UNICODE));
-                    events.push(stroke(VIRTUAL_KEY(0), *unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+                    events.push(stroke(
+                        VIRTUAL_KEY(0),
+                        *unit,
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                    ));
                 }
             }
             KeyAction::Enter => {
@@ -781,10 +1129,22 @@ pub fn send_keys(keys: &[crate::reply_here::KeyAction]) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "nook-dev")]
+    #[test]
+    fn z_order_comparison_respects_topmost_partition_and_rank() {
+        assert!(is_above_in_z_order(false, 10, true, 20));
+        assert!(!is_above_in_z_order(true, 10, false, 0));
+        assert!(is_above_in_z_order(true, 3, true, 2));
+        assert!(!is_above_in_z_order(false, 3, false, 4));
+    }
+
     #[test]
     fn a_process_is_named_by_its_image_and_never_by_a_path() {
         let name = image_name(std::process::id()).expect("our own process has an image");
-        assert!(name.to_lowercase().ends_with(".exe") && !name.contains(['\\', '/']), "{name}");
+        assert!(
+            name.to_lowercase().ends_with(".exe") && !name.contains(['\\', '/']),
+            "{name}"
+        );
         // No process has this pid: nothing is named.
         assert_eq!(image_name(u32::MAX - 3), None);
     }
@@ -800,34 +1160,6 @@ mod tests {
         assert!(!bring_forward(0));
     }
 
-    /// The real counters of this machine, read a few times a moment apart:
-    /// what the island would show, and what a tick costs. A machine without
-    /// them says why and passes. `cargo test -p nook -- the_graphics --nocapture` prints it.
-    #[test]
-    fn the_graphics_counters_are_read_or_say_why_not() {
-        let opened = Instant::now();
-        let mut counters = match GpuCounters::open() {
-            Ok(counters) => counters,
-            Err(why) => return eprintln!("gpu: not measured here — {why}"),
-        };
-        let first = counters.collect();
-        eprintln!("gpu: opened and first reading in {:?}", opened.elapsed());
-        if let Err(why) = first {
-            return eprintln!("gpu: not measured here — {why}");
-        }
-        for _ in 0..4 {
-            std::thread::sleep(Duration::from_millis(500));
-            let tick = Instant::now();
-            let collected = counters.collect();
-            let collect = tick.elapsed();
-            let value = collected.and_then(|()| counters.read());
-            eprintln!("gpu: {value:?} — tick {:?} (collect {collect:?}), {} bytes of instances", tick.elapsed(), counters.buffer.len() * 8);
-            if let Ok(Some(percent)) = value {
-                assert!((0.0..=100.0).contains(&percent), "{percent}");
-            }
-        }
-    }
-
     /// Takes the foreground away from whatever has it and gives it back, from a
     /// process with no claim to it at all — a harder case than the island's.
     /// Run by hand: `cargo test -p nook -- --ignored comes_forward --nocapture`.
@@ -836,10 +1168,21 @@ mod tests {
     fn a_window_comes_forward_and_the_one_before_it_comes_back() {
         let front = unsafe { GetForegroundWindow() }.0 as isize;
         let other = top_windows().into_iter().find(|w| {
-            w.hwnd != front && w.visible && w.owner == 0 && !w.title.is_empty() && ["code.exe", "windowsterminal.exe"].contains(&w.image.as_str())
+            w.hwnd != front
+                && w.visible
+                && w.owner == 0
+                && !w.title.is_empty()
+                && ["code.exe", "windowsterminal.exe"].contains(&w.image.as_str())
         });
-        let Some(other) = other else { return eprintln!("no editor or terminal window to try with") };
-        let describe = |hwnd: isize| top_windows().into_iter().find(|w| w.hwnd == hwnd).map(|w| format!("{} [{}]", w.image, w.class));
+        let Some(other) = other else {
+            return eprintln!("no editor or terminal window to try with");
+        };
+        let describe = |hwnd: isize| {
+            top_windows()
+                .into_iter()
+                .find(|w| w.hwnd == hwnd)
+                .map(|w| format!("{} [{}]", w.image, w.class))
+        };
         eprintln!("in front: {:?}; going to {}", describe(front), other.image);
         let went = take_foreground(HWND(other.hwnd as *mut _));
         eprintln!("went: {went:?}");
@@ -847,6 +1190,9 @@ mod tests {
         let back = (front != 0).then(|| take_foreground(HWND(front as *mut _)));
         eprintln!("came back: {back:?}");
         assert!(went.is_some(), "the window did not come forward");
-        assert!(back.is_none_or(|how| how.is_some()), "the window that was in front did not come back");
+        assert!(
+            back.is_none_or(|how| how.is_some()),
+            "the window that was in front did not come back"
+        );
     }
 }

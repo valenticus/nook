@@ -2,18 +2,27 @@ import { defineConfig, type Plugin } from "vite";
 import { existsSync, mkdirSync, readdirSync, copyFileSync, createReadStream } from "node:fs";
 import { resolve, join, extname } from "node:path";
 
+const isNookDevBuild = process.env.NOOK_DEV_BUILD === "1";
+const isNookStandaloneBuild = process.env.NOOK_STANDALONE_BUILD === "1";
+const frontendOutDir = isNookDevBuild ? "dist-dev" : isNookStandaloneBuild ? "dist-standalone" : "dist";
+
 // ───────────────────────────────────────────────────────────────────────────────
 // THE one and only place the sound folder is declared: the 28 WAVs in `sounds/`.
 export const SOUNDS_DIR = resolve(__dirname, "sounds");
 // ───────────────────────────────────────────────────────────────────────────────
 
 /**
- * Serves SOUNDS_DIR at /sounds/*.wav in dev, and copies it into dist/sounds on build.
+ * Serves SOUNDS_DIR at /sounds/*.wav in dev, and copies it into the selected
+ * frontend output directory on build.
  */
 function sharedSounds(): Plugin {
   const prefix = "/sounds/";
+  let outputDir = resolve(__dirname, frontendOutDir);
   return {
     name: "nook-shared-sounds",
+    configResolved(config) {
+      outputDir = config.build.outDir;
+    },
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         if (!req.url?.startsWith(prefix)) return next();
@@ -26,7 +35,7 @@ function sharedSounds(): Plugin {
       });
     },
     closeBundle() {
-      const out = resolve(__dirname, "dist/sounds");
+      const out = resolve(outputDir, "sounds");
       if (!existsSync(SOUNDS_DIR)) {
         this.warn(`sounds not found at ${SOUNDS_DIR} — the build will ship without audio`);
         return;
@@ -40,11 +49,16 @@ function sharedSounds(): Plugin {
 }
 
 export default defineConfig({
+  define: {
+    __NOOK_DEV_BUILD__: JSON.stringify(isNookDevBuild),
+    __NOOK_STANDALONE_BUILD__: JSON.stringify(isNookStandaloneBuild),
+  },
   plugins: [sharedSounds()],
   clearScreen: false,
   server: { port: 1420, strictPort: true, host: "127.0.0.1" },
   envPrefix: ["VITE_", "TAURI_ENV_"],
   build: {
+    outDir: frontendOutDir,
     target: "chrome110",
     minify: "esbuild",
     sourcemap: false,

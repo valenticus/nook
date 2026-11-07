@@ -1,17 +1,25 @@
 // Nook for Windows — app wiring and the commands the island calls.
 
 mod about;
+#[cfg(feature = "system-battery")]
+mod battery;
 mod agents;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod codex_hooks;
+#[cfg(feature = "codex-quota")]
+mod codex_quota;
+mod connect_identity;
+mod connect_plan;
+mod connect_scanner;
 mod cursor_hooks;
+#[cfg(feature = "nook-dev")]
+mod dev_simulator;
 mod dock;
 mod fullscreen;
 mod hooks;
 mod island;
 mod log;
 mod media;
-mod metrics;
 mod openfile;
 mod pipe;
 mod platform;
@@ -26,6 +34,7 @@ mod shortcut;
 mod statusline;
 mod target;
 mod tray;
+#[cfg(not(feature = "nook-standalone"))]
 mod update;
 mod usage;
 mod visibility;
@@ -36,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
-use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 use hooks::{HookPreview, HookStatus};
 use island::{PanelSize, PollGate, ScreenInfo};
@@ -48,6 +57,107 @@ use target::{Kind, Plan, Sessions};
 pub struct Shared {
     pub settings: Mutex<Settings>,
     pub gate: Arc<PollGate>,
+}
+
+const PRODUCTION_IDENTIFIER: &str = "io.github.zubairbinshaukat.nook";
+const DEV_IDENTIFIER: &str = "io.github.zubairbinshaukat.nook.dev";
+const STANDALONE_IDENTIFIER: &str = "io.github.valenticus.nook";
+
+/// Version exposed by this build. Cargo metadata remains aligned with the
+/// Original app; the separate Standalone product has its own release cadence.
+pub fn app_version() -> &'static str {
+    if cfg!(feature = "nook-standalone") {
+        "0.1.0"
+    } else {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
+fn is_nook_dev() -> bool {
+    cfg!(feature = "nook-dev")
+}
+
+fn ensure_agent_config_changes_allowed() -> Result<(), String> {
+    if is_nook_dev() {
+        Err("Agent configuration changes are disabled in Nook Dev".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn app_identifier_matches_build(identifier: &str) -> bool {
+    let expected = if cfg!(feature = "nook-standalone") {
+        STANDALONE_IDENTIFIER
+    } else if is_nook_dev() {
+        DEV_IDENTIFIER
+    } else {
+        PRODUCTION_IDENTIFIER
+    };
+    identifier == expected
+}
+
+fn ensure_connect_apply_allowed() -> Result<(), String> {
+    if cfg!(feature = "nook-dev") {
+        Err("Connect changes are disabled in Nook Dev; it supports read-only preview only.".into())
+    } else if cfg!(feature = "nook-standalone") {
+        Ok(())
+    } else {
+        Err("Safe Connect Apply is available only in standalone Nook.".into())
+    }
+}
+
+fn ensure_legacy_agent_apply_allowed() -> Result<(), String> {
+    if cfg!(feature = "nook-standalone") {
+        Err("Use the reviewed Connect preview and Safe Apply in standalone Nook.".into())
+    } else {
+        ensure_agent_config_changes_allowed()
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    #[test]
+    fn agent_configuration_mutation_guard_matches_feature() {
+        assert_eq!(
+            ensure_agent_config_changes_allowed().is_ok(),
+            !cfg!(feature = "nook-dev")
+        );
+    }
+
+    #[test]
+    fn tauri_identifier_must_match_the_compiled_mode() {
+        let (expected, other) = if cfg!(feature = "nook-standalone") {
+            (STANDALONE_IDENTIFIER, PRODUCTION_IDENTIFIER)
+        } else if cfg!(feature = "nook-dev") {
+            (DEV_IDENTIFIER, PRODUCTION_IDENTIFIER)
+        } else {
+            (PRODUCTION_IDENTIFIER, DEV_IDENTIFIER)
+        };
+        assert!(app_identifier_matches_build(expected));
+        assert!(!app_identifier_matches_build(other));
+    }
+
+    #[test]
+    fn safe_apply_is_standalone_only() {
+        assert_eq!(
+            ensure_connect_apply_allowed().is_ok(),
+            cfg!(feature = "nook-standalone")
+        );
+    }
+
+    #[test]
+    fn runtime_version_matches_product_variant() {
+        assert_eq!(
+            app_version(),
+            if cfg!(feature = "nook-standalone") {
+                "0.1.0"
+            } else {
+                "0.2.2"
+            }
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -63,6 +173,8 @@ pub struct BootInfo {
     /// False where the OS has no global cursor (Wayland): the page then reports
     /// the cursor from its own mouse events.
     cursor_poll: bool,
+    nook_dev: bool,
+    nook_standalone: bool,
 }
 
 #[tauri::command]
@@ -74,21 +186,35 @@ fn boot(app: AppHandle, window: tauri::Window, shared: State<Shared>) -> BootInf
     }
     let mut settings = shared.settings.lock().unwrap().clone();
     // The real state of ~/.claude/settings.json wins over whatever we stored.
-    settings.hooks_installed = hooks::status().installed;
+    settings.hooks_installed = !is_nook_dev() && hooks::status().installed;
     let screen = island::screen_info(&app, &settings.screen);
     let panel = *shared.gate.panel.lock().unwrap();
     BootInfo {
         settings,
         screen,
         panel,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: app_version().to_string(),
         hook_path: settings::hook_exe_path().to_string_lossy().to_string(),
         cursor_poll: platform::CURSOR_POLL,
+        nook_dev: is_nook_dev(),
+        nook_standalone: cfg!(feature = "nook-standalone"),
     }
 }
 
 #[tauri::command]
 fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
+    let settings = if is_nook_dev() {
+        Settings {
+            autostart: false,
+            check_updates: false,
+            ..settings
+        }
+    } else {
+        settings
+    };
+    #[cfg(feature = "codex-quota")]
+    app.state::<codex_quota::Provider>()
+        .set_enabled(settings.codex_quota_enabled);
     let (screen_changed, autostart_changed, theme_changed, agents_changed, settings) = {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
@@ -122,7 +248,13 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
         let theme_changed = current.theme != settings.theme;
         let agents_changed = current.show_agents_list != settings.show_agents_list;
         *current = settings.clone();
-        (screen_changed, autostart_changed, theme_changed, agents_changed, settings)
+        (
+            screen_changed,
+            autostart_changed,
+            theme_changed,
+            agents_changed,
+            settings,
+        )
     };
     if let Err(err) = settings::save(&settings) {
         eprintln!("[nook] could not save settings: {err}");
@@ -130,9 +262,13 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     if theme_changed {
         wear_theme(&app, &settings.theme);
     }
-    if autostart_changed {
+    if autostart_changed && !is_nook_dev() {
         let manager = app.autolaunch();
-        let result = if settings.autostart { manager.enable() } else { manager.disable() };
+        let result = if settings.autostart {
+            manager.enable()
+        } else {
+            manager.disable()
+        };
         if let Err(err) = result {
             eprintln!("[nook] autostart: {err}");
         }
@@ -149,6 +285,11 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     if agents_changed {
         agents::set_enabled(&app, settings.show_agents_list);
     }
+}
+
+#[tauri::command]
+fn tray_set_labels(app: AppHandle, labels: tray::TrayMenuLabels) -> Result<(), String> {
+    tray::set_labels(&app, labels)
 }
 
 /// The display the island lives on and the edge it hangs from, as saved.
@@ -172,7 +313,12 @@ fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
 /// The front end pushes the island shape; Rust decides click-through from it.
 #[tauri::command]
 fn set_island_rect(app: AppHandle, shared: State<Shared>, x: f64, y: f64, width: f64, height: f64) {
-    shared.gate.set_rect(island::IslandRect { x, y, w: width, h: height });
+    shared.gate.set_rect(island::IslandRect {
+        x,
+        y,
+        w: width,
+        h: height,
+    });
     // Without the cursor poll the input region is the click-through: it follows the island.
     if !platform::CURSOR_POLL {
         island::refresh_click_through(&app, &shared.gate);
@@ -183,7 +329,9 @@ fn set_island_rect(app: AppHandle, shared: State<Shared>, x: f64, y: f64, width:
 /// Escape, the sidebar's arrows — or gives it back to whoever had it.
 #[tauri::command]
 fn focus_window(app: AppHandle, focused: bool) {
-    let Some(win) = island::window(&app) else { return };
+    let Some(win) = island::window(&app) else {
+        return;
+    };
     platform::set_activating(&win, focused);
     if focused {
         let _ = win.set_focus();
@@ -229,7 +377,11 @@ fn focus_session(sessions: State<Sessions>, session_id: String) -> bool {
         return false;
     };
     let went = go_to(&plan);
-    log::line(format!("focus session in {}: {}", plan.target.label, if went { "done" } else { "no window to go to" }));
+    log::line(format!(
+        "focus session in {}: {}",
+        plan.target.label,
+        if went { "done" } else { "no window to go to" }
+    ));
     went
 }
 
@@ -250,7 +402,9 @@ fn plan_window(plan: &Plan) -> Option<isize> {
             let named = plan.target.pid.is_some_and(|pid| pids.contains(&pid));
             target::editor_image(&plan.target)
                 .filter(|_| named)
-                .and_then(|image| target::editor_window(&platform::top_windows(), image, cwd, &pids))
+                .and_then(|image| {
+                    target::editor_window(&platform::top_windows(), image, cwd, &pids)
+                })
         }
     }
 }
@@ -266,7 +420,8 @@ fn go_to(plan: &Plan) -> bool {
         Kind::Vscode | Kind::Cursor => match plan_window(plan) {
             Some(window) => platform::bring_forward(window),
             // No window of it at all: the folder is opened in it, as before.
-            None => target::launcher_of(&plan.target).is_some_and(|launcher| open_folder_in(launcher, plan.cwd.clone())),
+            None => target::launcher_of(&plan.target)
+                .is_some_and(|launcher| open_folder_in(launcher, plan.cwd.clone())),
         },
     }
 }
@@ -308,13 +463,20 @@ fn open_folder_in(launcher: &str, path: Option<String>) -> bool {
 /// the relay reported, running in an editor (VS Code, VS Code Insiders,
 /// Cursor). What `open_session_file` opens for, `session_files_exist` answers
 /// for, and no other.
-fn editor_session(sessions: &Sessions, session_id: &str) -> Result<(Plan, &'static str), &'static str> {
-    let plan = sessions.plan(session_id).ok_or("nothing known of where the session runs")?;
+fn editor_session(
+    sessions: &Sessions,
+    session_id: &str,
+) -> Result<(Plan, &'static str), &'static str> {
+    let plan = sessions
+        .plan(session_id)
+        .ok_or("nothing known of where the session runs")?;
     let launcher = match plan.target.kind {
         Kind::Vscode | Kind::Cursor => target::launcher_of(&plan.target),
         _ => None,
     };
-    launcher.map(|launcher| (plan, launcher)).ok_or("the session does not run in an editor")
+    launcher
+        .map(|launcher| (plan, launcher))
+        .ok_or("the session does not run in an editor")
 }
 
 /// Whether the names a reply writes are files that `open_session_file` would
@@ -327,7 +489,11 @@ fn editor_session(sessions: &Sessions, session_id: &str) -> Result<(Plan, &'stat
 ///
 /// Off the main thread: it looks at the file system.
 #[tauri::command(async)]
-fn session_files_exist(sessions: State<Sessions>, session_id: String, paths: Vec<String>) -> Vec<bool> {
+fn session_files_exist(
+    sessions: State<Sessions>,
+    session_id: String,
+    paths: Vec<String>,
+) -> Vec<bool> {
     match editor_session(&sessions, &session_id) {
         Ok((plan, _)) => openfile::exist(plan.cwd.as_deref(), &paths),
         Err(_) => vec![false; paths.len()],
@@ -353,7 +519,12 @@ fn session_files_exist(sessions: State<Sessions>, session_id: String, paths: Vec
 ///
 /// Off the main thread: it looks at the file system and starts a process.
 #[tauri::command(async)]
-fn open_session_file(sessions: State<Sessions>, session_id: String, path: String, line: Option<u32>) -> bool {
+fn open_session_file(
+    sessions: State<Sessions>,
+    session_id: String,
+    path: String,
+    line: Option<u32>,
+) -> bool {
     let (plan, launcher) = match editor_session(&sessions, &session_id) {
         Ok(found) => found,
         Err(why) => {
@@ -370,13 +541,25 @@ fn open_session_file(sessions: State<Sessions>, session_id: String, path: String
         return false;
     };
     let Some(program) = platform::find_on_path(launcher) else {
-        log::line(format!("open file in {}: `{launcher}` is not on PATH", plan.target.label));
+        log::line(format!(
+            "open file in {}: `{launcher}` is not on PATH",
+            plan.target.label
+        ));
         return false;
     };
     let mut cmd = Command::new(program);
-    cmd.arg("--goto").arg(openfile::goto_argument(&file, line, col));
+    cmd.arg("--goto")
+        .arg(openfile::goto_argument(&file, line, col));
     let opened = platform::no_console(&mut cmd).spawn().is_ok();
-    log::line(format!("open file in {}: {}", plan.target.label, if opened { "done" } else { "the launcher did not start" }));
+    log::line(format!(
+        "open file in {}: {}",
+        plan.target.label,
+        if opened {
+            "done"
+        } else {
+            "the launcher did not start"
+        }
+    ));
     opened
 }
 
@@ -385,16 +568,136 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// Inventories the current user's global configs and explicitly supplied
+/// project roots. This command is read-only, including in Nook Dev.
+#[tauri::command]
+fn connect_scan(
+    store: State<shelf::Store>,
+    delivery: State<connect_scanner::DeliveryTracker>,
+) -> connect_scanner::ConnectScan {
+    let roots = projects::list(&store)
+        .into_iter()
+        .map(|project| project.path)
+        .collect::<Vec<_>>();
+    let mut scan = connect_scanner::scan(&roots);
+    delivery.attach(&mut scan);
+    scan
+}
+
+#[tauri::command]
+fn connect_preview(
+    agent: String,
+    operation: String,
+    approved_dev_scopes: Vec<String>,
+    store: State<shelf::Store>,
+    tickets: State<connect_plan::PreviewTicket>,
+) -> Result<connect_plan::Preview, String> {
+    let operation = match operation.to_ascii_lowercase().as_str() {
+        "connect" => connect_plan::Operation::Connect,
+        "disconnect" => connect_plan::Operation::Disconnect,
+        "repair" => connect_plan::Operation::Repair,
+        _ => return Err("Unknown Connect preview operation".into()),
+    };
+    let roots = projects::list(&store)
+        .into_iter()
+        .map(|project| project.path)
+        .collect::<Vec<_>>();
+    let agent = match agent.to_ascii_lowercase().as_str() {
+        "claudecode" | "claude_code" => connect_scanner::Agent::ClaudeCode,
+        "codex" => connect_scanner::Agent::Codex,
+        _ => return Err("Unknown Connect agent".into()),
+    };
+    let plan = connect_plan::preview_agent_with_dev_scopes(operation, agent, &roots, &approved_dev_scopes);
+    tickets.issue(plan)
+}
+
+fn same_connect_revision(
+    expected: &connect_plan::Preview,
+    current: &connect_plan::Preview,
+) -> bool {
+    expected.operation == current.operation
+        && expected.agent == current.agent
+        && expected.target_relay == current.target_relay
+        && expected.requires_original_migration == current.requires_original_migration
+        && expected.codex_trust_required == current.codex_trust_required
+        && expected.approved_dev_scopes == current.approved_dev_scopes
+        && expected.dev_scopes_requiring_approval == current.dev_scopes_requiring_approval
+        && expected.conflicts == current.conflicts
+        && expected.files.len() == current.files.len()
+        && expected.files.iter().zip(&current.files).all(|(a, b)| {
+            a.agent == b.agent
+                && a.scope == b.scope
+                && a.path == b.path
+                && a.status == b.status
+                && a.fingerprint == b.fingerprint
+                && a.diff == b.diff
+        })
+}
+
+#[tauri::command]
+fn connect_apply(
+    preview_id: String,
+    confirmed: bool,
+    approved_dev_scopes: Vec<String>,
+    codex_trust_approved: bool,
+    original_migration_approved: bool,
+    store: State<shelf::Store>,
+    tickets: State<connect_plan::PreviewTicket>,
+) -> Result<Vec<String>, String> {
+    ensure_connect_apply_allowed()?;
+    if !confirmed {
+        return Err("Connect changes require explicit confirmation.".into());
+    }
+    let reviewed = tickets.take(&preview_id)?;
+    if reviewed.requires_original_migration && !original_migration_approved {
+        return Err("Original Nook migration requires its own explicit confirmation.".into());
+    }
+    let mut requested = approved_dev_scopes;
+    requested.sort();
+    let mut planned = reviewed.approved_dev_scopes.clone();
+    planned.sort();
+    if requested != planned {
+        return Err("Dev scope confirmations do not match the reviewed preview.".into());
+    }
+    let roots = projects::list(&store)
+        .into_iter()
+        .map(|project| project.path)
+        .collect::<Vec<_>>();
+    let current = if let Some(agent) = reviewed.agent {
+        connect_plan::preview_agent_with_dev_scopes(reviewed.operation, agent, &roots, &planned)
+    } else {
+        connect_plan::preview_with_dev_scopes(reviewed.operation, &roots, &planned)
+    };
+    if !same_connect_revision(&reviewed, &current) {
+        return Err(
+            "Configuration changed since preview. Nothing was applied; review a fresh preview."
+                .into(),
+        );
+    }
+    connect_plan::apply_preview(&reviewed, codex_trust_approved, None)
+}
+
 // ── Claude Code hooks ─────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn hooks_status() -> HookStatus {
-    hooks::status()
+    if is_nook_dev() {
+        HookStatus {
+            installed: false,
+            legacy: false,
+            settings_path: "Disabled in Nook Dev".into(),
+            hook_ready: false,
+            hook_path: "Disabled in Nook Dev".into(),
+        }
+    } else {
+        hooks::status()
+    }
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
 fn hooks_preview(install: bool) -> Result<HookPreview, String> {
+    ensure_legacy_agent_apply_allowed()?;
     hooks::preview(install)
 }
 
@@ -406,6 +709,7 @@ fn hooks_apply(
     install: bool,
     fingerprint: String,
 ) -> Result<String, String> {
+    ensure_legacy_agent_apply_allowed()?;
     // The fingerprint comes from the preview the user actually looked at, so a
     // settings.json that changed in between is refused rather than overwritten.
     let backup = hooks::write(install, &fingerprint)?;
@@ -423,18 +727,39 @@ fn hooks_apply(
 
 #[tauri::command]
 fn cursor_status() -> cursor_hooks::CursorStatus {
-    cursor_hooks::status()
+    if is_nook_dev() {
+        cursor_hooks::CursorStatus {
+            installed: false,
+            current: false,
+            file_exists: false,
+            cursor_found: false,
+            hooks_path: "Disabled in Nook Dev".into(),
+            hook_path: "Disabled in Nook Dev".into(),
+            hook_ready: false,
+            refused: None,
+            unreadable: None,
+        }
+    } else {
+        cursor_hooks::status()
+    }
 }
 
 /// The diff to look at before anything is written. `install: false` previews removal.
 #[tauri::command]
 fn cursor_preview(install: bool) -> Result<HookPreview, String> {
+    ensure_legacy_agent_apply_allowed()?;
     cursor_hooks::preview(install)
 }
 
 /// Only ever called from an explicit click in the settings window.
 #[tauri::command]
-fn cursor_apply(app: AppHandle, shared: State<Shared>, install: bool, fingerprint: String) -> Result<String, String> {
+fn cursor_apply(
+    app: AppHandle,
+    shared: State<Shared>,
+    install: bool,
+    fingerprint: String,
+) -> Result<String, String> {
+    ensure_agent_config_changes_allowed()?;
     let backup = cursor_hooks::apply(install, &fingerprint)?;
     // Installed hooks mean Cursor sessions are wanted; removed, there is nothing to show.
     let updated = {
@@ -453,18 +778,39 @@ fn cursor_apply(app: AppHandle, shared: State<Shared>, install: bool, fingerprin
 
 #[tauri::command]
 fn codex_status() -> codex_hooks::CodexStatus {
-    codex_hooks::status()
+    if is_nook_dev() {
+        codex_hooks::CodexStatus {
+            installed: false,
+            current: false,
+            file_exists: false,
+            codex_found: false,
+            hooks_path: "Disabled in Nook Dev".into(),
+            hook_path: "Disabled in Nook Dev".into(),
+            hook_ready: false,
+            refused: None,
+            unreadable: None,
+        }
+    } else {
+        codex_hooks::status()
+    }
 }
 
 /// The diff to look at before anything is written. `install: false` previews removal.
 #[tauri::command]
 fn codex_preview(install: bool) -> Result<HookPreview, String> {
+    ensure_agent_config_changes_allowed()?;
     codex_hooks::preview(install)
 }
 
 /// Only ever called from an explicit click in the settings window.
 #[tauri::command]
-fn codex_apply(app: AppHandle, shared: State<Shared>, install: bool, fingerprint: String) -> Result<String, String> {
+fn codex_apply(
+    app: AppHandle,
+    shared: State<Shared>,
+    install: bool,
+    fingerprint: String,
+) -> Result<String, String> {
+    ensure_agent_config_changes_allowed()?;
     let backup = codex_hooks::apply(install, &fingerprint)?;
     // Installed hooks mean Codex sessions are wanted; removed, there is nothing to show.
     let updated = {
@@ -487,23 +833,60 @@ fn usage_last(app: AppHandle) -> Option<usage::Usage> {
     usage::last(&app)
 }
 
+/// Codex quotas are read passively by the Nook Dev and Standalone app-server provider.
+/// Return only the in-memory result so the Settings UI cannot start another poll.
+#[cfg(feature = "codex-quota")]
+#[tauri::command]
+fn codex_quota_last(provider: State<'_, codex_quota::Provider>) -> codex_quota::Snapshot {
+    provider.last_snapshot()
+}
+
 /// Whether the relay is Claude Code's status line command, which is how the
 /// usage limits reach Nook.
 #[tauri::command]
-fn usage_status() -> UsageStatus {
-    statusline::status()
+fn usage_status(store: State<'_, shelf::Store>) -> UsageStatus {
+    if is_nook_dev() {
+        UsageStatus {
+            installed: false,
+            chained: false,
+            other_status_line: false,
+            status_line_owner: statusline::StatusLineOwner::None,
+            status_line_relay: None,
+            settings_path: "Disabled in Nook Dev".into(),
+            project_overrides: Vec::new(),
+            project_scan_warnings: Vec::new(),
+        }
+    } else {
+        let roots = projects::list(&store)
+            .into_iter()
+            .map(|project| std::path::PathBuf::from(project.path))
+            .collect::<Vec<_>>();
+        statusline::status_with_projects(&roots)
+    }
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
 fn usage_preview(install: bool) -> Result<HookPreview, String> {
+    ensure_agent_config_changes_allowed()?;
     statusline::preview(install)
 }
 
 /// Only ever called from an explicit click in the settings window, with the
 /// fingerprint of the preview that was looked at.
 #[tauri::command]
-fn usage_apply(install: bool, fingerprint: String) -> Result<String, String> {
+fn usage_apply(
+    install: bool,
+    fingerprint: String,
+    original_migration_approved: bool,
+) -> Result<String, String> {
+    ensure_agent_config_changes_allowed()?;
+    let current = statusline::status();
+    statusline::check_original_migration_confirmation(
+        install,
+        current.status_line_owner,
+        original_migration_approved,
+    )?;
     statusline::apply(install, &fingerprint)
 }
 
@@ -512,12 +895,23 @@ fn usage_apply(install: bool, fingerprint: String) -> Result<String, String> {
 /// Where Nook's reply-format block stands in ~/.claude/CLAUDE.md.
 #[tauri::command]
 fn reply_format_status() -> replyformat::ReplyFormatStatus {
-    replyformat::status()
+    if is_nook_dev() {
+        replyformat::ReplyFormatStatus {
+            state: "notInstalled",
+            found: Vec::new(),
+            error: Some("Agent configuration changes are disabled in Nook Dev".into()),
+            path: "Disabled in Nook Dev".into(),
+            exists: false,
+        }
+    } else {
+        replyformat::status()
+    }
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
 fn reply_format_preview(action: replyformat::Action) -> Result<HookPreview, String> {
+    ensure_agent_config_changes_allowed()?;
     replyformat::preview(action)
 }
 
@@ -525,6 +919,7 @@ fn reply_format_preview(action: replyformat::Action) -> Result<HookPreview, Stri
 /// fingerprint of the preview that was looked at.
 #[tauri::command]
 fn reply_format_apply(action: replyformat::Action, fingerprint: String) -> Result<String, String> {
+    ensure_agent_config_changes_allowed()?;
     replyformat::apply(action, &fingerprint)
 }
 
@@ -550,7 +945,11 @@ fn approval_decline(app: AppHandle, request_id: String) {
 
 /// The island answered a question Claude asked with its question tool.
 #[tauri::command]
-fn approval_answer(app: AppHandle, request_id: String, answers: serde_json::Map<String, serde_json::Value>) {
+fn approval_answer(
+    app: AppHandle,
+    request_id: String,
+    answers: serde_json::Map<String, serde_json::Value>,
+) {
     pipe::answer_question(&app, &request_id, &answers);
 }
 
@@ -608,14 +1007,28 @@ fn projects_note(store: State<shelf::Store>, cwd: String) {
 #[tauri::command(async)]
 fn projects_open_code(store: State<shelf::Store>, path: String) -> bool {
     let opened = projects::open_in_code(&store, &path);
-    log::line(format!("projects: open in VS Code: {}", if opened { "done" } else { "refused or `code` not found" }));
+    log::line(format!(
+        "projects: open in VS Code: {}",
+        if opened {
+            "done"
+        } else {
+            "refused or `code` not found"
+        }
+    ));
     opened
 }
 
 #[tauri::command(async)]
 fn projects_new_session(store: State<shelf::Store>, path: String) -> bool {
     let started = projects::new_session(&store, &path);
-    log::line(format!("projects: new Claude session: {}", if started { "done" } else { "refused or Windows Terminal not found" }));
+    log::line(format!(
+        "projects: new Claude session: {}",
+        if started {
+            "done"
+        } else {
+            "refused or Windows Terminal not found"
+        }
+    ));
     started
 }
 // ── The global shortcuts ──────────────────────────────────────────────────────
@@ -631,7 +1044,16 @@ fn shortcut_status(app: AppHandle) -> shortcut::Statuses {
 /// that another program holds comes back as the reason why, and what was there
 /// before stays.
 #[tauri::command]
-fn set_shortcut(app: AppHandle, shared: State<Shared>, which: shortcut::Which, accelerator: String, enabled: bool) -> Result<shortcut::Status, String> {
+fn set_shortcut(
+    app: AppHandle,
+    shared: State<Shared>,
+    which: shortcut::Which,
+    accelerator: String,
+    enabled: bool,
+) -> Result<shortcut::Status, String> {
+    if is_nook_dev() {
+        return Err("Global shortcuts are disabled in Nook Dev".into());
+    }
     let status = shortcut::change(&app, which, &accelerator, enabled)?;
     let updated = {
         let mut current = shared.settings.lock().unwrap();
@@ -700,7 +1122,9 @@ fn create_settings_window(app: &AppHandle) {
 /// it: "light", "dark", or the system's. The page colours itself; this is only
 /// what the OS draws around it. The island has no frame, and stays dark.
 fn wear_theme(app: &AppHandle, theme: &str) {
-    let Some(win) = app.get_webview_window("settings") else { return };
+    let Some(win) = app.get_webview_window("settings") else {
+        return;
+    };
     let theme = match theme {
         "light" => Some(tauri::Theme::Light),
         "dark" => Some(tauri::Theme::Dark),
@@ -761,15 +1185,31 @@ fn restart_app(app: AppHandle) {
 
 pub fn run() {
     platform::prepare_environment();
-    let loaded = settings::load();
+    let context = tauri::generate_context!();
+    assert!(
+        app_identifier_matches_build(&context.config().identifier),
+        "Nook Dev Cargo feature and Tauri identifier do not match; use npm run tauri:build:dev"
+    );
+    let loaded = if is_nook_dev() {
+        Settings {
+            autostart: false,
+            check_updates: false,
+            ..settings::load()
+        }
+    } else {
+        settings::load()
+    };
     let gate = Arc::new(PollGate::new());
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             visibility::open(app);
             let _ = app.emit_to(island::WINDOW_LABEL, "tray", "open".to_string());
         }))
-        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(shortcut::plugin())
         .manage(shortcut::Hotkeys::default())
         .manage(visibility::Visibility::default())
@@ -782,10 +1222,19 @@ pub fn run() {
         .manage(Sessions::default())
         .manage(usage::Latest::default())
         .manage(shelf::Store::default())
-        .manage(reply::Runs::default())
+        .manage(connect_scanner::DeliveryTracker::default())
+        .manage(connect_plan::PreviewTicket::default())
+        .manage(reply::Runs::default());
+    #[cfg(feature = "codex-quota")]
+    let builder = builder.manage(codex_quota::Provider::default());
+    #[cfg(feature = "nook-dev")]
+    let builder = builder.manage(dev_simulator::ManualAlerts::default());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
+            tray_set_labels,
             set_collapsed,
             set_island_rect,
             focus_window,
@@ -795,6 +1244,9 @@ pub fn run() {
             open_session_file,
             session_files_exist,
             quit_app,
+            connect_scan,
+            connect_preview,
+            connect_apply,
             hooks_status,
             hooks_preview,
             hooks_apply,
@@ -805,6 +1257,18 @@ pub fn run() {
             codex_preview,
             codex_apply,
             usage_last,
+            #[cfg(feature = "codex-quota")]
+            codex_quota_last,
+            #[cfg(feature = "nook-dev")]
+            dev_simulator::dev_simulator_emit,
+            #[cfg(feature = "system-battery")]
+            battery::dev_battery_status,
+            #[cfg(feature = "nook-dev")]
+            dev_simulator::dev_manual_alerts_start,
+            #[cfg(feature = "nook-dev")]
+            dev_simulator::dev_manual_alerts_status,
+            #[cfg(feature = "nook-dev")]
+            dev_simulator::dev_manual_alerts_cleanup,
             usage_status,
             usage_preview,
             usage_apply,
@@ -823,8 +1287,11 @@ pub fn run() {
             data_paths,
             open_log_folder,
             restart_app,
+            #[cfg(not(feature = "nook-standalone"))]
             update::update_check,
+            #[cfg(not(feature = "nook-standalone"))]
             update::update_last,
+            #[cfg(not(feature = "nook-standalone"))]
             update::update_open,
             shelf::shelf_load,
             shelf::shelf_save,
@@ -873,17 +1340,28 @@ pub fn run() {
             }
             gate.set_active(true);
             island::spawn_cursor_poll(handle.clone(), gate.clone());
-            metrics::spawn(handle.clone(), gate.clone());
-
-            log::line(format!("--- Nook {} started ---", env!("CARGO_PKG_VERSION")));
-            hooks::ensure_hook_exe(&handle);
+            #[cfg(feature = "codex-quota")]
+            handle
+                .state::<codex_quota::Provider>()
+                .set_enabled(loaded.codex_quota_enabled);
+            #[cfg(feature = "codex-quota")]
+            codex_quota::start(handle.clone());
+            log::line(format!("--- Nook {} started ---", app_version()));
+            if !is_nook_dev() {
+                hooks::ensure_hook_exe(&handle);
+            }
             pipe::start(handle.clone());
-            shortcut::start(&handle, &loaded);
+            if !is_nook_dev() {
+                shortcut::start(&handle, &loaded);
+            }
             agents::start(&handle);
-            update::start(&handle);
+            #[cfg(not(feature = "nook-standalone"))]
+            if !is_nook_dev() {
+                update::start(&handle);
+            }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while running Nook")
         .run(|app, event| {
             // Quitting: the OS gets the global shortcuts back.

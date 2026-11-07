@@ -84,20 +84,37 @@ mod tests {
     #[test]
     fn each_link_id_opens_its_own_constant_address() {
         assert_eq!(link("portfolio").unwrap().url(), "https://zubyr.dev");
-        assert_eq!(link("github").unwrap().url(), "https://github.com/zubairbinshaukat");
-        assert_eq!(link("linkedin").unwrap().url(), "https://www.linkedin.com/in/zubairbinshaukat");
+        assert_eq!(
+            link("github").unwrap().url(),
+            "https://github.com/zubairbinshaukat"
+        );
+        assert_eq!(
+            link("linkedin").unwrap().url(),
+            "https://www.linkedin.com/in/zubairbinshaukat"
+        );
         assert_eq!(link("x").unwrap().url(), "https://x.com/zubyrdev");
         // Every one is a plain https address: nothing a shell or a handler would read as more.
         for which in [Link::Portfolio, Link::Github, Link::Linkedin, Link::X] {
             let url = which.url();
             assert!(url.starts_with("https://"), "{url}");
-            assert!(url.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-')), "{url}");
+            assert!(
+                url.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-')),
+                "{url}"
+            );
         }
     }
 
     #[test]
     fn a_page_cannot_name_an_address_of_its_own() {
-        for said in ["https://example.com", "file:///C:/Windows", "Portfolio", "GITHUB", "", "portfolio "] {
+        for said in [
+            "https://example.com",
+            "file:///C:/Windows",
+            "Portfolio",
+            "GITHUB",
+            "",
+            "portfolio ",
+        ] {
             assert!(link(said).is_err(), "{said:?} must not be a link");
         }
     }

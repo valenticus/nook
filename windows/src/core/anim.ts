@@ -175,6 +175,21 @@ export class Tracked {
     this.mode = "curve";
   }
 
+  /**
+   * Retarget without restarting an animation already travelling to the same
+   * value. Repeated geometry requests can report the same target while the
+   * island is moving; restarting a close curve would keep moving its start
+   * time forward.
+   */
+  retarget(v: number, motion: "spring" | "curve", now?: number): boolean {
+    if (this.spring.target === v && (this.mode === motion || (this.mode === "idle" && this.spring.value === v))) {
+      return false;
+    }
+    if (motion === "curve") this.curveTowards(v, 340, now);
+    else this.springTo(v);
+    return true;
+  }
+
   step(dt: number, now = performance.now()) {
     if (this.mode === "spring") {
       this.spring.step(dt);

@@ -5,9 +5,11 @@
 
 import {
   Bridge, IS_TAURI, SettingsBridge, onEvent,
-  type AboutLink, type CodexStatus, type CursorStatus, type DataPaths, type HookPreview, type HookStatus, type ReplyFormatAction, type ReplyFormatStatus, type ShortcutName, type UpdateInfo,
+  type ConnectAgent, type ConnectOperation, type ConnectPreview, type ConnectScan,
+  type AboutLink, type CodexQuotaSnapshot, type CodexStatus, type CursorStatus, type DataPaths, type HookPreview, type HookStatus, type ReplyFormatAction, type ReplyFormatStatus, type ShortcutName, type UpdateInfo,
   type ShortcutStatus, type UsageStatus,
 } from "../core/bridge";
+import type { TrayMenuLabels } from "../core/i18n";
 import type { Settings } from "../core/state";
 
 export interface Backend {
@@ -15,9 +17,16 @@ export interface Backend {
   fake: boolean;
   /** The section to open on, when something other than the first is asked for (the made-up one only). */
   start?: string;
-  boot(): Promise<{ settings: Settings; version: string } | null>;
+  boot(): Promise<{ settings: Settings; version: string; nookDev?: boolean; nookStandalone?: boolean } | null>;
+  connectScan(): Promise<ConnectScan | null>;
+  connectPreview(agent: ConnectAgent, operation: ConnectOperation, approvedDevScopes?: string[]): Promise<ConnectPreview | null>;
+  connectApply(previewId: string, approvedDevScopes: string[], codexTrustApproved: boolean, originalMigrationApproved: boolean, confirmed: boolean): Promise<string[] | null>;
+  onConnectActivity(handler: () => void): Promise<void>;
   saveSettings(settings: Settings): Promise<void>;
+  setTrayLabels(labels: TrayMenuLabels): Promise<void>;
   onSettingsChanged(handler: (settings: Settings) => void): void;
+  codexQuotaLast(): Promise<CodexQuotaSnapshot | null>;
+  onCodexQuotaChanged(handler: (snapshot: CodexQuotaSnapshot) => void): Promise<void>;
 
   hooksStatus(): Promise<HookStatus | null>;
   /** Throws what Rust refused with: an unreadable settings.json is never treated as empty. */
@@ -40,7 +49,7 @@ export interface Backend {
 
   usageStatus(): Promise<UsageStatus | null>;
   usagePreview(install: boolean): Promise<HookPreview>;
-  usageApply(install: boolean, fingerprint: string): Promise<string>;
+  usageApply(install: boolean, fingerprint: string, originalMigrationApproved: boolean): Promise<string>;
 
   /** The reply format's block in ~/.claude/CLAUDE.md: the same flow, on another file. */
   replyFormatStatus(): Promise<ReplyFormatStatus | null>;
@@ -59,8 +68,15 @@ export interface Backend {
 const nook: Backend = {
   fake: false,
   boot: () => Bridge.boot(),
+  connectScan: () => Bridge.connectScan(),
+  connectPreview: (agent, operation, approvedDevScopes) => Bridge.connectPreview(agent, operation, approvedDevScopes),
+  connectApply: (previewId, approvedDevScopes, codexTrustApproved, originalMigrationApproved, confirmed) => Bridge.connectApply(previewId, approvedDevScopes, codexTrustApproved, originalMigrationApproved, confirmed),
+  onConnectActivity: (handler) => Bridge.onConnectActivity(() => handler()).then(() => undefined),
   saveSettings: async (settings) => void (await Bridge.saveSettings(settings)),
+  setTrayLabels: async (labels) => void (await Bridge.setTrayLabels(labels)),
   onSettingsChanged: (handler) => void onEvent<Settings>("settings-changed", handler),
+  codexQuotaLast: () => Bridge.codexQuotaLast(),
+  onCodexQuotaChanged: (handler) => onEvent<CodexQuotaSnapshot>("codex-quota", handler).then(() => undefined),
   hooksStatus: () => Bridge.hooksStatus(),
   hooksPreview: (install) => Bridge.hooksPreview(install),
   hooksApply: (install, fingerprint) => Bridge.hooksApply(install, fingerprint),
@@ -75,7 +91,7 @@ const nook: Backend = {
   updateOpen: async () => void (await Bridge.updateOpen()),
   usageStatus: () => Bridge.usageStatus(),
   usagePreview: (install) => Bridge.usagePreview(install),
-  usageApply: (install, fingerprint) => Bridge.usageApply(install, fingerprint),
+  usageApply: (install, fingerprint, originalMigrationApproved) => Bridge.usageApply(install, fingerprint, originalMigrationApproved),
   replyFormatStatus: () => Bridge.replyFormatStatus(),
   replyFormatPreview: (action) => Bridge.replyFormatPreview(action),
   replyFormatApply: (action, fingerprint) => Bridge.replyFormatApply(action, fingerprint),

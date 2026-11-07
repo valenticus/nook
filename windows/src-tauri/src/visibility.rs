@@ -76,7 +76,11 @@ impl Tracker {
         self.auto_shown = false;
         self.generation += 1;
         self.set_hidden(!self.hidden);
-        if self.hidden { Change::Hide } else { Change::Show }
+        if self.hidden {
+            Change::Hide
+        } else {
+            Change::Show
+        }
     }
 
     /// "Open Nook": on show, if it was hidden — and left on show.
@@ -125,8 +129,12 @@ impl Tracker {
 }
 
 /// The tray item's words, for what a press does.
-pub fn label(hidden: bool) -> &'static str {
-    if hidden { "Show island" } else { "Hide island" }
+pub fn label<'a>(hidden: bool, hide: &'a str, show: &'a str) -> &'a str {
+    if hidden {
+        show
+    } else {
+        hide
+    }
 }
 
 #[derive(Default)]
@@ -343,7 +351,9 @@ mod tests {
         let mut island = Tracker::default();
         island.toggle();
         island.request_up();
-        let Change::HideLater(g) = island.request_done() else { panic!("no delayed hide") };
+        let Change::HideLater(g) = island.request_done() else {
+            panic!("no delayed hide")
+        };
         assert!(!island.hidden());
         assert_eq!(island.hide_if_current(g), Change::Hide);
         assert!(island.hidden());
@@ -356,13 +366,17 @@ mod tests {
         let mut island = Tracker::default();
         island.toggle();
         island.request_up();
-        let Change::HideLater(g) = island.request_done() else { panic!("no delayed hide") };
+        let Change::HideLater(g) = island.request_done() else {
+            panic!("no delayed hide")
+        };
         // The next prompt: the island is up already, nothing to show.
         assert_eq!(island.request_up(), Change::Nothing);
         assert_eq!(island.hide_if_current(g), Change::Nothing);
         assert!(!island.hidden());
         // Its own end schedules a new hide, which does work.
-        let Change::HideLater(g2) = island.request_done() else { panic!("no delayed hide") };
+        let Change::HideLater(g2) = island.request_done() else {
+            panic!("no delayed hide")
+        };
         assert_ne!(g, g2);
         assert_eq!(island.hide_if_current(g2), Change::Hide);
     }
@@ -373,7 +387,9 @@ mod tests {
             let mut island = Tracker::default();
             island.toggle();
             island.request_up();
-            let Change::HideLater(g) = island.request_done() else { panic!("no delayed hide") };
+            let Change::HideLater(g) = island.request_done() else {
+                panic!("no delayed hide")
+            };
             act(&mut island);
             assert_eq!(island.hide_if_current(g), Change::Nothing);
         }
@@ -381,7 +397,9 @@ mod tests {
         let mut island = Tracker::default();
         island.toggle();
         island.request_up();
-        let Change::HideLater(g) = island.request_done() else { panic!("no delayed hide") };
+        let Change::HideLater(g) = island.request_done() else {
+            panic!("no delayed hide")
+        };
         island.open();
         assert_eq!(island.hide_if_current(g), Change::Nothing);
         assert!(!island.hidden());
@@ -392,9 +410,13 @@ mod tests {
         let mut island = Tracker::default();
         island.toggle();
         island.request_up();
-        let Change::HideLater(old) = island.request_done() else { panic!("no delayed hide") };
+        let Change::HideLater(old) = island.request_done() else {
+            panic!("no delayed hide")
+        };
         island.request_up();
-        let Change::HideLater(new) = island.request_done() else { panic!("no delayed hide") };
+        let Change::HideLater(new) = island.request_done() else {
+            panic!("no delayed hide")
+        };
         assert_eq!(island.hide_if_current(old), Change::Nothing);
         assert_eq!(island.hide_if_current(new), Change::Hide);
     }
@@ -404,10 +426,16 @@ mod tests {
         let mut island = Tracker::default();
         island.toggle();
         island.request_up();
-        let Change::HideLater(g) = island.request_done() else { panic!("no delayed hide") };
+        let Change::HideLater(g) = island.request_done() else {
+            panic!("no delayed hide")
+        };
         // An end with nothing left to end moves nothing on a hand-less island.
         let after = island.request_done();
-        let g = if let Change::HideLater(g2) = after { g2 } else { g };
+        let g = if let Change::HideLater(g2) = after {
+            g2
+        } else {
+            g
+        };
         assert_eq!(island.hide_if_current(g), Change::Hide);
     }
 
@@ -423,7 +451,7 @@ mod tests {
     }
     #[test]
     fn the_tray_says_what_a_press_does() {
-        assert_eq!(label(false), "Hide island");
-        assert_eq!(label(true), "Show island");
+        assert_eq!(label(false, "Hide island", "Show island"), "Hide island");
+        assert_eq!(label(true, "Hide island", "Show island"), "Show island");
     }
 }

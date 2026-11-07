@@ -116,7 +116,9 @@ fn clean_text(text: &str) -> Result<String, String> {
         return Err("Write a message first.".into());
     }
     if text.chars().count() > MAX_TEXT_CHARS {
-        return Err(format!("That message is too long (the limit is {MAX_TEXT_CHARS} characters)."));
+        return Err(format!(
+            "That message is too long (the limit is {MAX_TEXT_CHARS} characters)."
+        ));
     }
     Ok(text.to_string())
 }
@@ -127,7 +129,9 @@ fn check_session_id(id: &str) -> Result<(), String> {
     let bad = id.is_empty()
         || id.len() > MAX_ID_LEN
         || id.starts_with('-')
-        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     if bad {
         Err("This session has no id a reply can be sent to.".into())
     } else {
@@ -213,9 +217,11 @@ fn usable_path_dir(dir: &Path, windows: bool) -> bool {
         return false;
     }
     !(windows
-        && dir
-            .components()
-            .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("WindowsApps")))
+        && dir.components().any(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("WindowsApps")
+        }))
 }
 
 #[cfg(unix)]
@@ -228,7 +234,9 @@ fn is_runnable(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_runnable(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
 }
 
 /// Where this machine has the tool, if anywhere.
@@ -239,7 +247,9 @@ fn locate(tool: Tool) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         dirs.extend(std::env::split_paths(&path).filter(|d| usable_path_dir(d, windows)));
     }
-    candidates(tool.name(), &dirs, windows).into_iter().find(|p| is_runnable(p))
+    candidates(tool.name(), &dirs, windows)
+        .into_iter()
+        .find(|p| is_runnable(p))
 }
 
 /// The PATH the child gets: the folders the tool and its helpers usually live
@@ -270,9 +280,14 @@ fn tail_of(bytes: &[u8], max_chars: usize) -> String {
 }
 
 fn read_tail(path: &Path) -> String {
-    let Ok(mut file) = std::fs::File::open(path) else { return String::new() };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES))).is_err() {
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .is_err()
+    {
         return String::new();
     }
     let mut buf = Vec::new();
@@ -285,7 +300,10 @@ fn verdict(tool: Tool, outcome: &Outcome, tail: &str) -> (bool, Option<String>) 
     match outcome {
         Outcome::Done => (true, None),
         Outcome::Cancelled => (false, Some("The reply was cancelled.".into())),
-        Outcome::TimedOut => (false, Some("The reply took more than 30 minutes and was stopped.".into())),
+        Outcome::TimedOut => (
+            false,
+            Some("The reply took more than 30 minutes and was stopped.".into()),
+        ),
         Outcome::Failed(code) => {
             let mut message = match code {
                 Some(code) => format!("{} stopped with an error (exit code {code}).", tool.label()),
@@ -309,7 +327,9 @@ fn kill_tree(child: &mut Child) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         let _ = Command::new(root.join("System32").join("taskkill.exe"))
             .args(["/T", "/F", "/PID", &child.id().to_string()])
             .creation_flags(platform::CREATE_NO_WINDOW)
@@ -337,7 +357,11 @@ fn watch(child: &mut Child, cancel: &AtomicBool, limit: Duration) -> Outcome {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return if status.success() { Outcome::Done } else { Outcome::Failed(status.code()) };
+                return if status.success() {
+                    Outcome::Done
+                } else {
+                    Outcome::Failed(status.code())
+                };
             }
             Ok(None) => {}
             Err(_) => {
@@ -358,7 +382,13 @@ fn watch(child: &mut Child, cancel: &AtomicBool, limit: Duration) -> Outcome {
 }
 
 /// Starts the child with its input piped and its output in the log file.
-fn launch(tool: Tool, exe: &Path, id: &str, cwd: &Path, log_file: std::fs::File) -> std::io::Result<Child> {
+fn launch(
+    tool: Tool,
+    exe: &Path,
+    id: &str,
+    cwd: &Path,
+    log_file: std::fs::File,
+) -> std::io::Result<Child> {
     let extra: Vec<PathBuf> = if cfg!(windows) {
         Vec::new()
     } else {
@@ -399,7 +429,16 @@ fn log_path(tool: Tool, id: &str, others_running: bool) -> PathBuf {
 }
 
 /// Checks, starts the run and returns; the rest happens on its own thread.
-fn begin(app: &AppHandle, tool: &str, session_id: &str, cwd: &str, text: &str) -> Result<(), String> {
+fn begin(
+    app: &AppHandle,
+    tool: &str,
+    session_id: &str,
+    cwd: &str,
+    text: &str,
+) -> Result<(), String> {
+    if !replies_allowed() {
+        return Err("Replies are disabled in Nook Dev.".into());
+    }
     let tool = Tool::parse(tool)?;
     let text = clean_text(text)?;
     check_session_id(session_id)?;
@@ -467,7 +506,11 @@ fn begin(app: &AppHandle, tool: &str, session_id: &str, cwd: &str, text: &str) -
     let id = session_id.to_string();
     std::thread::spawn(move || {
         let outcome = watch(&mut child, &cancel, MAX_RUN);
-        let tail = if matches!(outcome, Outcome::Failed(_)) { read_tail(&path) } else { String::new() };
+        let tail = if matches!(outcome, Outcome::Failed(_)) {
+            read_tail(&path)
+        } else {
+            String::new()
+        };
         let (ok, error) = verdict(tool, &outcome, &tail);
         // Free the session before the island hears of it, so it can reply again at once.
         app.state::<Runs>().0.lock().unwrap().remove(&key);
@@ -475,7 +518,12 @@ fn begin(app: &AppHandle, tool: &str, session_id: &str, cwd: &str, text: &str) -
         let _ = app.emit_to(
             crate::island::WINDOW_LABEL,
             "reply_ended",
-            Ended { tool: tool.name().into(), session_id: id, ok, error },
+            Ended {
+                tool: tool.name().into(),
+                session_id: id,
+                ok,
+                error,
+            },
         );
     });
     Ok(())
@@ -486,7 +534,14 @@ fn begin(app: &AppHandle, tool: &str, session_id: &str, cwd: &str, text: &str) -
 /// Which tools can be replied to on this machine.
 #[tauri::command]
 pub fn reply_tools() -> ReplyTools {
-    ReplyTools { claude: locate(Tool::Claude).is_some(), codex: locate(Tool::Codex).is_some() }
+    ReplyTools {
+        claude: replies_allowed() && locate(Tool::Claude).is_some(),
+        codex: replies_allowed() && locate(Tool::Codex).is_some(),
+    }
+}
+
+fn replies_allowed() -> bool {
+    !cfg!(feature = "nook-dev")
 }
 
 /// Sends `text` to the session and returns once the tool has started.
@@ -507,7 +562,13 @@ pub async fn session_reply(
 #[tauri::command]
 pub fn session_reply_cancel(app: AppHandle, tool: String, session_id: String) {
     let Ok(tool) = Tool::parse(&tool) else { return };
-    if let Some(cancel) = app.state::<Runs>().0.lock().unwrap().get(&run_key(tool, &session_id)) {
+    if let Some(cancel) = app
+        .state::<Runs>()
+        .0
+        .lock()
+        .unwrap()
+        .get(&run_key(tool, &session_id))
+    {
         cancel.store(true, Ordering::SeqCst);
     }
 }
@@ -515,6 +576,19 @@ pub fn session_reply_cancel(app: AppHandle, tool: String, session_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "nook-dev")]
+    #[test]
+    fn replies_are_unavailable_in_nook_dev() {
+        assert!(!replies_allowed());
+        assert_eq!(
+            reply_tools(),
+            ReplyTools {
+                claude: false,
+                codex: false
+            }
+        );
+    }
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
@@ -542,12 +616,20 @@ mod tests {
         // The limit is on what is left after trimming.
         assert!(clean_text(&format!("  {}  ", "a".repeat(MAX_TEXT_CHARS))).is_ok());
         // What a shell would act on is just text here.
-        assert_eq!(clean_text("a && del *.* | \"%PATH%\" $(x)").unwrap(), "a && del *.* | \"%PATH%\" $(x)");
+        assert_eq!(
+            clean_text("a && del *.* | \"%PATH%\" $(x)").unwrap(),
+            "a && del *.* | \"%PATH%\" $(x)"
+        );
     }
 
     #[test]
     fn a_session_id_is_letters_digits_dash_and_underscore() {
-        for good in ["a", "019e2b4c-7f10-7d3a-b2c1-0a9f8e7d6c5b", "abc_DEF-123", &"x".repeat(MAX_ID_LEN)] {
+        for good in [
+            "a",
+            "019e2b4c-7f10-7d3a-b2c1-0a9f8e7d6c5b",
+            "abc_DEF-123",
+            &"x".repeat(MAX_ID_LEN),
+        ] {
             assert!(check_session_id(good).is_ok(), "{good}");
         }
         for bad in [
@@ -617,7 +699,9 @@ mod tests {
         assert_eq!(dirs[0], home.join(".local").join("bin"));
         assert!(dirs.contains(&p("/home/me/AppData/Roaming").join("npm")));
         // Without an APPDATA the npm folder is simply not listed.
-        assert!(usual_dirs(&home, None, true).iter().all(|d| !d.ends_with("npm")));
+        assert!(usual_dirs(&home, None, true)
+            .iter()
+            .all(|d| !d.ends_with("npm")));
     }
 
     #[test]
@@ -625,9 +709,17 @@ mod tests {
         let dirs = [p("a"), p("b")];
         assert_eq!(
             candidates("codex", &dirs, true),
-            [p("a/codex.exe"), p("b/codex.exe"), p("a/codex.cmd"), p("b/codex.cmd")]
+            [
+                p("a/codex.exe"),
+                p("b/codex.exe"),
+                p("a/codex.cmd"),
+                p("b/codex.cmd")
+            ]
         );
-        assert_eq!(candidates("codex", &dirs, false), [p("a/codex"), p("b/codex")]);
+        assert_eq!(
+            candidates("codex", &dirs, false),
+            [p("a/codex"), p("b/codex")]
+        );
         // Only the exe and the cmd: never the extensionless script or a .ps1.
         assert!(candidates("claude", &dirs, true).iter().all(|c| {
             let e = c.extension().unwrap();
@@ -641,28 +733,54 @@ mod tests {
         let exists = |c: &PathBuf| c == &p("b/claude.exe") || c == &p("a/claude.cmd");
         assert_eq!(list.into_iter().find(exists), Some(p("b/claude.exe")));
         let list = candidates("claude", &[p("a")], true);
-        assert_eq!(list.into_iter().find(|c| c == &p("a/claude.cmd")), Some(p("a/claude.cmd")));
+        assert_eq!(
+            list.into_iter().find(|c| c == &p("a/claude.cmd")),
+            Some(p("a/claude.cmd"))
+        );
     }
 
     #[test]
     fn path_entries_that_are_not_trusted_are_skipped() {
-        let abs = if cfg!(windows) { r"C:\tools" } else { "/opt/tools" };
+        let abs = if cfg!(windows) {
+            r"C:\tools"
+        } else {
+            "/opt/tools"
+        };
         assert!(usable_path_dir(Path::new(abs), cfg!(windows)));
         assert!(!usable_path_dir(Path::new("."), cfg!(windows)));
         assert!(!usable_path_dir(Path::new("bin"), cfg!(windows)));
         assert!(!usable_path_dir(Path::new(""), cfg!(windows)));
         if cfg!(windows) {
-            assert!(!usable_path_dir(Path::new(r"C:\Users\me\AppData\Local\Microsoft\WindowsApps"), true));
-            assert!(!usable_path_dir(Path::new(r"C:\Users\me\AppData\Local\Microsoft\windowsapps"), true));
+            assert!(!usable_path_dir(
+                Path::new(r"C:\Users\me\AppData\Local\Microsoft\WindowsApps"),
+                true
+            ));
+            assert!(!usable_path_dir(
+                Path::new(r"C:\Users\me\AppData\Local\Microsoft\windowsapps"),
+                true
+            ));
         }
     }
 
     #[test]
     fn the_child_path_starts_with_the_tools_own_folder() {
-        let exe = if cfg!(windows) { p(r"C:\Users\me\.local\bin\claude.exe") } else { p("/home/me/.local/bin/claude") };
+        let exe = if cfg!(windows) {
+            p(r"C:\Users\me\.local\bin\claude.exe")
+        } else {
+            p("/home/me/.local/bin/claude")
+        };
         let dir = exe.parent().unwrap().to_path_buf();
-        let extra = [if cfg!(windows) { p(r"C:\extra") } else { p("/extra") }];
-        let existing = std::env::join_paths([if cfg!(windows) { p(r"C:\old") } else { p("/old") }]).unwrap();
+        let extra = [if cfg!(windows) {
+            p(r"C:\extra")
+        } else {
+            p("/extra")
+        }];
+        let existing = std::env::join_paths([if cfg!(windows) {
+            p(r"C:\old")
+        } else {
+            p("/old")
+        }])
+        .unwrap();
         let joined = child_path(&exe, &extra, Some(existing)).unwrap();
         let parts: Vec<PathBuf> = std::env::split_paths(&joined).collect();
         assert_eq!(parts[0], dir);
@@ -674,7 +792,10 @@ mod tests {
 
     #[test]
     fn the_tail_is_one_line_and_at_most_the_last_300_characters() {
-        assert_eq!(tail_of(b"line one\r\nline two\n\n  end  ", 300), "line one line two end");
+        assert_eq!(
+            tail_of(b"line one\r\nline two\n\n  end  ", 300),
+            "line one line two end"
+        );
         assert_eq!(tail_of(b"", 300), "");
         let long = format!("{}END", "x".repeat(1000));
         let tail = tail_of(long.as_bytes(), 300);
@@ -689,28 +810,61 @@ mod tests {
 
     #[test]
     fn the_island_is_told_how_it_ended() {
-        assert_eq!(verdict(Tool::Claude, &Outcome::Done, "ignored"), (true, None));
-        let (ok, error) = verdict(Tool::Claude, &Outcome::Failed(Some(1)), "No conversation found");
+        assert_eq!(
+            verdict(Tool::Claude, &Outcome::Done, "ignored"),
+            (true, None)
+        );
+        let (ok, error) = verdict(
+            Tool::Claude,
+            &Outcome::Failed(Some(1)),
+            "No conversation found",
+        );
         assert!(!ok);
-        assert_eq!(error.unwrap(), "Claude Code stopped with an error (exit code 1). No conversation found");
+        assert_eq!(
+            error.unwrap(),
+            "Claude Code stopped with an error (exit code 1). No conversation found"
+        );
         let (_, error) = verdict(Tool::Codex, &Outcome::Failed(None), "");
         assert_eq!(error.unwrap(), "Codex stopped with an error.");
         assert!(!verdict(Tool::Codex, &Outcome::Cancelled, "").0);
-        assert!(verdict(Tool::Codex, &Outcome::Cancelled, "").1.unwrap().contains("cancelled"));
-        assert!(verdict(Tool::Claude, &Outcome::TimedOut, "").1.unwrap().contains("30 minutes"));
+        assert!(verdict(Tool::Codex, &Outcome::Cancelled, "")
+            .1
+            .unwrap()
+            .contains("cancelled"));
+        assert!(verdict(Tool::Claude, &Outcome::TimedOut, "")
+            .1
+            .unwrap()
+            .contains("30 minutes"));
     }
 
     #[test]
     fn what_the_front_end_receives_is_camel_case() {
-        let tools = serde_json::to_value(ReplyTools { claude: true, codex: false }).unwrap();
+        let tools = serde_json::to_value(ReplyTools {
+            claude: true,
+            codex: false,
+        })
+        .unwrap();
         assert_eq!(tools, serde_json::json!({ "claude": true, "codex": false }));
-        let ended = Ended { tool: "codex".into(), session_id: "s1".into(), ok: false, error: Some("boom".into()) };
+        let ended = Ended {
+            tool: "codex".into(),
+            session_id: "s1".into(),
+            ok: false,
+            error: Some("boom".into()),
+        };
         assert_eq!(
             serde_json::to_value(&ended).unwrap(),
             serde_json::json!({ "tool": "codex", "sessionId": "s1", "ok": false, "error": "boom" })
         );
-        let ok = Ended { tool: "claude".into(), session_id: "s2".into(), ok: true, error: None };
-        assert_eq!(serde_json::to_value(&ok).unwrap()["error"], serde_json::Value::Null);
+        let ok = Ended {
+            tool: "claude".into(),
+            session_id: "s2".into(),
+            ok: true,
+            error: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&ok).unwrap()["error"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -734,7 +888,11 @@ mod tests {
             c.args(["-c", &format!("exit {code}")]);
             c
         };
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
     }
 
     fn slow() -> Child {
@@ -757,21 +915,34 @@ mod tests {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
     }
 
     #[test]
     fn a_child_that_exits_is_done_or_failed_with_its_code() {
         let cancel = AtomicBool::new(false);
-        assert_eq!(watch(&mut quick(0), &cancel, Duration::from_secs(30)), Outcome::Done);
-        assert_eq!(watch(&mut quick(3), &cancel, Duration::from_secs(30)), Outcome::Failed(Some(3)));
+        assert_eq!(
+            watch(&mut quick(0), &cancel, Duration::from_secs(30)),
+            Outcome::Done
+        );
+        assert_eq!(
+            watch(&mut quick(3), &cancel, Duration::from_secs(30)),
+            Outcome::Failed(Some(3))
+        );
     }
 
     #[test]
     fn a_cancelled_run_is_killed() {
         let cancel = AtomicBool::new(true);
         let started = Instant::now();
-        assert_eq!(watch(&mut slow(), &cancel, Duration::from_secs(30)), Outcome::Cancelled);
+        assert_eq!(
+            watch(&mut slow(), &cancel, Duration::from_secs(30)),
+            Outcome::Cancelled
+        );
         assert!(started.elapsed() < Duration::from_secs(20));
     }
 
@@ -779,7 +950,10 @@ mod tests {
     fn a_run_past_its_time_is_killed() {
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
-        assert_eq!(watch(&mut slow(), &cancel, Duration::from_millis(400)), Outcome::TimedOut);
+        assert_eq!(
+            watch(&mut slow(), &cancel, Duration::from_millis(400)),
+            Outcome::TimedOut
+        );
         assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

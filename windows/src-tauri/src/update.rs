@@ -78,14 +78,25 @@ fn parse_version(text: &str) -> Option<Vec<u64>> {
     if core.is_empty() {
         return None;
     }
-    core.split('.').map(|part| if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) { None } else { part.parse().ok() }).collect()
+    core.split('.')
+        .map(|part| {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                None
+            } else {
+                part.parse().ok()
+            }
+        })
+        .collect()
 }
 
 /// True only when `latest` is strictly newer than `current`, number by number
 /// (0.10.0 is newer than 0.9.9; 0.2 is the same as 0.2.0). Either one being
 /// something else than a version is false.
 fn is_newer(latest: &str, current: &str) -> bool {
-    let (Some(mut latest), Some(mut current)) = (parse_version(latest), parse_version(current)) else { return false };
+    let (Some(mut latest), Some(mut current)) = (parse_version(latest), parse_version(current))
+    else {
+        return false;
+    };
     let len = latest.len().max(current.len());
     latest.resize(len, 0);
     current.resize(len, 0);
@@ -104,14 +115,23 @@ struct Release {
 
 fn parse_release(body: &[u8]) -> Result<Release, String> {
     let odd = || "GitHub's answer wasn't what Nook expected. Try again later.".to_string();
-    let Ok(Value::Object(release)) = serde_json::from_slice::<Value>(body) else { return Err(odd()) };
-    let tag = release.get("tag_name").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    let Ok(Value::Object(release)) = serde_json::from_slice::<Value>(body) else {
+        return Err(odd());
+    };
+    let tag = release
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
     let version = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
     if version.is_empty() {
         return Err(odd());
     }
     let flag = |key: &str| release.get(key).and_then(Value::as_bool).unwrap_or(false);
-    Ok(Release { version: version.to_string(), offered: !flag("draft") && !flag("prerelease") })
+    Ok(Release {
+        version: version.to_string(),
+        offered: !flag("draft") && !flag("prerelease"),
+    })
 }
 
 // ── Saved result ──────────────────────────────────────────────────────────────
@@ -131,7 +151,8 @@ fn write_file(file: &Path, stored: &Stored) -> std::io::Result<()> {
     if let Some(dir) = file.parent() {
         platform::ensure_private_dir(dir)?;
     }
-    let json = serde_json::to_vec_pretty(stored).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_vec_pretty(stored)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let temp = file.with_extension("json.tmp");
     std::fs::write(&temp, json)?;
     std::fs::rename(&temp, file).inspect_err(|_| {
@@ -149,7 +170,11 @@ struct State {
     failed_at: Option<u64>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { loaded: false, last: None, failed_at: None });
+static STATE: Mutex<State> = Mutex::new(State {
+    loaded: false,
+    last: None,
+    failed_at: None,
+});
 /// Held for the length of a check: there is one at a time.
 static CHECKING: Mutex<()> = Mutex::new(());
 
@@ -163,7 +188,10 @@ fn state() -> std::sync::MutexGuard<'static, State> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The last good result of this run, or the saved one. No network.
@@ -191,17 +219,37 @@ fn curl() -> Command {
 /// The fixed arguments of the request. No shell is involved, and nothing in
 /// them comes from the user or the machine but the version.
 fn curl_args(version: &str) -> Vec<String> {
-    let mut args: Vec<String> = ["-q", "--silent", "--fail", "--proto", "=https", "--max-redirs", "0", "--max-time", "10", "--max-filesize", "1048576"]
-        .map(String::from)
-        .to_vec();
-    args.extend(["-H".into(), format!("User-Agent: Nook/{version}"), "-H".into(), "Accept: application/vnd.github+json".into(), API_URL.into()]);
+    let mut args: Vec<String> = [
+        "-q",
+        "--silent",
+        "--fail",
+        "--proto",
+        "=https",
+        "--max-redirs",
+        "0",
+        "--max-time",
+        "10",
+        "--max-filesize",
+        "1048576",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend([
+        "-H".into(),
+        format!("User-Agent: Nook/{version}"),
+        "-H".into(),
+        "Accept: application/vnd.github+json".into(),
+        API_URL.into(),
+    ]);
     args
 }
 
 /// What the user is told when curl stops with this exit code.
 fn explain_curl(code: Option<i32>) -> String {
     match code {
-        Some(6 | 7 | 28 | 35 | 52 | 55 | 56) => "Couldn't reach GitHub. Check your connection and try again.".into(),
+        Some(6 | 7 | 28 | 35 | 52 | 55 | 56) => {
+            "Couldn't reach GitHub. Check your connection and try again.".into()
+        }
         Some(22) => "GitHub didn't give an answer just now. Try again in a little while.".into(),
         _ => "The update check failed. Try again later.".into(),
     }
@@ -216,10 +264,14 @@ fn fetch() -> Result<Vec<u8>, String> {
         .output()
         .map_err(|err| {
             crate::log::line(format!("update: curl did not start: {err}"));
-            "Nook needs curl to check for updates, and couldn't find it on this computer.".to_string()
+            "Nook needs curl to check for updates, and couldn't find it on this computer."
+                .to_string()
         })?;
     if !output.status.success() {
-        crate::log::line(format!("update: curl exited with {:?}", output.status.code()));
+        crate::log::line(format!(
+            "update: curl exited with {:?}",
+            output.status.code()
+        ));
         return Err(explain_curl(output.status.code()));
     }
     Ok(output.stdout)
@@ -238,7 +290,11 @@ fn run_check(app: &AppHandle) -> Result<UpdateInfo, String> {
         }
     };
     let release = parse_release(&fetch()?)?;
-    let stored = Stored { latest: release.version, offered: release.offered, checked_at: now_ms() };
+    let stored = Stored {
+        latest: release.version,
+        offered: release.offered,
+        checked_at: now_ms(),
+    };
     if let Err(err) = write_file(&path(), &stored) {
         crate::log::line(format!("update: could not save the result: {err}"));
     }
@@ -256,7 +312,13 @@ fn run_check(app: &AppHandle) -> Result<UpdateInfo, String> {
 
 /// Whether an automatic check is made now. Pure: the clock, the setting and
 /// what happened before are all passed in.
-fn due(enabled: bool, now: u64, started: u64, last_ok: Option<u64>, last_failed: Option<u64>) -> bool {
+fn due(
+    enabled: bool,
+    now: u64,
+    started: u64,
+    last_ok: Option<u64>,
+    last_failed: Option<u64>,
+) -> bool {
     if !enabled || now.saturating_sub(started) < STARTUP_GRACE_MS {
         return false;
     }
@@ -274,7 +336,12 @@ pub fn start(app: &AppHandle) {
     let started = now_ms();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
-        let enabled = app.state::<crate::Shared>().settings.lock().map(|s| s.check_updates).unwrap_or(false);
+        let enabled = app
+            .state::<crate::Shared>()
+            .settings
+            .lock()
+            .map(|s| s.check_updates)
+            .unwrap_or(false);
         let (last_ok, last_failed) = {
             let state = state();
             (state.last.as_ref().map(|s| s.checked_at), state.failed_at)
@@ -309,7 +376,8 @@ pub fn update_last(_app: AppHandle) -> Option<UpdateInfo> {
 /// (`Nook-Windows-<version>-setup.exe`, under the tag `v<version>`). None for a
 /// version that is not plain numbers and dots: nothing else goes into an address.
 fn installer_url(version: &str) -> Option<String> {
-    let plain = parse_version(version).is_some() && version.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let plain =
+        parse_version(version).is_some() && version.chars().all(|c| c.is_ascii_digit() || c == '.');
     plain.then(|| format!("https://github.com/zubairbinshaukat/nook/releases/download/v{version}/Nook-Windows-{version}-setup.exe"))
 }
 
@@ -331,6 +399,11 @@ pub fn update_open() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updater_uses_original_nook_version_metadata() {
+        assert_eq!(CURRENT, "0.2.2");
+    }
 
     #[test]
     fn versions_are_compared_number_by_number() {
@@ -364,7 +437,9 @@ mod tests {
 
     #[test]
     fn something_that_is_not_a_version_is_never_newer() {
-        for bad in ["", "v", "latest", "1.x", "1..2", "-1", "1.2.3.", " ", "0.2.0a"] {
+        for bad in [
+            "", "v", "latest", "1.x", "1..2", "-1", "1.2.3.", " ", "0.2.0a",
+        ] {
             assert!(!is_newer(bad, "0.1.0"), "{bad:?} as latest");
             assert!(!is_newer("9.9.9", bad), "{bad:?} as current");
         }
@@ -374,14 +449,32 @@ mod tests {
     #[test]
     fn a_release_answer_is_read() {
         let ok = br#"{"tag_name":"v0.3.0","name":"Nook 0.3.0","draft":false,"prerelease":false,"assets":[]}"#;
-        assert_eq!(parse_release(ok), Ok(Release { version: "0.3.0".into(), offered: true }));
+        assert_eq!(
+            parse_release(ok),
+            Ok(Release {
+                version: "0.3.0".into(),
+                offered: true
+            })
+        );
         let bare = br#"{"tag_name":"0.3.0"}"#;
-        assert_eq!(parse_release(bare), Ok(Release { version: "0.3.0".into(), offered: true }));
+        assert_eq!(
+            parse_release(bare),
+            Ok(Release {
+                version: "0.3.0".into(),
+                offered: true
+            })
+        );
     }
 
     #[test]
     fn get_it_goes_to_the_installer_on_windows_and_to_the_page_otherwise() {
-        let info = |latest: &str, available| UpdateInfo { current: "0.2.1".into(), latest: latest.into(), available, url: RELEASES_URL.into(), checked_at: 1 };
+        let info = |latest: &str, available| UpdateInfo {
+            current: "0.2.1".into(),
+            latest: latest.into(),
+            available,
+            url: RELEASES_URL.into(),
+            checked_at: 1,
+        };
         let newer = info("0.3.0", true);
         assert_eq!(
             open_target(Some(&newer), true),
@@ -404,25 +497,51 @@ mod tests {
         let pre = br#"{"tag_name":"v0.9.0","draft":false,"prerelease":true}"#;
         assert!(!parse_release(draft).unwrap().offered);
         assert!(!parse_release(pre).unwrap().offered);
-        let stored = Stored { latest: "0.9.0".into(), offered: false, checked_at: 1 };
+        let stored = Stored {
+            latest: "0.9.0".into(),
+            offered: false,
+            checked_at: 1,
+        };
         assert!(!stored.info("0.1.0").available);
     }
 
     #[test]
     fn an_answer_without_a_tag_or_not_json_is_an_error() {
-        for body in [&br#"{"draft":false}"#[..], br#"{"tag_name":""}"#, br#"{"tag_name":7}"#, br#"{"tag_name":"v"}"#, b"<html>rate limited</html>", b"", br#"["v1.0.0"]"#, b"null"] {
+        for body in [
+            &br#"{"draft":false}"#[..],
+            br#"{"tag_name":""}"#,
+            br#"{"tag_name":7}"#,
+            br#"{"tag_name":"v"}"#,
+            b"<html>rate limited</html>",
+            b"",
+            br#"["v1.0.0"]"#,
+            b"null",
+        ] {
             let err = parse_release(body).unwrap_err();
-            assert!(!err.is_empty() && !err.contains('{') && !err.contains('<'), "{err}");
+            assert!(
+                !err.is_empty() && !err.contains('{') && !err.contains('<'),
+                "{err}"
+            );
         }
     }
 
     #[test]
     fn the_info_is_worked_out_against_the_running_version() {
-        let stored = Stored { latest: "0.3.0".into(), offered: true, checked_at: 1_700_000_000_000 };
+        let stored = Stored {
+            latest: "0.3.0".into(),
+            offered: true,
+            checked_at: 1_700_000_000_000,
+        };
         let behind = stored.info("0.2.0");
         assert!(behind.available);
-        assert_eq!((behind.current.as_str(), behind.latest.as_str()), ("0.2.0", "0.3.0"));
-        assert_eq!(behind.url, "https://github.com/zubairbinshaukat/nook/releases/latest");
+        assert_eq!(
+            (behind.current.as_str(), behind.latest.as_str()),
+            ("0.2.0", "0.3.0")
+        );
+        assert_eq!(
+            behind.url,
+            "https://github.com/zubairbinshaukat/nook/releases/latest"
+        );
         // The app was updated since: nothing to offer any more.
         assert!(!stored.info("0.3.0").available);
         assert!(!stored.info("0.4.0").available);
@@ -435,7 +554,10 @@ mod tests {
     fn the_request_is_fixed_and_carries_only_the_version() {
         let args = curl_args("0.2.0");
         assert!(args.contains(&"User-Agent: Nook/0.2.0".to_string()));
-        assert_eq!(args.last().unwrap(), "https://api.github.com/repos/zubairbinshaukat/nook/releases/latest");
+        assert_eq!(
+            args.last().unwrap(),
+            "https://api.github.com/repos/zubairbinshaukat/nook/releases/latest"
+        );
         assert_eq!(args.iter().filter(|a| a.as_str() == "-H").count(), 2);
     }
 
@@ -445,9 +567,18 @@ mod tests {
     fn the_daily_check_is_due_after_a_day() {
         let up = T - 10 * MINUTE_MS;
         assert!(due(true, T, up, None, None), "never checked");
-        assert!(!due(true, T, up, Some(T - 23 * HOUR_MS), None), "23 hours ago");
-        assert!(due(true, T, up, Some(T - 25 * HOUR_MS), None), "25 hours ago");
-        assert!(due(true, T, up, Some(T + HOUR_MS), None), "dated in the future");
+        assert!(
+            !due(true, T, up, Some(T - 23 * HOUR_MS), None),
+            "23 hours ago"
+        );
+        assert!(
+            due(true, T, up, Some(T - 25 * HOUR_MS), None),
+            "25 hours ago"
+        );
+        assert!(
+            due(true, T, up, Some(T + HOUR_MS), None),
+            "dated in the future"
+        );
     }
 
     #[test]
@@ -459,8 +590,14 @@ mod tests {
     #[test]
     fn a_failed_check_is_not_retried_for_an_hour() {
         let up = T - 5 * HOUR_MS;
-        assert!(!due(true, T, up, None, Some(T - 30 * MINUTE_MS)), "30 minutes ago");
-        assert!(due(true, T, up, None, Some(T - 61 * MINUTE_MS)), "61 minutes ago");
+        assert!(
+            !due(true, T, up, None, Some(T - 30 * MINUTE_MS)),
+            "30 minutes ago"
+        );
+        assert!(
+            due(true, T, up, None, Some(T - 61 * MINUTE_MS)),
+            "61 minutes ago"
+        );
         // A failure does not bring forward a check that is not due anyway.
         assert!(!due(true, T, up, Some(T - HOUR_MS), Some(T - 2 * HOUR_MS)));
     }
@@ -468,11 +605,18 @@ mod tests {
     #[test]
     fn with_the_setting_off_nothing_is_ever_due() {
         assert!(!due(false, T, T - 10 * HOUR_MS, None, None));
-        assert!(!due(false, T, T - 10 * HOUR_MS, Some(T - 100 * HOUR_MS), None));
+        assert!(!due(
+            false,
+            T,
+            T - 10 * HOUR_MS,
+            Some(T - 100 * HOUR_MS),
+            None
+        ));
     }
 
     fn temp_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nook-update-test-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nook-update-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("update.json")
@@ -482,12 +626,19 @@ mod tests {
     fn the_saved_result_round_trips() {
         let file = temp_file("round");
         assert_eq!(read_file(&file), None, "missing file");
-        let stored = Stored { latest: "0.3.0".into(), offered: true, checked_at: 1_700_000_000_000 };
+        let stored = Stored {
+            latest: "0.3.0".into(),
+            offered: true,
+            checked_at: 1_700_000_000_000,
+        };
         write_file(&file, &stored).unwrap();
         assert_eq!(read_file(&file), Some(stored.clone()));
         assert!(!file.with_extension("json.tmp").exists());
         // Written again over the first.
-        let newer = Stored { latest: "0.4.0".into(), ..stored };
+        let newer = Stored {
+            latest: "0.4.0".into(),
+            ..stored
+        };
         write_file(&file, &newer).unwrap();
         assert_eq!(read_file(&file), Some(newer));
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
@@ -496,7 +647,14 @@ mod tests {
     #[test]
     fn a_damaged_saved_file_is_no_result() {
         let file = temp_file("damaged");
-        for junk in [&b"not json"[..], b"", b"{}", br#"{"latest":"","offered":true,"checkedAt":1}"#, br#"{"latest":3,"offered":true,"checkedAt":1}"#, &[0xff, 0xfe, 0x00]] {
+        for junk in [
+            &b"not json"[..],
+            b"",
+            b"{}",
+            br#"{"latest":"","offered":true,"checkedAt":1}"#,
+            br#"{"latest":3,"offered":true,"checkedAt":1}"#,
+            &[0xff, 0xfe, 0x00],
+        ] {
             std::fs::write(&file, junk).unwrap();
             assert_eq!(read_file(&file), None, "{junk:?}");
         }

@@ -5,9 +5,36 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["production-relay"]
+production-relay = []
+nook-dev-relay = []
+standalone-relay = []
+
 [[bin]]
 name = "nook-hook"
 path = "src/main.rs"
+required-features = ["production-relay"]
+
+[[bin]]
+name = "nook-hook-dev"
+path = "src/main.rs"
+required-features = ["nook-dev-relay"]
+
+[[bin]]
+name = "nook-hook-standalone"
+path = "src/main.rs"
+required-features = ["standalone-relay"]
+
+[[bin]]
+name = "nook-dev-relay-test-server"
+path = "src/bin/dev-relay-test-server.rs"
+required-features = ["nook-dev-relay"]
+
+[[test]]
+name = "dev_relay"
+path = "tests/dev_relay.rs"
+required-features = ["nook-dev-relay"]
 
 [dependencies]
 serde_json = "1"
@@ -22,6 +49,8 @@ windows = { version = "0.61", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Pipes",
   "Win32_System_Threading",
+  "Win32_System_IO",
+  "Win32_Storage_FileSystem",
 ] }
 
 # The relay's version information (name, description, author, version) as

@@ -12,9 +12,11 @@
 //                 connect, island and look)
 //        &theme=light|dark|system  &motion=system|on|off
 //        &hooks=installed|none|legacy|both|relay|relay-none|unreadable
-//        &usage=none|installed|chained|other
+//        &usage=none|installed|chained|other|original|standalone
 //        &reply=none|installed|outdated|unmarked|broken|missing
 //        &cursor=installed
+//        &connect=none|configured|receiving|repair|original|dev|mixed|relay-missing
+//        &mode=dev|original|standalone
 //        &shortcuts=ok|launch|off
 //        &size=560x680            (the page drawn at that size, as the window is)
 //        &chrome=0                (…without the frame and backdrop around it)
@@ -26,7 +28,7 @@
 // Nothing in it is random, and its timestamps are fixed: the same address draws
 // the same page, for screenshots.
 
-import type { CodexStatus, CursorStatus, HookPreview, HookStatus, ReplyFormatStatus, ShortcutName, ShortcutStatus, UpdateInfo, UsageStatus } from "../core/bridge";
+import type { CodexQuotaSnapshot, CodexStatus, ConnectAgent, ConnectOperation, ConnectPreview, ConnectScan, CursorStatus, HookPreview, HookStatus, ReplyFormatStatus, ShortcutName, ShortcutStatus, UpdateInfo, UsageStatus } from "../core/bridge";
 import { DEFAULT_SETTINGS, type Settings } from "../core/state";
 import type { Backend } from "./backend";
 
@@ -65,6 +67,12 @@ const stamp = () => "20261006-091500";
 
 export function fakeBackend(): Backend {
   const q = new URLSearchParams(location.search);
+  const connectCase = q.get("connect") ?? "none";
+  const standaloneRelay = `${HOME}\\AppData\\Local\\NookStandalone\\bin\\nook-hook-standalone.exe`;
+  const eventSets: Record<ConnectAgent, string[]> = {
+    ClaudeCode: ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "Notification", "Stop", "StopFailure", "SubagentStart", "SubagentStop"],
+    Codex: ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop", "SessionEnd", "Interrupt", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact"],
+  };
   const hooksCase = q.get("hooks") ?? "installed";
   const usageCase = q.get("usage") ?? "none";
   let replyCase = q.get("reply") ?? "none";
@@ -85,7 +93,10 @@ export function fakeBackend(): Backend {
   const cursor = { installed: q.get("cursor") === "installed" };
   const codex = { installed: q.get("codex") === "installed" };
   let update: UpdateInfo | null = null;
-  const usage = { installed: usageCase === "installed" || usageCase === "chained", chained: usageCase === "chained", other: usageCase === "other" };
+  const usageOwner: UsageStatus["statusLineOwner"] = usageCase === "original" ? "original"
+    : usageCase === "standalone" || usageCase === "installed" || usageCase === "chained" ? "standalone"
+      : usageCase === "other" ? "thirdParty" : "none";
+  const usage = { owner: usageOwner, installed: usageOwner === "standalone", chained: usageCase === "chained", other: usageOwner === "thirdParty" };
   /** Stands for the bytes of settings.json: every write changes it. */
   let revision = 1;
 
@@ -153,8 +164,58 @@ export function fakeBackend(): Backend {
     fake: true,
     start: q.get("section") ?? undefined,
     async boot() {
-      return { settings: { ...settings }, version: "0.0.0-fake" };
+      return { settings: { ...settings }, version: "0.0.0-fake", nookDev: q.get("mode") === "dev", nookStandalone: q.get("mode") === "standalone" };
     },
+    async connectScan(): Promise<ConnectScan> {
+      const hooks: ConnectScan["hooks"] = [];
+      const configs: ConnectScan["configs"] = [];
+      for (const agent of ["ClaudeCode", "Codex"] as const) {
+        const userPath = agent === "ClaudeCode" ? SETTINGS_JSON : CODEX_JSON;
+        const active = connectCase === "configured" || connectCase === "receiving" || connectCase === "repair" || connectCase === "original" || connectCase === "mixed" || connectCase === "dev";
+        const owner = connectCase === "original" ? "OriginalNook" : connectCase === "dev" ? "NookDev" : "StandaloneNook";
+        const events = connectCase === "repair" ? [eventSets[agent][0]!] : eventSets[agent];
+        const relay = owner === "OriginalNook" ? RELAY : standaloneRelay;
+        if (active) for (const event of events) hooks.push({ agent, scope: "User", configPath: agent === "ClaudeCode" ? SETTINGS_JSON : CODEX_JSON, event, ownership: owner, command: relay, relayPath: relay, relayExists: true });
+        if (connectCase === "mixed") {
+          hooks.push({ agent, scope: "User", configPath: agent === "ClaudeCode" ? SETTINGS_JSON : CODEX_JSON, event: "Stop", ownership: "ThirdParty", command: "C:\\tools\\observer.exe", relayPath: null, relayExists: null });
+          hooks.push({ agent, scope: "User", configPath: agent === "ClaudeCode" ? SETTINGS_JSON : CODEX_JSON, event: "UnknownEvent", ownership: "Unknown", command: "C:\\tools\\unknown.exe", relayPath: null, relayExists: null });
+          const projectPath = agent === "ClaudeCode" ? "C:\\Users\\dev\\Projects\\sample\\.claude\\settings.json" : "C:\\Users\\dev\\Projects\\sample\\.codex\\hooks.json";
+          const localPath = agent === "ClaudeCode" ? "C:\\Users\\dev\\Projects\\sample\\.claude\\settings.local.json" : "C:\\Users\\dev\\Projects\\sample\\.codex\\hooks.json";
+          hooks.push({ agent, scope: "Project", configPath: projectPath, event: "SessionStart", ownership: "OriginalNook", command: RELAY, relayPath: RELAY, relayExists: true });
+          hooks.push({ agent, scope: "ProjectLocal", configPath: localPath, event: "UserPromptSubmit", ownership: "NookDev", command: `${HOME}\\AppData\\Local\\NookDev\\bin\\nook-hook-dev.exe`, relayPath: `${HOME}\\AppData\\Local\\NookDev\\bin\\nook-hook-dev.exe`, relayExists: true });
+          configs.push({ agent, scope: "Project", path: projectPath, status: "Readable", fingerprint: "fixture-sha256-original", error: null }, { agent, scope: "ProjectLocal", path: localPath, status: "Readable", fingerprint: "fixture-sha256-dev", error: null });
+        }
+        configs.push({ agent, scope: "User", path: userPath, status: active ? "Readable" : "Missing", fingerprint: active ? "fixture-sha256-user" : null, error: null });
+      }
+      const agents = (["ClaudeCode", "Codex"] as const).map((agent) => {
+        const owned = hooks.filter((hook) => hook.agent === agent && hook.ownership === "StandaloneNook");
+        const configured = owned.length > 0;
+        const complete = eventSets[agent].every((event) => owned.some((hook) => hook.event === event));
+        const receiving = connectCase === "receiving";
+        return { agent, configurationStatus: configured ? complete ? "Configured" as const : "NeedsRepair" as const : "NotConfigured" as const, deliveryState: receiving ? "Receiving" as const : configured ? "WaitingForActivity" as const : "NotConfigured" as const, lastReceivedEvent: receiving ? "Stop" : null, lastReceivedAtMs: receiving ? 1793970120000 : null };
+      });
+      return { standaloneRelay, standaloneRelayReady: connectCase !== "relay-missing", detectedAgents: ["ClaudeCode", "Codex"], configs, hooks, duplicates: [], agents, issues: [] };
+    },
+    async connectPreview(agent: ConnectAgent, operation: ConnectOperation, approvedDevScopes = []): Promise<ConnectPreview> {
+      const original = connectCase === "original" || connectCase === "mixed";
+      const dev = connectCase === "dev" || connectCase === "mixed";
+      const hasConfig = ["configured", "receiving", "repair", "original", "mixed"].includes(connectCase);
+      const changes: ConnectPreview["files"][number]["changes"] = operation === "Disconnect"
+        ? [{ event: "Stop", kind: "Remove", ownership: original ? "OriginalNook" : "StandaloneNook", detail: "Remove only the owned Nook hook." }]
+        : [{ event: "Stop", kind: original ? "Change" : "Add", ownership: original ? "OriginalNook" : "StandaloneNook", detail: "Configure standalone relay." }, ...(connectCase === "mixed" ? [{ event: "PreToolUse", kind: "Preserve" as const, ownership: "ThirdParty" as const, detail: "Leave third-party hook unchanged." }, { event: "UnknownEvent", kind: "Preserve" as const, ownership: "Unknown" as const, detail: "Leave unknown hook unchanged." }] : [])];
+      const scopePath = agent === "ClaudeCode" ? SETTINGS_JSON : CODEX_JSON;
+      const projectPath = agent === "ClaudeCode" ? "C:\\Users\\dev\\Projects\\sample\\.claude\\settings.json" : "C:\\Users\\dev\\Projects\\sample\\.codex\\hooks.json";
+      const localPath = agent === "ClaudeCode" ? "C:\\Users\\dev\\Projects\\sample\\.claude\\settings.local.json" : "C:\\Users\\dev\\Projects\\sample\\.codex\\hooks.json";
+      const requiredDev = dev && !approvedDevScopes.includes(localPath) ? [localPath] : [];
+      const files: ConnectPreview["files"] = hasConfig || dev ? [{ agent, scope: "User", path: scopePath, status: "Readable", fingerprint: "fixture-sha256-user", backupRequired: true, backupPath: `${scopePath}.bak-fixture`, diff: JSON.stringify(changes, null, 2), changes, conflicts: [], devApprovalRequired: dev }] : [{ agent, scope: "User", path: scopePath, status: "Missing", fingerprint: null, backupRequired: false, backupPath: null, diff: "Add owned hook entries.", changes, conflicts: [] }];
+      if (connectCase === "mixed") {
+        files.push({ agent, scope: "Project", path: projectPath, status: "Readable", fingerprint: "fixture-sha256-original", backupRequired: true, backupPath: `${projectPath}.bak-fixture`, diff: "- Original Nook SessionStart relay\n+ Standalone Nook SessionStart relay", changes: [{ event: "SessionStart", kind: "Change", ownership: "OriginalNook", detail: "Migrate Original Nook entry." }], conflicts: [] });
+        files.push({ agent, scope: "ProjectLocal", path: localPath, status: "Readable", fingerprint: "fixture-sha256-dev", backupRequired: true, backupPath: `${localPath}.bak-fixture`, diff: "- Nook Dev UserPromptSubmit relay", changes: [{ event: "UserPromptSubmit", kind: "Remove", ownership: "NookDev", detail: "Remove only after explicit scope approval." }], conflicts: [] });
+      }
+      return { previewId: `fake-${agent}-${operation}-${approvedDevScopes.length}`, agent, operation, targetRelay: standaloneRelay, files, duplicates: [], preservedRecords: changes.filter((change) => change.kind === "Preserve").length, conflicts: connectCase === "relay-missing" ? ["Standalone relay is not installed yet."] : [], approvedDevScopes, devScopesRequiringApproval: requiredDev, codexTrustRequired: agent === "Codex" && operation !== "Disconnect", requiresOriginalMigration: original && operation !== "Disconnect" };
+    },
+    async connectApply(): Promise<string[]> { return ["Fixture-only change applied in this browser preview."]; },
+    async onConnectActivity() {},
     async saveSettings(next) {
       // As Rust does: the shortcuts are not a page's to write, and the page is told what was kept.
       Object.assign(settings, next, {
@@ -169,6 +230,7 @@ export function fakeBackend(): Backend {
       await wait(20);
       told?.({ ...settings });
     },
+    async setTrayLabels() {},
     onSettingsChanged(handler) {
       told = handler;
       // What the island's own quick settings would do, to try from the console:
@@ -178,6 +240,10 @@ export function fakeBackend(): Backend {
         handler({ ...settings });
       };
     },
+    async codexQuotaLast(): Promise<CodexQuotaSnapshot | null> {
+      return null;
+    },
+    async onCodexQuotaChanged() {},
 
     async hooksStatus(): Promise<HookStatus> {
       return { installed: hooks.installed, legacy: hooks.legacy, settingsPath: SETTINGS_JSON, hookPath: RELAY, hookReady: hooks.ready };
@@ -248,13 +314,13 @@ export function fakeBackend(): Backend {
     },
 
     async usageStatus(): Promise<UsageStatus> {
-      return { installed: usage.installed, chained: usage.chained, otherStatusLine: usage.other, settingsPath: SETTINGS_JSON };
+      return { installed: usage.installed, chained: usage.chained, otherStatusLine: usage.other, statusLineOwner: usage.owner, statusLineRelay: usage.owner === "original" ? RELAY : usage.owner === "standalone" ? RELAY.replace("Nook\\bin\\nook-hook.exe", "NookStandalone\\bin\\nook-hook-standalone.exe") : usage.owner === "thirdParty" ? OWN_STATUS_LINE : null, settingsPath: SETTINGS_JSON, projectOverrides: [], projectScanWarnings: [] };
     },
     async usagePreview(install) {
       await wait();
       return preview(usageDiff(install));
     },
-    async usageApply(install, fingerprint) {
+    async usageApply(install, fingerprint, _originalMigrationApproved) {
       await wait(300);
       const backup = written(fingerprint);
       if (install) Object.assign(usage, { installed: true, chained: usage.other, other: false });

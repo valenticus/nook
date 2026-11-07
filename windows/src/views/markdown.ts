@@ -14,6 +14,7 @@
 
 import { h } from "./dom";
 import { LUCIDE, lucide } from "./iconset";
+import { message } from "../core/i18n";
 
 // ── Reading: an answer as blocks ──────────────────────────────────────────────
 
@@ -480,7 +481,7 @@ export function reply(source: string, opener: PathOpener | null, fold: ReplyFold
   return h(
     "div", { class: "md folded" },
     ...all(plan.lead),
-    plan.decisions > 0 ? h("div", { class: "md-skip", text: `${plan.decisions} ${plan.decisions === 1 ? "decision" : "decisions"} further down` }) : null,
-    control("Show full reply", `${plan.hidden} more ${plan.hidden === 1 ? "line" : "lines"}`),
+    plan.decisions > 0 ? h("div", { class: "md-skip", text: message(`{count} ${plan.decisions === 1 ? "decision" : "decisions"} further down`, { count: plan.decisions }) }) : null,
+    control("Show full reply", message(`{count} more ${plan.hidden === 1 ? "line" : "lines"}`, { count: plan.hidden })),
   );
 }

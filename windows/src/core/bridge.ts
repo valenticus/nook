@@ -7,9 +7,12 @@ import { listen } from "@tauri-apps/api/event";
 import type { AgentsSnapshot } from "../agents/model";
 import type { Dock } from "./layout";
 import type { Settings } from "./state";
+import type { TrayMenuLabels } from "./i18n";
 
 export const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+export const isSimulatedRequest = (requestId: string) => requestId.startsWith("nook-sim:req:");
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
   if (!IS_TAURI) return null;
@@ -23,6 +26,10 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T |
 
 export interface BootInfo {
   settings: Settings;
+  /** True only in the isolated Nook Dev build. */
+  nookDev: boolean;
+  /** True only in the standalone build allowed to apply reviewed Connect plans. */
+  nookStandalone?: boolean;
   /** Logical screen rect of the monitor the island lives on. */
   screen: { x: number; y: number; width: number; height: number; scale: number };
   /** The window's own logical size on that monitor: see layout.ts `Room`. */
@@ -31,6 +38,60 @@ export interface BootInfo {
   hookPath: string;
   /** False where the OS has no global cursor (Wayland): see Island.followPageCursor. */
   cursorPoll: boolean;
+}
+
+export interface DevBatteryStatus {
+  percent: number | null;
+  acConnected: boolean | null;
+  charging: boolean | null;
+  /** null on API failure or when Windows reports BatteryFlag=Unknown (255). */
+  batteryPresent: boolean | null;
+}
+
+export type ConnectAgent = "ClaudeCode" | "Codex";
+export type ConnectScope = "User" | "Project" | "ProjectLocal";
+export type ConnectOwnership = "OriginalNook" | "NookDev" | "StandaloneNook" | "ThirdParty" | "Unknown";
+export type ConnectConfigStatus = "Readable" | "Missing" | "Malformed" | "Inaccessible";
+export type ConnectDeliveryState = "NotConfigured" | "WaitingForActivity" | "Receiving";
+export type ConnectOperation = "Connect" | "Disconnect" | "Repair";
+
+/** Read-only Connect inventory. Delivery is separate from configuration: no event is not proof of no hooks. */
+export interface ConnectScan {
+  standaloneRelay: string;
+  standaloneRelayReady: boolean;
+  detectedAgents: ConnectAgent[];
+  configs: { agent: ConnectAgent; scope: ConnectScope; path: string; status: ConnectConfigStatus; fingerprint?: string | null; error: string | null }[];
+  hooks: {
+    agent: ConnectAgent; scope: ConnectScope; configPath: string; event: string;
+    ownership: ConnectOwnership; command: string | null; relayPath: string | null; relayExists: boolean | null;
+  }[];
+  duplicates: { agent: ConnectAgent; event: string; relayPath: string; scopes: ConnectScope[]; configPaths: string[] }[];
+  agents: {
+    agent: ConnectAgent; configurationStatus: "Configured" | "NotConfigured" | "NeedsRepair";
+    deliveryState: ConnectDeliveryState; lastReceivedEvent: string | null; lastReceivedAtMs: number | null;
+  }[];
+  issues: string[];
+}
+
+export interface ConnectPreview {
+  previewId: string | null;
+  agent?: ConnectAgent | null;
+  operation: ConnectOperation;
+  targetRelay: string;
+  files: {
+    agent: ConnectAgent; scope: ConnectScope; path: string; status: ConnectConfigStatus;
+    fingerprint: string | null; backupRequired: boolean; backupPath: string | null; diff: string;
+    changes: { event: string; kind: "Add" | "Change" | "Remove" | "Preserve"; ownership: ConnectOwnership; detail: string }[];
+    conflicts: string[];
+    devApprovalRequired?: boolean;
+  }[];
+  duplicates: ConnectScan["duplicates"];
+  preservedRecords: number;
+  conflicts: string[];
+  approvedDevScopes: string[];
+  devScopesRequiringApproval: string[];
+  codexTrustRequired: boolean;
+  requiresOriginalMigration: boolean;
 }
 
 /** The full window's logical size, as Rust sized it for the display (the `panel-size` event carries one too). */
@@ -44,7 +105,33 @@ export interface PanelSize {
 export const Bridge = {
   boot: () => call<BootInfo>("boot"),
 
+  /** Read-only user and explicitly supplied project hook configuration inventory. */
+  connectScan: () => call<ConnectScan>("connect_scan"),
+
+  /** Read-only fingerprinted Connect / Disconnect / Repair plan. */
+  connectPreview: (agent: ConnectAgent, operation: ConnectOperation, approvedDevScopes: string[] = []) =>
+    call<ConnectPreview>("connect_preview", { agent, operation, approvedDevScopes }),
+
+  /** The confirmation button calls this once; Rust consumes its one-use preview ticket. */
+  connectApply: async (previewId: string, approvedDevScopes: string[], codexTrustApproved: boolean, originalMigrationApproved: boolean, confirmed: boolean) => {
+    if (!IS_TAURI) return null;
+    return invoke<string[]>("connect_apply", { previewId, approvedDevScopes, codexTrustApproved, originalMigrationApproved, confirmed });
+  },
+
+  onConnectActivity: (fn: () => void) => listen("connect-activity", fn),
+
+  /** Read-only Windows power status; exposed only by Nook Dev. */
+  devBatteryStatus: () => call<DevBatteryStatus>("dev_battery_status"),
+
+  /** Read only the normalized in-memory snapshot; this never starts a poll. */
+  codexQuotaLast: () => call<CodexQuotaSnapshot>("codex_quota_last"),
+
+  /** Subscribe to Codex quota snapshots where the provider feature is available. */
+  onCodexQuota: (fn: (snapshot: CodexQuotaSnapshot) => void) =>
+    listen<CodexQuotaSnapshot>("codex-quota", ({ payload }) => fn(payload)),
+
   saveSettings: (settings: Settings) => call<void>("save_settings", { settings }),
+  setTrayLabels: (labels: TrayMenuLabels) => call<void>("tray_set_labels", { labels }),
 
   /** Shrink the window down to the invisible wake strip (hidden) or back to full. */
   setCollapsed: (collapsed: boolean) => call<void>("set_collapsed", { collapsed }),
@@ -210,14 +297,14 @@ export const Bridge = {
     callOrThrow<string>("codex_apply", { install, fingerprint }),
 
   approvalDecision: (requestId: string, decision: "allow" | "deny" | "skip") =>
-    call<void>("approval_decision", { requestId, decision }),
+    isSimulatedRequest(requestId) ? Promise.resolve(null) : call<void>("approval_decision", { requestId, decision }),
   /** "The card is up" — until this lands the relay only waits a moment. */
-  approvalAck: (requestId: string) => call<void>("approval_ack", { requestId }),
+  approvalAck: (requestId: string) => isSimulatedRequest(requestId) ? Promise.resolve(null) : call<void>("approval_ack", { requestId }),
   /** "Nobody can act on this" — Claude Code asks in the terminal right away. */
-  approvalDecline: (requestId: string) => call<void>("approval_decline", { requestId }),
+  approvalDecline: (requestId: string) => isSimulatedRequest(requestId) ? Promise.resolve(null) : call<void>("approval_decline", { requestId }),
   /** The answers to a question Claude asked, keyed by the question's own words. */
   approvalAnswer: (requestId: string, answers: Record<string, string>) =>
-    call<void>("approval_answer", { requestId, answers }),
+    isSimulatedRequest(requestId) ? Promise.resolve(null) : call<void>("approval_answer", { requestId, answers }),
 
   // ── Claude's usage limits (step 2, system side) ───────────────────────────
   /** The latest usage Claude Code reported to its status line, or null when none has come yet. */
@@ -227,8 +314,8 @@ export const Bridge = {
   /** Diff of the `statusLine` key to show before anything is written. `install: false` previews removal. */
   usagePreview: (install: boolean) => callOrThrow<HookPreview>("usage_preview", { install }),
   /** Writes ~/.claude/settings.json — after an explicit click, and only if it still matches the preview. */
-  usageApply: (install: boolean, fingerprint: string) =>
-    callOrThrow<string>("usage_apply", { install, fingerprint }),
+  usageApply: (install: boolean, fingerprint: string, originalMigrationApproved: boolean) =>
+    callOrThrow<string>("usage_apply", { install, fingerprint, originalMigrationApproved }),
   // ── end of the usage block ────────────────────────────────────────────────
 
   // ── The reply format, in ~/.claude/CLAUDE.md ──────────────────────────────
@@ -292,20 +379,6 @@ export interface ReplyFormatStatus {
 // ── Step 2, system side: the machine, the usage limits, the models ────────────
 // Events Rust emits to the island window, and what the usage commands return.
 
-/**
- * The `metrics` event: every 2.5 s while the island is not hidden, never
- * otherwise. `cpu` is the whole machine's, in percent (0–100, one decimal),
- * and null on the first reading after each wake. `gpu` is the busiest
- * graphics adapter's, 0–100 too: null on that first reading, and always on a
- * machine that does not report it. The two others are bytes.
- */
-export interface MetricsPayload {
-  cpu: number | null;
-  gpu: number | null;
-  ramUsed: number;
-  ramTotal: number;
-}
-
 /** One usage window: how much of it is used, in percent (0–100), and when it resets (Unix ms). */
 export interface UsageWindow {
   usedPercent: number;
@@ -321,6 +394,21 @@ export interface UsagePayload {
   fiveHour: UsageWindow | null;
   sevenDay: UsageWindow | null;
   updatedAt: number;
+}
+
+/** Normalized, in-memory Codex app-server quota snapshot (Nook Dev only). */
+export interface CodexQuotaSnapshot {
+  /** Dev opt-in epoch; events from earlier epochs are discarded by each UI window. */
+  generation: number;
+  quotas: { fiveHour: CodexQuotaWindow | null; sevenDay: CodexQuotaWindow | null } | null;
+  updatedAt: number | null;
+  stale: boolean;
+  available: boolean;
+  failureReason: "disabled" | "cliUnavailable" | "spawnFailed" | "processIsolationUnavailable" | "timeout" | "unauthorized" | "serverExited" | "protocolError" | "quotaUnavailable" | null;
+}
+
+export interface CodexQuotaWindow extends UsageWindow {
+  windowDurationMins: number;
 }
 
 /** The `session_model` event: the model a session runs on, from its status line. */
@@ -339,12 +427,17 @@ export interface UsageStatus {
   chained: boolean;
   /** A status line that is not Nook's is there: installing wraps it. */
   otherStatusLine: boolean;
+  statusLineOwner: "none" | "standalone" | "original" | "dev" | "thirdParty" | "unknown";
+  statusLineRelay: string | null;
   settingsPath: string;
+  /** Highest-priority statusLine found in each known project; project-local wins over shared project. */
+  projectOverrides: { projectPath: string; settingsPath: string; scope: string; standalone: boolean; owner: UsageStatus["statusLineOwner"]; relayPath: string | null }[];
+  /** Known project settings that could not be read or parsed. */
+  projectScanWarnings: string[];
 }
 
 /** The events of this block, by name. */
 export type SystemEvent =
-  | { name: "metrics"; payload: MetricsPayload }
   | { name: "usage"; payload: UsagePayload }
   | { name: "session_model"; payload: SessionModelPayload };
 // ── end of the step 2 block ───────────────────────────────────────────────────
@@ -454,6 +547,7 @@ async function callOrThrow<T>(cmd: string, args?: Record<string, unknown>): Prom
 export type BridgeEvent =
   | { name: "cursor"; payload: { x: number; y: number } }
   | { name: "tray"; payload: string }
+  | { name: "codex-quota"; payload: CodexQuotaSnapshot }
   | { name: "hook"; payload: Record<string, unknown> }
   | { name: "screen-changed"; payload: null };
 

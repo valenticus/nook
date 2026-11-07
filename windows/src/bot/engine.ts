@@ -244,6 +244,25 @@ const THEME_RGB = Object.fromEntries(
   Object.entries(BOT_THEMES).map(([name, t]) => [name, { a: hexToRGB(t.a), b: hexToRGB(t.b) }]),
 ) as Record<BotTheme, { a: RGB; b: RGB }>;
 
+/** The plush of a Nook nobody has chosen a colour in. */
+export const DEFAULT_BOT_THEME: BotTheme = "cream";
+
+/**
+ * The two colours a bot's plush is drawn in. A body colour (a pill's, a
+ * session's: the plush dyed in it) is worn as it was made — except by a bot
+ * that `yieldsToTheme`, once the user has chosen a plush in Settings: what the
+ * user chose wins over what a pill would have. While the default is still the
+ * theme, nobody has chosen, and the pills' own colours are as they were made.
+ */
+export function skinFor(
+  theme: BotTheme, bodyColor: RGB | null, yieldsToTheme: boolean,
+): { a: RGB; b: RGB } {
+  if (bodyColor && !(yieldsToTheme && theme !== DEFAULT_BOT_THEME)) {
+    return { a: mix3(bodyColor, WHITE, 0.45), b: bodyColor };
+  }
+  return THEME_RGB[theme];
+}
+
 /**
  * How much of the bot's surroundings a bot of this size gets, 0…1: its arms and
  * toes, the plush's hairs and rim, the shadow under it and its bubble. The
@@ -327,10 +346,22 @@ const FONT = `system-ui, "Segoe UI Variable Text", "Segoe UI", sans-serif`;
 
 export class BotEngine {
   isMini = false;
-  /** Which plush the body is made of, when nothing tints it. */
-  /** The plush every bot made from now on wears: the one chosen in Settings. */
-  static defaultTheme: BotTheme = "cream";
-  theme: BotTheme = BotEngine.defaultTheme;
+  /** The plush every bot that has none of its own wears: the one chosen in Settings, bots already made included. */
+  static defaultTheme: BotTheme = DEFAULT_BOT_THEME;
+
+  /** Puts the plush chosen in Settings in place; false when it already was. */
+  static setDefaultTheme(theme: BotTheme): boolean {
+    if (BotEngine.defaultTheme === theme) return false;
+    BotEngine.defaultTheme = theme;
+    return true;
+  }
+
+  private ownTheme: BotTheme | null = null;
+  /** Which plush the body is made of, when nothing tints it: its own if it was given one, else the default — whenever that changes. */
+  get theme(): BotTheme { return this.ownTheme ?? BotEngine.defaultTheme; }
+  set theme(theme: BotTheme) { this.ownTheme = theme; }
+  /** A pill's bot, not a decoration: once the user has chosen a plush, `bodyColor` gives way to it (see `skinFor`). */
+  tintYieldsToTheme = false;
   /**
    * The colour of a mini bot's or a pill's body (null = the theme's own): the
    * plush is dyed in it, lighter where the light falls, as the themes are.
@@ -933,9 +964,7 @@ export class BotEngine {
     const m = x.getTransform();
     const px = Math.hypot(m.a, m.b);
 
-    const skin = this.bodyColor
-      ? { a: mix3(this.bodyColor, WHITE, 0.45), b: this.bodyColor }
-      : THEME_RGB[this.theme];
+    const skin = skinFor(this.theme, this.bodyColor, this.tintYieldsToTheme);
 
     if (k > 0) {
       // Its shadow on the ground, smaller as it leaves it.

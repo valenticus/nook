@@ -1,0 +1,97 @@
+[
+  {
+    "agent": "claude",
+    "event": "SessionStart",
+    "payload": { "hook_event_name": "SessionStart", "session_id": "fixture-claude-01", "cwd": "C:\\NookFixture", "source": "startup" }
+  },
+  {
+    "agent": "claude",
+    "event": "UserPromptSubmit",
+    "payload": { "hook_event_name": "UserPromptSubmit", "session_id": "fixture-claude-01", "cwd": "C:\\NookFixture", "prompt": "synthetic fixture prompt" }
+  },
+  {
+    "agent": "claude",
+    "event": "PreToolUse",
+    "payload": { "hook_event_name": "PreToolUse", "session_id": "fixture-claude-01", "tool_name": "Read", "tool_input": { "file_path": "fixture.txt" } }
+  },
+  {
+    "agent": "claude",
+    "event": "PostToolUse",
+    "payload": { "hook_event_name": "PostToolUse", "session_id": "fixture-claude-01", "tool_name": "Read", "tool_response": { "file": { "content": "fixture only" } } }
+  },
+  {
+    "agent": "claude",
+    "event": "PermissionRequest",
+    "payload": { "hook_event_name": "PermissionRequest", "session_id": "fixture-claude-01", "tool_name": "Bash", "tool_input": { "command": "echo fixture-only" } }
+  },
+  {
+    "agent": "claude",
+    "event": "Stop",
+    "payload": { "hook_event_name": "Stop", "session_id": "fixture-claude-01", "stop_hook_active": false, "last_assistant_message": "synthetic completion" }
+  },
+  {
+    "agent": "claude",
+    "event": "SessionEnd",
+    "payload": { "hook_event_name": "SessionEnd", "session_id": "fixture-claude-01", "reason": "other" }
+  },
+  {
+    "agent": "codex",
+    "event": "SessionStart",
+    "payload": { "hook_event_name": "SessionStart", "session_id": "fixture-codex-02", "cwd": "C:\\NookFixture" }
+  },
+  {
+    "agent": "codex",
+    "event": "UserPromptSubmit",
+    "payload": { "hook_event_name": "UserPromptSubmit", "session_id": "fixture-codex-02", "cwd": "C:\\NookFixture", "prompt": "synthetic fixture prompt" }
+  },
+  {
+    "agent": "codex",
+    "event": "PreToolUse",
+    "payload": { "hook_event_name": "PreToolUse", "session_id": "fixture-codex-02", "tool_name": "Bash", "tool_input": { "command": "echo fixture-only" } }
+  },
+  {
+    "agent": "codex",
+    "event": "PostToolUse",
+    "payload": { "hook_event_name": "PostToolUse", "session_id": "fixture-codex-02", "tool_name": "Bash", "tool_response": { "stdout": "fixture only" } }
+  },
+  {
+    "agent": "codex",
+    "event": "PermissionRequest",
+    "payload": { "hook_event_name": "PermissionRequest", "session_id": "fixture-codex-02", "tool_name": "Bash", "tool_input": { "command": "echo fixture-only" } }
+  },
+  {
+    "agent": "codex",
+    "event": "Stop",
+    "payload": { "hook_event_name": "Stop", "session_id": "fixture-codex-02", "last_assistant_message": "synthetic completion" }
+  },
+  {
+    "agent": "codex",
+    "event": "Interrupt",
+    "payload": { "hook_event_name": "Interrupt", "session_id": "fixture-codex-02", "turn_id": "fixture-turn-02", "permission_mode": "default" }
+  },
+  {
+    "agent": "codex",
+    "event": "SubagentStart",
+    "payload": { "hook_event_name": "SubagentStart", "session_id": "fixture-codex-02", "turn_id": "fixture-turn-02", "agent_id": "fixture-agent-01", "agent_type": "general", "permission_mode": "default" }
+  },
+  {
+    "agent": "codex",
+    "event": "SubagentStop",
+    "payload": { "hook_event_name": "SubagentStop", "session_id": "fixture-codex-02", "turn_id": "fixture-turn-02", "agent_id": "fixture-agent-01", "agent_type": "general", "permission_mode": "default", "last_assistant_message": "synthetic child completion" }
+  },
+  {
+    "agent": "codex",
+    "event": "PreCompact",
+    "payload": { "hook_event_name": "PreCompact", "session_id": "fixture-codex-02", "turn_id": "fixture-turn-02", "trigger": "auto" }
+  },
+  {
+    "agent": "codex",
+    "event": "PostCompact",
+    "payload": { "hook_event_name": "PostCompact", "session_id": "fixture-codex-02", "turn_id": "fixture-turn-02", "trigger": "auto" }
+  },
+  {
+    "agent": "codex",
+    "event": "SessionEnd",
+    "payload": { "hook_event_name": "SessionEnd", "session_id": "fixture-codex-02", "reason": "other" }
+  }
+]

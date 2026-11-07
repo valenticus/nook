@@ -3,14 +3,20 @@
 import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { Bridge, IS_TAURI, onEvent, type PanelSize } from "./core/bridge";
+import { enableShelfTraceSource, shelfTrace } from "./core/shelf-trace";
 import { Reply } from "./core/reply";
 import { Sound } from "./core/sound";
-import { State, readMetrics, readUsage, type Settings } from "./core/state";
+import { State, readUsage, type Settings } from "./core/state";
+import { clearLegacyCompletionNotifications } from "./core/completion-events";
+import { currentLanguage, resolveLanguage, setLanguage, trayMenuLabels } from "./core/i18n";
+import { QuotaSnapshotGate } from "./settings/codex-quota-view";
 import { Update } from "./core/update";
 import { startAgentsFeed } from "./agents/feed";
 import { Island } from "./island/island";
 import { registerHookHandlers } from "./island/hooks";
 import { startWidgets } from "./widgets";
+
+const CODEX_QUOTA_BUILD = __NOOK_DEV_BUILD__ || __NOOK_STANDALONE_BUILD__;
 
 /**
  * Asks Rust for something that may not be there: a command of the usage
@@ -37,15 +43,54 @@ async function main() {
   const root = document.getElementById("root");
   if (!root) return;
 
+  if (__NOOK_DEV_BUILD__) shelfTrace("locale-before-boot", { locale: currentLanguage(), languagePreference: State.settings.language, source: "island" });
+  setLanguage(resolveLanguage(State.settings.language), "island.pre-boot");
+
   void Sound.preload();
-
-  const island = new Island(root);
-
   const boot = await Bridge.boot();
+  const codexQuotaGate = new QuotaSnapshotGate();
   if (boot) {
     State.settings = { ...State.settings, ...boot.settings };
+    State.nookDev = boot.nookDev === true;
+    State.nookStandalone = boot.nookStandalone === true;
+    setLanguage(resolveLanguage(State.settings.language), "island.boot");
+    void Bridge.setTrayLabels(trayMenuLabels());
+    if (__NOOK_DEV_BUILD__ && boot.nookDev) void enableShelfTraceSource(true);
+    codexQuotaGate.setEnabled(CODEX_QUOTA_BUILD && !!(boot.nookDev || boot.nookStandalone) && !!boot.settings.codexQuotaEnabled);
+  }
+  clearLegacyCompletionNotifications();
+  if (__NOOK_DEV_BUILD__) shelfTrace("locale-after-boot", { locale: currentLanguage(), languagePreference: State.settings.language, source: boot ? "island.boot" : "island.boot-unavailable" });
+
+  // Build the Island only after the persisted locale and settings are known.
+  // Views render synchronously from state; constructing them before `boot`
+  // makes the default English UI visible before the saved language arrives.
+  const island = new Island(root);
+  // The constructor has now attached every view. Translate it in this same
+  // task so its first painted frame uses the persisted locale too.
+  setLanguage(resolveLanguage(State.settings.language), "island.after-create");
+  if (boot) {
     island.setRoom(boot.panel.width, boot.panel.height, boot.panel.dock);
     island.setScreenWidth(boot.screen.width, boot.screen.height);
+    State.notify();
+  }
+  if (CODEX_QUOTA_BUILD && (boot?.nookDev || boot?.nookStandalone)) {
+    await Bridge.onCodexQuota((snapshot) => {
+      const accepted = codexQuotaGate.acceptEvent(snapshot);
+      if (accepted && State.settings.codexQuotaEnabled) {
+        if (__NOOK_DEV_BUILD__) shelfTrace("home-quota-update", { source: "codex-event", mutationType: "quota" });
+        State.setCodexQuota(accepted as import("./core/bridge").CodexQuotaSnapshot);
+      }
+    });
+    if (boot.settings.codexQuotaEnabled) {
+      void Bridge.codexQuotaLast().then((snapshot) => {
+        if (!codexQuotaGate.prime(snapshot)) return;
+        const accepted = codexQuotaGate.acceptEvent(snapshot);
+        if (accepted) {
+          if (__NOOK_DEV_BUILD__) shelfTrace("home-quota-update", { source: "codex-last", mutationType: "quota" });
+          State.setCodexQuota(accepted as import("./core/bridge").CodexQuotaSnapshot);
+        }
+      });
+    }
   }
   // Another display, or the same one at another size: the window was sized again.
   await onEvent<PanelSize>("panel-size", ({ width, height, dock }) => {
@@ -54,31 +99,32 @@ async function main() {
     void Bridge.boot().then((again) => again && island.setScreenWidth(again.screen.width, again.screen.height));
   });
 
-  // The machine, every 2.5 s while the island is on show, and Claude's usage
-  // limits when Claude Code reports them. Neither wakes the island's frame
-  // loop: each number is written where it shows (State.onGauges).
-  await onEvent<unknown>("metrics", (payload) => {
-    const metrics = readMetrics(payload);
-    if (metrics) State.setMetrics(metrics);
-  });
+  // Claude's usage limits arrive only when Claude Code reports them.
   await onEvent<unknown>("usage", (payload) => {
     const usage = readUsage(payload);
     if (!usage) return;
     // Usage that arrives was relayed: the limits are switched on.
     State.usageInstalled = true;
+    if (__NOOK_DEV_BUILD__) shelfTrace("home-quota-update", { source: "claude-event", mutationType: "quota" });
     State.setUsage(usage);
   });
   // What was last reported, before this page was listening.
   void ask("usage_last").then((last) => {
     const usage = readUsage(last);
-    if (usage) State.setUsage(usage);
+    if (usage) {
+      if (__NOOK_DEV_BUILD__) shelfTrace("home-quota-update", { source: "claude-last", mutationType: "quota" });
+      State.setUsage(usage);
+    }
   });
   void readUsageInstalled();
   // A reply typed in the island: which command lines can take one, and when a run of ours is over.
   await onEvent<unknown>("reply_ended", (payload) => Reply.ended(payload));
-  // A newer Nook, when the user asked to be told of one (core/update.ts): the island is told, and never asks.
-  await onEvent<unknown>("update_checked", (payload) => Update.checked(payload));
-  void Update.load();
+  // The Original build may report its upstream update state. Personal Edition
+  // has no Original updater commands or release endpoint.
+  if (!__NOOK_STANDALONE_BUILD__) {
+    await onEvent<unknown>("update_checked", (payload) => Update.checked(payload));
+    void Update.load();
+  }
   island.applySettings();
   // The Shelf's widgets read what they kept, and arm what must run on its own.
   startWidgets();
@@ -135,7 +181,39 @@ async function main() {
   // The settings window writes preferences; apply them here without a restart.
   const agentsFeed = startAgentsFeed();
   await onEvent<Settings>("settings-changed", (s) => {
+    const previousLocale = currentLanguage();
+    const previousPreference = State.settings.language;
+    const previousShelfHidden = State.settings.shelfHidden;
+    if (__NOOK_DEV_BUILD__) {
+      if (JSON.stringify(previousShelfHidden) !== JSON.stringify(s.shelfHidden)) {
+        shelfTrace("settings-event", { previousHidden: previousShelfHidden, nextHidden: s.shelfHidden });
+      }
+    }
+    const wasQuotaEnabled = State.settings.codexQuotaEnabled;
     State.settings = { ...State.settings, ...s };
+    setLanguage(resolveLanguage(State.settings.language), "island.settings-changed");
+    void Bridge.setTrayLabels(trayMenuLabels());
+    if (__NOOK_DEV_BUILD__) shelfTrace("locale-settings-update", {
+      locale: currentLanguage(), previousLocale, newLocale: currentLanguage(),
+      languagePreference: State.settings.language,
+      source: previousPreference === State.settings.language ? "island.settings-refresh" : "island.settings-changed",
+    });
+    if (__NOOK_DEV_BUILD__) {
+      if (JSON.stringify(previousShelfHidden) !== JSON.stringify(State.settings.shelfHidden)) {
+        shelfTrace("settings-applied", { shelfHidden: State.settings.shelfHidden });
+      }
+    }
+    if (State.settings.codexQuotaEnabled !== wasQuotaEnabled) {
+      codexQuotaGate.setEnabled(CODEX_QUOTA_BUILD && !!(boot?.nookDev || boot?.nookStandalone) && !!State.settings.codexQuotaEnabled);
+      if (CODEX_QUOTA_BUILD && (boot?.nookDev || boot?.nookStandalone) && State.settings.codexQuotaEnabled) {
+        void Bridge.codexQuotaLast().then((snapshot) => {
+          if (!codexQuotaGate.prime(snapshot)) return;
+          const accepted = codexQuotaGate.acceptEvent(snapshot);
+          if (accepted) State.setCodexQuota(accepted as import("./core/bridge").CodexQuotaSnapshot);
+        });
+      }
+    }
+    if (!State.settings.codexQuotaEnabled) State.clearCodexQuota();
     island.applySettings();
     // The agents list may have just been turned on: it is sent the rows.
     agentsFeed.poke();

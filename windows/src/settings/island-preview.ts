@@ -15,13 +15,14 @@
 
 import { Tracked } from "../core/anim";
 import {
-  COMPACT_BOT_SLOT, COMPACT_CELL_H, COMPACT_COLUMN_W, COMPACT_DOT, COMPACT_DOT_GAP, COMPACT_METRIC_GAP, COMPACT_PAD,
+  COMPACT_AGENT_ICON_H, COMPACT_AGENT_ICON_SIZE, COMPACT_AGENT_ICON_W, COMPACT_AGENT_SIDE_ADVANCE, COMPACT_BOT_SLOT, COMPACT_CELL_H, COMPACT_COLUMN_W, COMPACT_DOT, COMPACT_DOT_GAP, COMPACT_METRIC_GAP, COMPACT_PAD,
   COMPACT_SLOT_GAP, EAR_COMPACT, NOTCH_H, ROUNDED_CORNER, botPosition, compactLayout, sideDock, type Dock,
 } from "../core/layout";
 import { notchPath } from "../island/notch";
 import { usageLevel, type CompactMetric } from "../core/state";
 import { clear, h } from "../views/dom";
-import { LUCIDE, lucide } from "../views/iconset";
+import { message } from "../core/i18n";
+import { CLAUDE_BRAND_MARK, LUCIDE, brand, lucide } from "../views/iconset";
 import type { Bot } from "./bots";
 
 /**
@@ -29,9 +30,6 @@ import type { Bot } from "./bots";
  * in plain words and in short, its icon — with a sample of what it says.
  */
 export const COMPACT_CELLS: Record<CompactMetric, { width: number; name: string; short: string; icon: string; sample: string }> = {
-  cpu: { width: 52, name: "Processor (CPU)", short: "CPU", icon: LUCIDE.cpu, sample: "31%" },
-  gpu: { width: 52, name: "Graphics (GPU)", short: "GPU", icon: LUCIDE.gpu, sample: "18%" },
-  ram: { width: 52, name: "Memory (RAM)", short: "RAM", icon: LUCIDE.memoryStick, sample: "70%" },
   usage5h: { width: 52, name: "5-hour usage limit", short: "5-hour", icon: LUCIDE.timer, sample: "38%" },
   usage7d: { width: 52, name: "Weekly usage limit", short: "Weekly", icon: LUCIDE.calendarDays, sample: "12%" },
   waiting: { width: 38, name: "Sessions waiting for you", short: "Waiting", icon: LUCIDE.bell, sample: "1" },
@@ -47,10 +45,8 @@ export const COMPACT_BOT = botPosition("compact", "overview", NOTCH_H).diameter;
 
 /** Three sample sessions: one calling for the user, one working, one done. */
 const SAMPLE_DOTS: { color: string; calls?: boolean }[] = [{ color: "#FFB547", calls: true }, { color: "#5AA9FF" }, { color: "#4FD69C" }];
-/** The desk on a side: the column with its three sample dots and three cells, its ears, and air above and below. */
-const SIDE_DESK_H = compactLayout(SAMPLE_DOTS.length, [52, 52, 52], "left", Infinity).height + 2 * EAR_COMPACT + 24;
-/** What the CPU cell goes through, so the preview shows that a number moves and its cell does not. */
-const SAMPLE_CPU = ["31%", "34%", "28%", "47%", "39%", "100%", "36%"];
+/** The desk on a side: the column with sample dots and cells, its ears, and air above and below. */
+const SIDE_DESK_H = compactLayout(SAMPLE_DOTS.length, [52, 52, 38], "left", Infinity, 0).height + 2 * EAR_COMPACT + 24;
 
 export interface IslandPreview {
   el: HTMLElement;
@@ -60,8 +56,6 @@ export interface IslandPreview {
    * island goes to its new length on its own spring unless `animate` is false.
    */
   update(kinds: readonly CompactMetric[], animate: boolean, dock?: Dock): void;
-  /** Starts the sample CPU number moving; the returned function stops it. */
-  run(): () => void;
 }
 
 /** Made once: the bot in it is the one handed over, already mounted. */
@@ -129,12 +123,20 @@ export function islandPreview(bot: Bot): IslandPreview {
         // Tall enough for the longest column the samples make, whatever is picked: the page does not jump as cells come and go.
         desk.style.height = side ? `${SIDE_DESK_H}px` : "";
       }
-      const layout = compactLayout(SAMPLE_DOTS.length, kinds.map((k) => COMPACT_CELLS[k].width), side ?? "top");
+      const markBefore = kinds.findIndex((kind) => kind === "usage5h" || kind === "usage7d");
+      const layout = compactLayout(SAMPLE_DOTS.length, kinds.map((k) => COMPACT_CELLS[k].width), side ?? "top", undefined, markBefore);
       const on = kinds.slice(0, layout.metrics);
       if (on.join() !== shown) {
         shown = on.join();
         clear(cells);
-        for (const kind of on) {
+        const visibleMarkAt = on.findIndex((kind) => kind === "usage5h" || kind === "usage7d");
+        for (let index = 0; index < on.length; index++) {
+          const kind = on[index]!;
+          if (index === visibleMarkAt) cells.append(h("span", {
+            class: "sp-ci-agent",
+            style: `--agent-slot-w:${COMPACT_AGENT_ICON_W}px;--agent-slot-h:${COMPACT_AGENT_ICON_H}px;--agent-icon-size:${COMPACT_AGENT_ICON_SIZE}px;--agent-side-overlap:${COMPACT_AGENT_ICON_H - COMPACT_AGENT_SIDE_ADVANCE}px`,
+            role: "img", "aria-label": "Claude", title: "Claude", "data-agent": "claude",
+          }, brand(CLAUDE_BRAND_MARK, COMPACT_AGENT_ICON_SIZE)));
           const cell = COMPACT_CELLS[kind];
           // A usage cell's number wears its level's colour, as on the island.
           const level = kind === "usage5h" || kind === "usage7d" ? usageLevel(parseInt(cell.sample, 10)) : undefined;
@@ -156,19 +158,15 @@ export function islandPreview(bot: Bot): IslandPreview {
         requestAnimationFrame(frame);
       }
       draw();
-      const names = on.map((k) => COMPACT_CELLS[k].short);
-      words.textContent = names.length ? `Gullu · sessions · ${names.join(" · ")}` : "Gullu · sessions — no numbers, so the island is narrower";
+      const names = on.map((k) => message(COMPACT_CELLS[k].short));
+      words.textContent = names.length
+        ? message("Gullu · sessions · {metrics}", { metrics: names.join(" · ") })
+        : message("Gullu · sessions — no numbers, so the island is narrower");
       // Its length along the edge, ears included; on a side, the column's width beside it.
       width.textContent = side ? `${COMPACT_COLUMN_W} × ${wanted + 2 * EAR_COMPACT} px` : `${wanted + 2 * EAR_COMPACT} px`;
-      desk.setAttribute("aria-label", `Preview of the compact island, with sample values: ${on.map((k) => COMPACT_CELLS[k].name).join(", ") || "no numbers"}`);
-    },
-    run() {
-      let tick = 0;
-      const timer = window.setInterval(() => {
-        const cell = cells.querySelector('[data-id="cpu"] b');
-        if (cell) cell.textContent = SAMPLE_CPU[++tick % SAMPLE_CPU.length];
-      }, 2500);
-      return () => window.clearInterval(timer);
+      desk.setAttribute("aria-label", message("Preview of the compact island, with sample values: {metrics}", {
+        metrics: on.map((k) => message(COMPACT_CELLS[k].name)).join(", ") || message("no numbers"),
+      }));
     },
   };
 }

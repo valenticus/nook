@@ -40,8 +40,9 @@ const TINT_ALPHA = "26";
  * colour itself for what is drawn, and a wash of it for the ground under it.
  */
 export function wear(el: HTMLElement, color: string) {
-  el.style.setProperty("--c", color);
-  el.style.setProperty("--tint", `${color}${TINT_ALPHA}`);
+  if (el.style.getPropertyValue("--c") !== color) el.style.setProperty("--c", color);
+  const tint = `${color}${TINT_ALPHA}`;
+  if (el.style.getPropertyValue("--tint") !== tint) el.style.setProperty("--tint", tint);
 }
 
 /** How bright a colour is, 0 (black) to 1 (white): its relative luminance. */

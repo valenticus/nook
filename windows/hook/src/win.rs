@@ -9,16 +9,16 @@
 use std::time::{Duration, Instant};
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LocalFree, HLOCAL};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, TokenUser,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+    TokenUser, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::{Proc, CONNECT_TIMEOUT};
@@ -27,13 +27,27 @@ use crate::{Proc, CONNECT_TIMEOUT};
 /// the one error worth retrying: the server exists and a slot will free up.
 const ERROR_PIPE_BUSY: i32 = 231;
 
-/// `\\.\pipe\nook-<sid>`. The SID keeps two accounts on the same machine from
-/// ever meeting on the same pipe; the name falls back to the user name only if
-/// the SID cannot be read at all, which should not happen.
+/// Each app flavor has a fixed pipe namespace; there is no runtime fallback.
 fn pipe_path() -> String {
     let key = current_user_sid()
         .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "user".into()));
-    format!(r"\\.\pipe\nook-{key}")
+    format!(r"\\.\pipe\nook{}-{key}", pipe_namespace())
+}
+
+/// Endpoint printed only by the compile-time Dev relay's test diagnostic.
+#[cfg(feature = "nook-dev-relay")]
+pub fn test_endpoint() -> Option<String> {
+    Some(pipe_path())
+}
+
+fn pipe_namespace() -> &'static str {
+    if cfg!(feature = "nook-dev-relay") {
+        "-dev"
+    } else if cfg!(feature = "standalone-relay") {
+        "-standalone"
+    } else {
+        ""
+    }
 }
 
 /// Opens the pipe. Retries only while the server is busy: any other error means
@@ -43,7 +57,11 @@ pub fn connect() -> Option<std::fs::File> {
     let path = pipe_path();
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
-        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
             Ok(file) => {
                 let handle = HANDLE(file.as_raw_handle());
                 // Somebody else's server on our pipe name gets nothing from us.
@@ -64,21 +82,23 @@ pub fn current_user_sid() -> Option<String> {
     unsafe { token_sid(GetCurrentProcess()) }
 }
 
-/// True when the process serving `handle` looks like Nook: our own user, an
-/// image called nook.exe, and an integrity level no lower than ours.
+/// True when the process serving `handle` looks like the matching Nook build:
+/// our own user, its build-specific image name, and a sufficient integrity level.
 ///
 /// The same-user check stops another account. The other two narrow what a
 /// process of our own account can pass for: the app's path is not known to the
 /// relay (the installer may put it anywhere), so its file name stands in, and
 /// a server below our integrity level can never be Nook run by us (it matters
 /// when Claude Code runs elevated). This cannot stop code that runs as us at
-/// our own level and is called nook.exe.
+/// our own level and has the matching Nook executable name.
 ///
 /// A failure to answer is treated as "not Nook": refusing costs one hook event
 /// and Claude Code asks in the terminal, while trusting could hand the contents
 /// of every tool call to a stranger.
 pub fn pipe_server_is_nook(handle: HANDLE) -> bool {
-    let Some(mine) = current_user_sid() else { return false };
+    let Some(mine) = current_user_sid() else {
+        return false;
+    };
     unsafe {
         let mut pid = 0u32;
         if GetNamedPipeServerProcessId(handle, &mut pid).is_err() || pid == 0 {
@@ -92,13 +112,25 @@ pub fn pipe_server_is_nook(handle: HANDLE) -> bool {
         let theirs = integrity_level(process);
         let _ = CloseHandle(process);
         let ours = integrity_level(GetCurrentProcess());
-        same_user && image.as_deref().is_some_and(is_nook_image) && integrity_not_lower(theirs, ours)
+        same_user
+            && image.as_deref().is_some_and(is_nook_image)
+            && integrity_not_lower(theirs, ours)
     }
 }
 
-/// `nook.exe`, whatever folder it sits in and however it is cased.
+/// The expected Nook executable name, whatever folder it sits in and however
+/// it is cased.
 fn is_nook_image(path: &str) -> bool {
-    path.rsplit(['\\', '/']).next().is_some_and(|name| name.eq_ignore_ascii_case("nook.exe"))
+    let expected = if cfg!(feature = "nook-dev-relay") {
+        "nook-dev.exe"
+    } else if cfg!(feature = "standalone-relay") {
+        "nook-standalone.exe"
+    } else {
+        "nook.exe"
+    };
+    path.rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
 }
 
 /// The server must be at our level or above; an unreadable level is a refusal.
@@ -110,7 +142,13 @@ fn integrity_not_lower(server: Option<u32>, relay: Option<u32>) -> bool {
 unsafe fn image_path(process: HANDLE) -> Option<String> {
     let mut buf = vec![0u16; 1024];
     let mut len = buf.len() as u32;
-    QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).ok()?;
+    QueryFullProcessImageNameW(
+        process,
+        PROCESS_NAME_WIN32,
+        PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    )
+    .ok()?;
     Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
@@ -126,7 +164,14 @@ unsafe fn integrity_level(process: HANDLE) -> Option<u32> {
     }
     // u64 elements keep the buffer aligned for the structure inside it.
     let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
-    let ok = GetTokenInformation(token, TokenIntegrityLevel, Some(buf.as_mut_ptr().cast()), needed, &mut needed).is_ok();
+    let ok = GetTokenInformation(
+        token,
+        TokenIntegrityLevel,
+        Some(buf.as_mut_ptr().cast()),
+        needed,
+        &mut needed,
+    )
+    .is_ok();
     let _ = CloseHandle(token);
     if !ok {
         return None;
@@ -152,17 +197,33 @@ unsafe fn integrity_level(process: HANDLE) -> Option<u32> {
 pub fn ancestors(max: usize) -> Vec<Proc> {
     use std::collections::HashMap;
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
     };
 
     let mut table: HashMap<u32, (u32, String)> = HashMap::new();
     unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return Vec::new() };
-        let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return Vec::new();
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
         while more {
-            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-            table.insert(entry.th32ProcessID, (entry.th32ParentProcessID, String::from_utf16_lossy(&entry.szExeFile[..len])));
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            table.insert(
+                entry.th32ProcessID,
+                (
+                    entry.th32ParentProcessID,
+                    String::from_utf16_lossy(&entry.szExeFile[..len]),
+                ),
+            );
             more = Process32NextW(snapshot, &mut entry).is_ok();
         }
         let _ = CloseHandle(snapshot);
@@ -172,9 +233,13 @@ pub fn ancestors(max: usize) -> Vec<Proc> {
     let mut pid = std::process::id();
     let mut born = created_at(pid);
     while chain.len() < max {
-        let Some((parent, _)) = table.get(&pid) else { break };
+        let Some((parent, _)) = table.get(&pid) else {
+            break;
+        };
         let parent = *parent;
-        let Some((_, name)) = table.get(&parent) else { break };
+        let Some((_, name)) = table.get(&parent) else {
+            break;
+        };
         if parent == 0 || parent == pid || chain.iter().any(|p| p.pid == parent) {
             break;
         }
@@ -184,7 +249,10 @@ pub fn ancestors(max: usize) -> Vec<Proc> {
             (Some(theirs), Some(ours)) if theirs <= ours => {}
             _ => break,
         }
-        chain.push(Proc { pid: parent, name: name.clone() });
+        chain.push(Proc {
+            pid: parent,
+            name: name.clone(),
+        });
         pid = parent;
         born = parent_born;
     }
@@ -196,7 +264,8 @@ fn created_at(pid: u32) -> Option<u64> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let (mut created, mut exited, mut kernel, mut user) = Default::default();
-        let read = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user).is_ok();
+        let read =
+            GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user).is_ok();
         let _ = CloseHandle(process);
         read.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
     }
@@ -242,11 +311,45 @@ mod tests {
 
     #[test]
     fn only_a_file_called_nook_exe_passes_for_nook() {
-        assert!(is_nook_image(r"C:\Program Files\Nook\nook.exe"));
-        assert!(is_nook_image(r"D:\work\nook\target\release\NOOK.EXE"));
+        let expected = if cfg!(feature = "nook-dev-relay") {
+            "nook-dev.exe"
+        } else if cfg!(feature = "standalone-relay") {
+            "nook-standalone.exe"
+        } else {
+            "nook.exe"
+        };
+        let other = if cfg!(feature = "nook-dev-relay") {
+            "nook.exe"
+        } else {
+            "nook-dev.exe"
+        };
+        assert!(is_nook_image(&format!(r"C:\Program Files\Nook\{expected}")));
+        assert!(is_nook_image(&format!(
+            r"D:\work\nook\target\release\{}",
+            expected.to_uppercase()
+        )));
+        assert!(!is_nook_image(&format!(
+            r"D:\work\nook\target\release\{other}"
+        )));
         assert!(!is_nook_image(r"C:\Users\me\AppData\Local\Temp\evil.exe"));
         assert!(!is_nook_image(r"C:\x\not-nook.exe"));
         assert!(!is_nook_image(r"C:\nook.exe\payload.exe"));
+    }
+
+    #[test]
+    fn relay_namespace_is_fixed_by_the_build_feature() {
+        let namespace = pipe_namespace();
+        if cfg!(feature = "nook-dev-relay") {
+            assert_eq!(namespace, "-dev");
+            assert!(pipe_path().contains(r"\pipe\nook-dev-"));
+        } else if cfg!(feature = "standalone-relay") {
+            assert_eq!(namespace, "-standalone");
+            assert!(pipe_path().contains(r"\pipe\nook-standalone-"));
+        } else {
+            assert_eq!(namespace, "");
+            assert!(pipe_path().contains(r"\pipe\nook-"));
+            assert!(!pipe_path().contains(r"\pipe\nook-dev-"));
+        }
     }
 
     #[test]

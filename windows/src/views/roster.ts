@@ -10,6 +10,7 @@ import {
 } from "../core/state";
 import { COLOR } from "./palette";
 import { stepName } from "./step";
+import { message } from "../core/i18n";
 
 // ── The rules, as constants ───────────────────────────────────────────────────
 
@@ -196,11 +197,11 @@ const WORDS: Record<BotStateName, string> = {
 export function stateWords(entry: Entry): string {
   const session = entry.session;
   // Its last reply waits on a decision: said of one at rest — a request or an error is said first.
-  if (session?.decision && entry.lane === "done") return DECISION_WORDS.toLowerCase();
+  if (session?.decision && entry.lane === "done") return message(DECISION_WORDS.toLowerCase());
   // A turn that ended is "finished" for as long as it is on show, not only while the bot hops.
-  if (session && entry.lane === "done" && session.restedAt > 0) return WORDS.finished;
-  if (session && entry.lane === "working" && isQuiet(session)) return QUIET_WORDS.toLowerCase();
-  return WORDS[entry.state];
+  if (session && entry.lane === "done" && session.restedAt > 0) return message(WORDS.finished);
+  if (session && entry.lane === "working" && isQuiet(session)) return message(QUIET_WORDS.toLowerCase());
+  return message(WORDS[entry.state]);
 }
 
 /** The subagents of a session that are at work, the one asking first: it is never the one folded into "+N". */

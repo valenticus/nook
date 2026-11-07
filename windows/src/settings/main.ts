@@ -15,13 +15,22 @@
 // between is refused by Rust rather than written over.
 
 import "./settings.css";
-import type { AboutLink, CodexStatus, CursorStatus, DataPaths, HookPreview, HookStatus, ReplyFormatAction, ReplyFormatStatus, ShortcutName, ShortcutStatus, UpdateInfo, UsageStatus } from "../core/bridge";
-import { COMPACT_METRICS, DEFAULT_SETTINGS, FADE_MAX, FADE_MIN, FOLDED_AUTO_HIDE, MAX_COMPACT_METRICS, compactMetrics, foldedAutoHide, type CompactMetric, type SessionAgent, type Settings } from "../core/state";
+import type { CodexQuotaSnapshot, CodexStatus, ConnectAgent, ConnectOperation, ConnectPreview, ConnectScan, CursorStatus, DataPaths, HookPreview, HookStatus, ReplyFormatAction, ReplyFormatStatus, ShortcutName, ShortcutStatus, UsageStatus } from "../core/bridge";
+import { COMPACT_METRICS, DEFAULT_SETTINGS, FADE_MAX, FADE_MIN, FOLDED_AUTO_HIDE, MAX_COMPACT_METRICS, compactMetrics, foldedAutoHide, type CompactMetric, type Settings } from "../core/state";
+import { currentLanguage, message, resolveLanguage, setLanguage, trayMenuLabels, type Language } from "../core/i18n";
 import { BOT_THEMES } from "../bot/engine";
 import { clear, h, replay } from "../views/dom";
-import { BRANDS, CLAUDE_MARK, CODEX_MARK, LUCIDE, brand } from "../views/iconset";
-import { TOOL_NAME } from "../views/tool";
+import { LUCIDE } from "../views/iconset";
 import { connect, type Backend } from "./backend";
+import { createConnectPreviewGate } from "./connect-preview-gate";
+import { formatQuotaPercent, formatResetTime, quotaProviderDisplay, type QuotaWindowDisplay } from "./codex-quota-view";
+import { primaryConnectionAction, summarizeAgentConnection } from "../core/connect-status";
+import { connectPreviewIsFresh } from "./connect-preview-freshness";
+import { QuotaSnapshotGate } from "./codex-quota-view";
+import {
+  enableShelfTraceCapture, exportShelfTrace, isShelfTraceRecording, shelfTrace, shelfTraceCount, startShelfTrace,
+  stopShelfTrace, subscribeShelfTrace,
+} from "../core/shelf-trace";
 import { isBotTheme, mountBot, refreshBots, startBots, wearBotTheme } from "./bots";
 import { COMPACT_BOT, COMPACT_CELLS, cellIcon, islandPreview } from "./island-preview";
 import { SPRING, flip, icon, reorderable, segmented, slider, toggle, type Toggle } from "./ui";
@@ -41,11 +50,24 @@ type Motion = Settings["reduceMotion"];
 let nook: Backend;
 let settings: Settings = { ...DEFAULT_SETTINGS };
 let version = "";
+let nookDev = false;
+let nookStandalone = false;
+const CODEX_QUOTA_BUILD = __NOOK_DEV_BUILD__ || __NOOK_STANDALONE_BUILD__;
+let connectScan: ConnectScan | null = null;
+let devSimulatorHost: HTMLElement | null = null;
+let connectPreviewScanTimer = 0;
+const connectPreviewGate = createConnectPreviewGate<ConnectAgent>();
+const connectPreviewPanels = new Map<ConnectAgent, HTMLElement>();
+const connectPreviewStates = new Map<ConnectAgent, { preview: ConnectPreview; apply: HTMLButtonElement; notice: HTMLElement; refresh: HTMLButtonElement; stale: boolean; writable: boolean; checkboxes: HTMLInputElement[] }>();
 let hooks: HookStatus | null = null;
 let usage: UsageStatus | null = null;
 let reply: ReplyFormatStatus | null = null;
 let cursor: CursorStatus | null = null;
 let codex: CodexStatus | null = null;
+let codexQuota: CodexQuotaSnapshot | null = null;
+let codexQuotaRevision = 0;
+const codexQuotaGate = new QuotaSnapshotGate();
+let codexQuotaPanel: HTMLElement | null = null;
 /** The last write of the reply format created CLAUDE.md: there was no previous file to save. */
 let wasCreated = false;
 let paths: DataPaths | null = null;
@@ -57,12 +79,18 @@ const root = document.getElementById("settings-root")!;
 
 /** What Rust, or the bridge, refused with — as a sentence, without the "Error:" a thrown one carries. */
 const reason = (err: unknown) => (err instanceof Error ? err.message : String(err)).replace(/^Error:\s*/, "");
+const usageErrorText = (error: string) => {
+  if (error.includes("Original Claude statusLine migration requires separate confirmation.")) return message("Original Claude statusLine migration requires separate confirmation.");
+  if (error.includes("changed since the preview") || error.includes("changed during apply")) return message("Claude settings changed after preview. Nothing was written; review a fresh preview.");
+  if (error.includes("cannot be read back")) return message("The existing statusLine cannot be read safely. Nothing was changed.");
+  return message("Claude Usage could not be updated. Nothing was changed. Technical detail: {detail}", { detail: error });
+};
 
 /** Each category: its name, its mark, the group of the sidebar it stands in, and what it is for, in a sentence. */
 const INFO: Record<Section, { name: string; icon: string; group: string; lede: string }> = {
   connect: {
     name: "Connect", icon: LUCIDE.plug, group: "Setup",
-    lede: "Link Nook to Claude Code, Cursor and Codex. Nothing on your computer is changed until you have seen the change and said yes.",
+    lede: "Manage Claude Code and Codex integrations.",
   },
   island: {
     name: "Island", icon: LUCIDE.panelTop, group: "The island",
@@ -74,11 +102,11 @@ const INFO: Record<Section, { name: string; icon: string; group: string; lede: s
   },
   sounds: {
     name: "Sounds", icon: LUCIDE.volume2, group: "The island",
-    lede: "Hear when Claude needs you, without keeping an eye on the island.",
+    lede: "Hear when an agent needs you, without keeping an eye on the island.",
   },
   agents: {
     name: "Agents list", icon: LUCIDE.list, group: "Extras",
-    lede: "A small window that stays on top, with a row for each project Claude is working on.",
+    lede: "A small window that stays on top, with a row for each project an agent is working on.",
   },
   shortcuts: {
     name: "Shortcuts", icon: LUCIDE.keyboard, group: "Extras",
@@ -112,7 +140,31 @@ function save() {
  * after the last of a run of changes (`soon`: a slider being dragged).
  */
 function change(patch: Partial<Settings>, soon = false) {
+  const previousLocale = currentLanguage();
   settings = { ...settings, ...patch };
+  if ("language" in patch) {
+    setLanguage(resolveLanguage(settings.language), "settings.change");
+    void nook.setTrayLabels(trayMenuLabels());
+    if (__NOOK_DEV_BUILD__) shelfTrace("locale-settings-update", { locale: currentLanguage(), previousLocale, newLocale: currentLanguage(), languagePreference: settings.language, source: "settings.change" });
+  }
+  if ("codexQuotaEnabled" in patch) {
+    codexQuotaRevision++;
+    if (CODEX_QUOTA_BUILD && (nookDev || nookStandalone) && settings.codexQuotaEnabled) {
+      codexQuotaGate.setEnabled(true);
+      codexQuota = null;
+      const revision = codexQuotaRevision;
+      void nook.codexQuotaLast().then((snapshot) => {
+        if (!codexQuotaGate.prime(snapshot)) return;
+        const accepted = codexQuotaGate.acceptEvent(snapshot);
+        if (accepted && settings.codexQuotaEnabled && codexQuotaRevision === revision) {
+          codexQuota = accepted as CodexQuotaSnapshot;
+          paintCodexQuota();
+        }
+      });
+    } else codexQuotaGate.setEnabled(false);
+    if (!settings.codexQuotaEnabled) codexQuota = null;
+    paintCodexQuota();
+  }
   const now = performance.now();
   for (const key of Object.keys(patch)) touched.set(key, now);
   applyAppearance();
@@ -138,6 +190,9 @@ const follow = () => {
  * ago is not taken back from an older echo.
  */
 function settingsChanged(next: Settings) {
+  const previousLocale = currentLanguage();
+  const previousPreference = settings.language;
+  const quotaWasEnabled = settings.codexQuotaEnabled;
   const now = performance.now();
   const mine: Record<string, unknown> = {};
   for (const [key, at] of touched) {
@@ -145,9 +200,24 @@ function settingsChanged(next: Settings) {
     else touched.delete(key);
   }
   settings = { ...settings, ...next, ...(mine as Partial<Settings>) };
+  setLanguage(resolveLanguage(settings.language), "settings.settings-changed");
+  void nook.setTrayLabels(trayMenuLabels());
+  if (__NOOK_DEV_BUILD__) shelfTrace("locale-settings-update", {
+    locale: currentLanguage(), previousLocale, newLocale: currentLanguage(), languagePreference: settings.language,
+    source: previousPreference === settings.language ? "settings.settings-refresh" : "settings.settings-changed",
+  });
+  if (settings.codexQuotaEnabled !== quotaWasEnabled) {
+    codexQuotaRevision++;
+    if (CODEX_QUOTA_BUILD && (nookDev || nookStandalone) && settings.codexQuotaEnabled) {
+      // Provider emits the new epoch immediately after Rust accepts the opt-in.
+      codexQuotaGate.setEnabled(true);
+    } else codexQuotaGate.setEnabled(false);
+    if (!settings.codexQuotaEnabled) codexQuota = null;
+  }
   applyAppearance();
   follow();
   paintResets();
+  paintCodexQuota();
 }
 
 // ── Theme and motion ──────────────────────────────────────────────────────────
@@ -279,7 +349,7 @@ const stackRow = (label: string, help: string | null, keys: string, ...controls:
 const needs = () => h("p", { class: "sp-needs", hidden: true });
 const sayNeeds = (el: HTMLElement, why: string | null) => {
   el.hidden = why == null;
-  el.textContent = why ?? "";
+  el.textContent = why == null ? "" : message(why);
 };
 
 /** A path, free to wrap after any of its separators and nowhere else. */
@@ -580,7 +650,7 @@ function resetFoot(id: Section): HTMLElement {
   const arm = () => {
     armed = window.setTimeout(disarm, 4000);
     paint();
-    say(`Click again to reset ${INFO[id].name}.`);
+    say(message("Click again to reset {name}.", { name: message(INFO[id].name) }));
   };
   b.addEventListener("click", async () => {
     if (busy || (!armed && atDefaults(id))) return;
@@ -592,7 +662,7 @@ function resetFoot(id: Section): HTMLElement {
     await resetSection(id);
     busy = false;
     paint();
-    say(`${INFO[id].name} is reset.`);
+    say(message("{name} is reset.", { name: message(INFO[id].name) }));
   });
   b.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && armed) {
@@ -621,14 +691,14 @@ const CHANGED_FILE: Record<Change, string> = { hooks: "settings.json", usage: "s
 /** Where a part's install flow is at: its status, or the diff to confirm. */
 type Flow =
   | { at: "status"; error?: string; done?: { install: boolean; backup: string }; note?: string }
-  | { at: "confirm"; install: boolean; preview: HookPreview; error?: string; busy?: boolean; action?: ReplyFormatAction };
+  | { at: "confirm"; install: boolean; preview: HookPreview; error?: string; busy?: boolean; action?: ReplyFormatAction; originalMigrationApproved?: boolean };
 
 const flows: Record<Change, Flow> = { hooks: { at: "status" }, usage: { at: "status" }, reply: { at: "status" }, cursor: { at: "status" }, codex: { at: "status" } };
 /** Whether each part's Details are open: kept across its repaints. */
 const detailsOpen: Record<Change, boolean> = { hooks: false, usage: false, reply: false, cursor: false, codex: false };
 
 /** Codex runs a new hook only once it is trusted: said after connecting, and in the details. */
-const CODEX_TRUST = "Codex runs new hooks only once you trust them: start Codex and review them once with /hooks.";
+const CODEX_TRUST = "For Codex CLI, review new hooks with /hooks before trusting them. Hook behavior in Codex CLI and VS Code has not been verified in this test cycle.";
 
 /** What the preview panel says of each change, before and after it is written. */
 const CHANGE_WORDS: Record<Change, { install: string; remove: string; done: string }> = {
@@ -638,9 +708,9 @@ const CHANGE_WORDS: Record<Change, { install: string; remove: string; done: stri
     done: "Open a new Claude Code session for the change to take effect.",
   },
   usage: {
-    install: "This is exactly what will change in Claude Code's settings file: its status line (the statusLine key), and nothing else. A status line you already have keeps working: Nook runs it for you — it is the long word after --previous — and turning this off puts it back as it was.",
-    remove: "This takes Nook out of the status line only. The status line you had before comes back exactly as it was; with none, the key is removed.",
-    done: "Claude Code picks the change up when it reloads its settings; a new session always does.",
+    install: "Only the Claude Code statusLine setting will change. Any existing statusLine is kept and can be restored when disconnected.",
+    remove: "Only the Claude Code statusLine setting will be restored to its saved previous value.",
+    done: "Claude Code reads the updated statusLine after reloading settings; a new session always does.",
   },
   reply: {
     install: "This is exactly what will change in your CLAUDE.md, Claude Code's instructions file: the block between Nook's two marker lines, and nothing outside them.",
@@ -691,7 +761,7 @@ const UNREACHABLE: Omit<Spec, "name"> = {
 
 function hooksSpec(): Spec {
   const s = hooks;
-  const name = "Connect Claude Code to Nook";
+  const name = "Claude Code";
   if (!s) return { name, ...UNREACHABLE };
   const file: [string, string] = ["settings.json", s.settingsPath];
   const relay: [string, string] = ["Relay", s.hookPath];
@@ -729,14 +799,14 @@ function hooksSpec(): Spec {
   if (s.installed) {
     return {
       name, tone: "ok", title: "Connected",
-      text: "Your Claude Code sessions show up in the island, and you can answer their questions and permission requests there.",
+      text: "Claude Code sessions and permission requests can appear in the island. Live permission decisions have not been verified in this test cycle.",
       details: [how],
       facts: [file, relay], again: "Connect again…", remove: "Disconnect…",
     };
   }
   return {
     name, tone: "off", title: "Not connected",
-    text: "Connect to see your Claude Code sessions in the island, and to answer their permission requests without switching windows.",
+    text: "Connect Claude Code to show its sessions and permission requests in the island. Live permission decisions have not been verified in this test cycle.",
     details: [how],
     facts: [file], primary: { label: "Connect…", act: "install" },
   };
@@ -748,36 +818,71 @@ function usageSpec(): Spec {
   if (!u) return { name, ...UNREACHABLE };
   const how = "Reads the usage numbers Claude Code already passes to its status line (the statusLine key of settings.json). Nothing leaves this computer. Numbers appear on subscription plans, and update only while a session runs.";
   const hints = "Claude Code hides its keyboard hints (\"? for shortcuts\") while any status line is set.";
-  if (u.installed) {
+  const projectBlocks = u.projectOverrides.filter((entry) => !entry.standalone);
+  const projectWarning = projectBlocks.length
+    ? message("Project statusLine overrides Claude usage in: {paths}", {
+        paths: projectBlocks.map((entry) => `${entry.scope}: ${entry.settingsPath}`).join("; "),
+      })
+    : "";
+  const projectDetails = [
+    ...u.projectOverrides.filter((entry) => entry.standalone).map((entry) => message("Project statusLine already uses Standalone: {path}", { path: entry.settingsPath })),
+    ...u.projectScanWarnings.map((warning) => message("Could not check project statusLine: {path}", { path: warning })),
+  ];
+  const relayFact: [string, string] = ["Current relay", u.statusLineRelay ?? message("None")];
+  if (u.statusLineOwner === "standalone") {
     return {
-      name, tone: "ok",
-      title: u.chained ? "On, next to your own status line" : "On",
-      text: "The island can show how much of your 5-hour and weekly Claude limits you have used.",
+      name, tone: "ok", title: "Connected",
+      text: "Claude usage is connected through the Standalone statusLine.",
       details: [
         how,
         u.chained
           ? "Claude Code hands the numbers to Nook, which then runs the status line you already had, so it keeps showing. Turning this off puts it back exactly as it was."
           : `Nook prints no status line of its own. ${hints}`,
+        ...projectDetails,
+        ...(projectWarning ? [projectWarning] : []),
+        "A managed Claude Code policy can also override or disable a local status line.",
       ],
-      facts: [["Key", "statusLine"]],
+      facts: [["Scope", message("User scope")], relayFact],
       remove: "Turn off…",
     };
   }
+  if (u.statusLineOwner === "original") {
+    return {
+      name, tone: "warn", title: "Original statusLine found",
+      text: "Claude sessions reach Nook, but Claude usage is still routed through Original Nook.",
+      details: [
+        "Migrate the user statusLine to Standalone to send Claude 5-hour and weekly usage to this Nook.",
+        "The preview shows the exact change and backup. A separate confirmation is required for Original Nook migration.",
+        "Any user statusLine already wrapped by Original Nook is kept and can be restored when Standalone usage is turned off.",
+        ...projectDetails,
+        ...(projectWarning ? [projectWarning] : []),
+      ],
+      facts: [["Scope", message("User scope")], relayFact],
+      primary: { label: "Migrate Original statusLine…", act: "install", blocked: hooks && !hooks.hookReady ? RELAY_MISSING : undefined },
+    };
+  }
+  const otherOwner = u.statusLineOwner !== "none";
   return {
-    name, tone: "off", title: "Off",
-    text: "Show how much of your 5-hour and weekly Claude limits you have used, right in the island.",
+    name, tone: otherOwner ? "warn" : "off",
+    title: otherOwner ? "Another statusLine is set" : "Not connected",
+    text: otherOwner
+      ? "Claude already has another statusLine. The preview will show how Nook keeps it working and restores it when disconnected."
+      : "Show how much of your 5-hour and weekly Claude limits you have used, right in the island.",
     details: [
       how,
       u.otherStatusLine
         ? "You have a status line: Nook runs it after reading the numbers, so it keeps showing, and turning this off puts it back exactly."
         : `You have no status line: Nook prints none. ${hints}`,
+      ...(u.statusLineOwner === "dev" ? ["The current statusLine points to Nook Dev. It will be preserved as the previous statusLine in the preview."] : []),
+      ...(u.statusLineOwner === "unknown" ? ["The current Nook statusLine owner is unknown. Review the preview carefully; it is preserved as the previous statusLine."] : []),
+      ...(projectWarning ? [projectWarning] : []),
+      ...projectDetails,
+      "A managed Claude Code policy can also override or disable a local status line.",
     ],
-    facts: [],
-    // The same relay as the hooks': a status line pointing at one that isn't there shows nothing.
-    primary: { label: "Turn on…", act: "install", blocked: hooks && !hooks.hookReady ? RELAY_MISSING : undefined },
+    facts: otherOwner ? [["Scope", message("User scope")], relayFact] : [["Scope", message("User scope")]],
+    primary: { label: "Connect Claude statistics…", act: "install", blocked: hooks && !hooks.hookReady ? RELAY_MISSING : undefined },
   };
 }
-
 const CURSOR_DOES = "Shows your Cursor agent sessions in the island too. Nook can only show them: it can't answer anything in Cursor.";
 const CURSOR_HOW = "Nook adds its entries to Cursor's hooks.json, for events that can only report what Cursor does and never change it.";
 
@@ -825,8 +930,8 @@ function cursorSpec(): Spec {
   };
 }
 
-const CODEX_DOES = "Shows your Codex sessions in the island too, and lets you allow or deny what Codex asks permission for.";
-const CODEX_HOW = "Nook adds its entries to Codex's hooks.json. A permission request waits for your click in the island; with none, Codex asks in its own window as it always does.";
+const CODEX_DOES = "Nook is configured to receive Codex session events. Real Codex CLI and VS Code hook delivery has not been verified.";
+const CODEX_HOW = "Synthetic Codex events have been checked in Nook Dev. Real Codex CLI and VS Code hook delivery has not been verified; Codex remains the source of truth for permission decisions.";
 
 function codexSpec(): Spec {
   const c = codex;
@@ -944,7 +1049,10 @@ async function openPreview(kind: Change, install: boolean) {
         : kind === "cursor" ? await nook.cursorPreview(install)
           : kind === "codex" ? await nook.codexPreview(install)
             : await nook.hooksPreview(install);
-    flows[kind] = { at: "confirm", install, preview, action };
+    flows[kind] = {
+      at: "confirm", install, preview, action,
+      ...(kind === "usage" && install && usage?.statusLineOwner === "original" ? { originalMigrationApproved: false } : {}),
+    };
     paintOthers();
     painters[kind]?.(true, "panel");
   } catch (err) {
@@ -967,7 +1075,7 @@ async function writeChange(kind: Change) {
     const backup = kind === "reply"
       ? await nook.replyFormatApply(flow.action ?? (flow.install ? "install" : "remove"), flow.preview.fingerprint)
       : kind === "usage"
-        ? await nook.usageApply(flow.install, flow.preview.fingerprint)
+        ? await nook.usageApply(flow.install, flow.preview.fingerprint, flow.originalMigrationApproved === true)
         : kind === "cursor"
           ? await nook.cursorApply(flow.install, flow.preview.fingerprint)
           : kind === "codex"
@@ -982,7 +1090,7 @@ async function writeChange(kind: Change) {
     say(flow.install ? "Done." : "Removed.");
   } catch (err) {
     flow.busy = false;
-    flow.error = `Could not write: ${reason(err)}`;
+    flow.error = kind === "usage" ? reason(err) : `Could not write: ${reason(err)}`;
     painters[kind]?.(false, "panel");
   }
 }
@@ -1001,21 +1109,46 @@ function diffPanel(kind: Change, flow: Extract<Flow, { at: "confirm" }>, close: 
     // Rust writes "+ ", "- " or two spaces before each line.
     box.append(h("div", { class: sign === "+" ? "add" : sign === "-" ? "del" : "", "data-sign": sign, text: line.slice(line[1] === " " ? 2 : 1) }));
   }
-  const confirm = button(created ? "Create the file" : flow.install ? "Save a backup and apply" : "Save a backup and remove", flow.install ? "primary" : "danger solid", () => void writeChange(kind));
+  const originalMigrationRequired = kind === "usage" && flow.install && usage?.statusLineOwner === "original";
+  const confirm = button(message(created ? "Create the file" : flow.install ? "Save a backup and apply" : "Save a backup and remove"), flow.install ? "primary" : "danger solid", () => void writeChange(kind));
   const cancel = button("Cancel", "quiet", close);
-  confirm.disabled = cancel.disabled = Boolean(flow.busy);
+  cancel.disabled = Boolean(flow.busy);
+  confirm.disabled = Boolean(flow.busy) || Boolean(originalMigrationRequired && !flow.originalMigrationApproved);
+  const migrationApproval = originalMigrationRequired
+    ? (() => {
+      const input = h("input", { type: "checkbox" });
+      input.checked = flow.originalMigrationApproved === true;
+      input.addEventListener("change", () => {
+        flow.originalMigrationApproved = input.checked;
+        confirm.disabled = Boolean(flow.busy) || !input.checked;
+      });
+      return h("label", { class: "sp-usage-migration-confirm" }, input, h("span", { text: message("I approve migrating the Original Nook statusLine to Standalone.") }));
+    })()
+    : null;
+  const usagePreview = kind === "usage"
+    ? h("div", { class: "sp-usage-preview-summary", role: "status" },
+      h("p", { text: message("Scope: {scope} — {path}", { scope: message("User scope"), path: flow.preview.settingsPath }) }),
+      h("p", { text: message("Current statusLine relay: {relay}", { relay: usage?.statusLineRelay ?? message("None") }) }),
+      h("p", { text: message("New Standalone relay: {relay}", { relay: hooks?.hookPath ?? message("Unavailable") }) }),
+      h("p", { text: message(usage?.otherStatusLine
+        ? "The existing statusLine is kept as the previous command and restored when disconnected."
+        : "Disconnect restores the statusLine value saved before Standalone was connected.") }),
+      originalMigrationRequired ? h("p", { class: "sp-connect-warning", text: message("This replaces the Original Nook statusLine after your separate confirmation.") }) : null)
+    : null;
   const panel = h("div", { class: "sp-panel" },
     h("div", { class: "sp-panel-head" },
-      h("span", { text: `Changes to ${fileName}` }),
+      h("span", { text: message("Changes to {file}", { file: fileName }) }),
       h("span", { class: "counts" },
         h("span", { class: "plus", text: `+${added}` }), h("span", { class: "minus", text: `−${removed}` }))),
-    h("p", { class: "sp-help", text: `${flow.install ? words.install : words.remove} Nothing is changed until you click below.` }),
+    h("p", { class: "sp-help", text: `${kind === "usage" ? message(flow.install ? words.install : words.remove) : flow.install ? words.install : words.remove} ${message("Nothing is changed until you click below.")}` }),
+    usagePreview,
     box,
-    added + removed === 0 ? h("p", { class: "sp-help", text: `Nothing would change: ${fileName} already says this.` }) : null,
+    added + removed === 0 ? h("p", { class: "sp-help", text: message("Nothing would change: {file} already says this.", { file: fileName }) }) : null,
     created
       ? h("p", { class: "sp-help", text: "There is no file to back up: it is created." })
-      : h("p", { class: "sp-help" }, "A dated backup is saved first: ", h("code", {}, ...breakable(flow.preview.backup))),
-    flow.error ? h("div", { class: "sp-flash error", role: "alert" }, icon(LUCIDE.circleX, 15), h("span", { text: flow.error })) : null,
+      : h("p", { class: "sp-help" }, kind === "usage" ? message("A dated backup is saved first:") : "A dated backup is saved first:", " ", h("code", {}, ...breakable(flow.preview.backup))),
+    flow.error ? h("div", { class: "sp-flash error", role: "alert" }, icon(LUCIDE.circleX, 15), h("span", { text: kind === "usage" ? usageErrorText(flow.error) : flow.error })) : null,
+    migrationApproval,
     h("div", { class: "sp-panel-actions" }, confirm, cancel));
   panel.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !flow.busy) {
@@ -1041,18 +1174,20 @@ function integration(kind: Change): HTMLElement {
     const head = h("div", { class: "sp-status-head" },
       h("span", { class: "sp-status-icon" }, icon(TONE_ICON[spec.tone], 22, 1.8)),
       h("div", {},
-        h("div", { class: "sp-status-title" }, h("span", { text: spec.title })),
-        h("p", { class: "sp-status-text", text: spec.text })));
+        h("div", { class: "sp-status-title" }, h("span", { text: kind === "usage" ? message(spec.title) : spec.title })),
+        h("p", { class: "sp-status-text", text: kind === "usage" ? message(spec.text) : spec.text })));
     const block = h("div", { class: "sp-status", "data-tone": spec.tone, role: "group", "aria-label": spec.name }, head);
 
     if (flow.at === "status" && flow.done) {
       // A file Nook created had no previous one to save.
-      const saved = (kind === "reply" || kind === "cursor" || kind === "codex") && wasCreated ? [] : ["Your previous file is saved as ", ...breakable(flow.done.backup), ". "];
+      const saved = (kind === "reply" || kind === "cursor" || kind === "codex") && wasCreated ? []
+        : kind === "usage" ? [message("Backup saved as"), " ", ...breakable(flow.done.backup), ". "]
+          : ["Your previous file is saved as ", ...breakable(flow.done.backup), ". "];
       block.append(h("div", { class: "sp-flash", role: "status" }, icon(LUCIDE.check, 15, 2.4),
-        h("span", {}, flow.done.install ? "Done. " : "Removed. ", ...saved, CHANGE_WORDS[kind].done)));
+        h("span", {}, message(flow.done.install ? "Done." : "Removed."), " ", ...saved, kind === "usage" ? message(CHANGE_WORDS[kind].done) : CHANGE_WORDS[kind].done)));
     }
     if (flow.at === "status" && flow.error) {
-      block.append(h("div", { class: "sp-flash error", role: "alert" }, icon(LUCIDE.circleX, 15), h("span", { text: flow.error })));
+      block.append(h("div", { class: "sp-flash error", role: "alert" }, icon(LUCIDE.circleX, 15), h("span", { text: kind === "usage" ? usageErrorText(flow.error) : flow.error })));
     }
     if (flow.at === "status" && flow.note) {
       block.append(h("div", { class: "sp-flash note", role: "status" }, icon(LUCIDE.info, 15), h("span", { text: flow.note })));
@@ -1063,7 +1198,7 @@ function integration(kind: Change): HTMLElement {
     const actions = h("div", { class: "sp-actions" });
     if (spec.primary) {
       const { act, blocked, label } = spec.primary;
-      const b = button(label, "primary", () => {
+      const b = button(kind === "usage" ? message(label) : label, "primary", () => {
         if (act === "install") return go(true);
         flows[kind] = { at: "status", note: "Restarting Nook…" };
         paint();
@@ -1081,8 +1216,8 @@ function integration(kind: Change): HTMLElement {
         actions.append(h("span", { class: "sp-actions-note", text: blocked }));
       }
     }
-    if (spec.again) actions.append(button(spec.again, "quiet", () => go(true)));
-    if (spec.remove) actions.append(button(spec.remove, `danger${actions.childElementCount ? " push" : ""}`, () => go(false)));
+    if (spec.again) actions.append(button(kind === "usage" ? message(spec.again) : spec.again, "quiet", () => go(true)));
+    if (spec.remove) actions.append(button(kind === "usage" ? message(spec.remove) : spec.remove, `danger${actions.childElementCount ? " push" : ""}`, () => go(false)));
     // While the diff is open, its two buttons are the only way on.
     if (!confirming && actions.childElementCount) block.append(actions);
 
@@ -1095,15 +1230,15 @@ function integration(kind: Change): HTMLElement {
         body.append(h("div", { class: "sp-diff sp-found", tabindex: "0", role: "region", "aria-label": `Lines found in ${CHANGED_FILE[kind]}` },
           ...spec.found.map((line) => h("div", { "data-sign": " ", text: line || " " }))));
       }
-      for (const text of spec.details ?? []) body.append(h("p", { text }));
+      for (const text of spec.details ?? []) body.append(h("p", { text: kind === "usage" ? message(text) : text }));
       if (spec.facts.length) {
         const facts = h("dl", { class: "sp-facts" });
-        for (const [k, v] of spec.facts) facts.append(h("dt", { text: k }), h("dd", {}, ...breakable(v)));
+        for (const [k, v] of spec.facts) facts.append(h("dt", { text: kind === "usage" ? message(k) : k }), h("dd", {}, ...breakable(v)));
         body.append(facts);
       }
       const fold = h("div", { class: `sp-fold${detailsOpen[kind] ? " open" : ""}` }, h("div", {}, body));
       const more = h("button", { class: "sp-more", type: "button", "aria-expanded": String(detailsOpen[kind]), "aria-controls": id },
-        h("span", { text: "Details" }), icon(LUCIDE.chevronDown, 14, 2.2));
+        h("span", { text: message("Details") }), icon(LUCIDE.chevronDown, 14, 2.2));
       more.addEventListener("click", () => {
         detailsOpen[kind] = !detailsOpen[kind];
         fold.classList.toggle("open", detailsOpen[kind]);
@@ -1145,55 +1280,277 @@ function integration(kind: Change): HTMLElement {
 }
 
 /** A part of Connect, as a search finds it: by what it does, whatever state it is in. */
-const connectGroup = (kind: Change, label: string, what: string, keys: string, ...more: Kid[]) =>
-  findable(bare(label, integration(kind), ...more), label, what, keys, true);
-
-/** A tool's own part of Connect: its mark, its name, what Nook does with it, and under them everything Nook writes for it. */
-const toolPart = (key: SessionAgent, what: string, ...kids: Kid[]) =>
-  h("section", { class: `sp-tool ${key}`, "aria-label": TOOL_NAME[key] },
-    h("header", { class: "sp-tool-head" },
-      h("span", { class: "sp-tool-mark", "aria-hidden": "true" },
-        key === "cursor" ? brand(BRANDS.cursor, 18) : icon(key === "codex" ? CODEX_MARK : CLAUDE_MARK, 18, 2.4)),
-      h("div", { class: "sp-tool-text" },
-        h("h2", { class: "sp-tool-name", text: TOOL_NAME[key] }),
-        h("p", { class: "sp-tool-what", text: what }))),
-    ...kids);
-
 function connectSection(): Kid[] {
-  return [
-    head("connect"),
-    toolPart("claude", "Your sessions and what they ask, your usage limits, and how replies are laid out.",
-      connectGroup("hooks", "Sessions and approvals", "Connect Claude Code to Nook: see your sessions in the island and answer them there.",
-        "hooks hook claude code connect connection install setup set up link sessions permissions approve relay settings.json uninstall disconnect"),
-      connectGroup("usage", "Usage limits", "Show how much of your 5-hour and weekly Claude limits you have used.",
-        "usage limits limit quota plan subscription status line statusline weekly 5-hour five hour"),
-      connectGroup("reply", "Reply layout", REPLY_DOES,
-        "reply replies format answers layout claude.md instructions summary decisions warnings tips markdown")),
-    cursorGroup(),
-    codexGroup(),
-  ];
-}
-
-/** Codex beside Claude Code: its hooks (sessions and permission requests), and whether its sessions are shown. */
-function codexGroup(): HTMLElement {
+  let children: Kid[];
+  const claude = connectAgentCard("ClaudeCode", "Claude Code");
+  const codexCard = connectAgentCard("Codex", "Codex");
   const show = toggle(settings.showCodexSessions, "Show Codex sessions", (on) => change({ showCodexSessions: on }));
   followers.push(() => show.set(settings.showCodexSessions));
-  return toolPart("codex", "Its sessions, and Allow or Deny for what it asks permission for.",
-    connectGroup("codex", "Sessions and approvals", CODEX_DOES, "codex openai cli hooks.json agent sessions permissions approve allow deny connect"),
-    group(null,
-      row("Show Codex sessions", "Codex's sessions appear in the island with a Codex mark. Off, they are not followed at all, and Codex asks for permission in its own window.", show.el,
-        "codex show hide sessions openai")));
+  const quota = toggle(settings.codexQuotaEnabled, "Allow Codex quota access", (on) => change({ codexQuotaEnabled: on }));
+  if (nookDev || nookStandalone) followers.push(() => quota.set(settings.codexQuotaEnabled));
+  children = [head("connect"),
+    !nookStandalone ? h("p", { class: "sp-connect-mode", text: "Preview only in this build. Agent configuration files will not be changed." })
+      : nookStandalone && connectScan?.standaloneRelayReady === false ? h("p", { class: "sp-connect-block", text: "Standalone relay is not installed yet. Install the standalone Nook build before connecting." }) : null,
+    claude, codexCard,
+    group("Codex", row("Show Codex sessions", "Codex sessions appear in the island with a Codex mark.", show.el, "codex sessions"),
+      nookDev || nookStandalone ? row("Allow Codex quota access", "Allow Nook to read Codex quota windows from its local App Server.", quota.el, "codex quota usage") : null,
+      nookDev || nookStandalone ? codexQuotaDiagnostics() : null)];
+  if (__NOOK_DEV_BUILD__ && nookDev && new URLSearchParams(location.search).get("devSimulator") === "1") {
+    devSimulatorHost = h("div", { "data-testid": "dev-simulator-host" });
+    children.push(devSimulatorHost);
+    children.push(shelfTraceControls());
+  }
+  return children;
 }
 
-/** Cursor beside Claude Code: its hooks (status only), and whether its sessions are shown. */
-function cursorGroup(): HTMLElement {
-  const show = toggle(settings.showCursorSessions, "Show Cursor sessions", (on) => change({ showCursorSessions: on }));
-  followers.push(() => show.set(settings.showCursorSessions));
-  return toolPart("cursor", "Its agent sessions, to watch only: Nook answers nothing in Cursor.",
-    connectGroup("cursor", "Sessions", CURSOR_DOES, "cursor editor ide hooks.json agent sessions connect"),
-    group(null,
-      row("Show Cursor sessions", "Cursor's sessions appear in the island with a Cursor mark. Off, they are not followed at all.", show.el,
-        "cursor show hide sessions editor")));
+function connectAgentCard(agent: ConnectAgent, title: string): HTMLElement {
+  const card = h("section", { class: "sp-connect-card", "aria-label": message("{agent} connection", { agent: title }), "data-agent": agent });
+  const usagePanel = agent === "ClaudeCode" ? integration("usage") : null;
+  const paint = () => {
+    const openPreview = connectPreviewPanels.get(agent);
+    const scan = connectScan;
+    const build = nookDev ? "Dev" : nookStandalone ? "Standalone" : "Original";
+    const summary = summarizeAgentConnection(scan, agent, build);
+    const status = summary.state;
+    const detail = message({
+      connected: "Agent hooks are configured for this Nook build.",
+      notConfigured: "No hooks for this Nook build were found.",
+      otherBuild: "Hooks from a different Nook build were found; they do not connect this build.",
+      incomplete: "Some required hooks are missing. Review Connect to repair this agent.",
+      relayMissing: "A configured hook points to a relay that is not available.",
+      duplicate: "Duplicate hooks were found across configuration scopes.",
+      unreadable: "An agent configuration could not be read safely. No changes will be made to it.",
+    }[summary.detail]);
+    const delivery = summary.delivery === "Receiving" ? "Receiving events" : status === "Connected" ? "Waiting for activity" : "No events received";
+    const last = summary.lastEvent
+      ? message("Last event: {event}{time}", { event: summary.lastEvent, time: summary.lastEventAt ? ` · ${new Date(summary.lastEventAt).toLocaleTimeString()}` : "" })
+      : "No real hook event received yet";
+    const action: ConnectOperation = primaryConnectionAction(status);
+    clear(card);
+    card.dataset.status = status.toLowerCase().replaceAll(" ", "-");
+    card.append(h("header", { class: "sp-connect-head" }, h("div", {}, h("h2", { text: title }), h("p", { text: status })), h("span", { class: "sp-connect-delivery", text: delivery })),
+      h("p", { class: "sp-connect-install", text: scan?.detectedAgents.includes(agent) ? "CLI detected on PATH" : "CLI not detected on PATH" }),
+      h("p", { class: "sp-connect-detail", text: detail }),
+      h("p", { class: "sp-connect-last", text: last }),
+      h("div", { class: "sp-connect-actions" }, button(action, "primary", () => void showConnectPreview(agent, action))),
+      );
+    if (usagePanel) card.append(usagePanel);
+    if (status === "Connected") card.querySelector<HTMLButtonElement>(".sp-connect-actions .sp-btn")?.insertAdjacentElement("afterend", button("Repair", "secondary", () => void showConnectPreview(agent, "Repair")));
+    if (status === "Needs repair") card.querySelector<HTMLButtonElement>(".sp-connect-actions .sp-btn")?.insertAdjacentElement("afterend", button("Disconnect", "secondary", () => void showConnectPreview(agent, "Disconnect")));
+    // Runtime status followers repaint this card on focus and scanner refresh.
+    // Keep its user-owned preview panel attached across that repaint.
+    if (openPreview) card.append(openPreview);
+  };
+  followers.push(paint);
+  paint();
+  return card;
+}
+
+async function showConnectPreview(agent: ConnectAgent, operation: ConnectOperation, reviewedPlan?: ConnectPreview) {
+  const token = connectPreviewGate.begin(agent);
+  connectPreviewPanels.get(agent)?.remove();
+  connectPreviewPanels.delete(agent);
+  connectPreviewStates.delete(agent);
+  syncConnectPreviewScanTimer();
+  const preview = reviewedPlan ?? await nook.connectPreview(agent, operation);
+  if (!connectPreviewGate.isCurrent(agent, token)) return;
+  if (!preview) return;
+  const card = [...document.querySelectorAll<HTMLElement>(".sp-connect-card")].find((item) => item.dataset.agent === agent);
+  if (!card) return;
+  const panel = h("div", { class: "sp-connect-preview", "aria-label": message("Connection change preview") });
+  const checkboxes: HTMLInputElement[] = [];
+  const confirmation = (label: string) => { const input = h("input", { type: "checkbox" }); checkboxes.push(input); return h("label", { class: "sp-connect-confirm" }, input, h("span", { text: label })); };
+  panel.append(h("strong", { text: message("{operation} preview", { operation: message(operation) }) }), h("p", { text: message("Review these changes. Nothing is written until you confirm.") }));
+
+  const changes = preview.files.flatMap((file) => file.changes);
+  const counts = {
+    added: changes.filter((change) => change.kind === "Add").length,
+    replaced: changes.filter((change) => change.kind === "Change").length,
+    removed: changes.filter((change) => change.kind === "Remove").length,
+  };
+  const scopes = [...new Set(preview.files.map((file) => connectScopeLabel(file.scope)))];
+  const backups = preview.files.filter((file) => file.backupRequired).length;
+  panel.append(h("div", { class: "sp-connect-summary", role: "status" },
+    h("strong", { text: message("Planned hook changes: {added} added, {replaced} replaced, {removed} removed.", counts) }),
+    h("p", { text: message("Scopes: {scopes}. Backups: {backups}.", { scopes: scopes.join(", ") || message("none"), backups }) }),
+    preview.preservedRecords ? h("p", { text: message("Third-party and unknown entries preserved: {count}.", { count: preview.preservedRecords }) }) : null,
+    preview.requiresOriginalMigration ? h("p", { class: "sp-connect-warning", text: message("This preview migrates Original Nook hooks to Standalone.") }) : null,
+  ));
+  for (const file of preview.files) {
+    const owners = [...new Set(file.changes.map((change) => connectOwnerLabel(change.ownership)))].join(", ") || message("No owned entries");
+    const plannedChanges = file.changes.length
+      ? h("ul", { class: "sp-connect-change-list" }, ...file.changes.map((change) => {
+        const owner = connectOwnerLabel(change.ownership);
+        const action = change.kind === "Add" ? message("Add Standalone hook")
+          : change.kind === "Change" ? message("Replace {owner} hook", { owner })
+            : change.kind === "Remove" ? message("Remove {owner} hook", { owner })
+              : message("Keep {owner} hook", { owner });
+        return h("li", { text: message("{event}: {action}", { event: change.event, action }) });
+      }))
+      : h("p", { text: message("No file changes.") });
+    const technicalDiff = h("details", { class: "sp-connect-technical" },
+      h("summary", { text: message("Technical diff") }),
+      h("pre", { text: file.diff || message("No file changes.") }));
+    panel.append(h("details", { class: "sp-connect-file" },
+      h("summary", { text: `${connectScopeLabel(file.scope)} · ${file.path}` }),
+      h("p", { text: message("Ownership: {owners}", { owners }) }),
+      h("p", { text: message("Fingerprint: {fingerprint}{backup}", { fingerprint: file.fingerprint ?? message("Unavailable"), backup: file.backupRequired ? ` · ${message("Backup: {path}", { path: file.backupPath ?? message("required") })}` : "" }) }),
+      plannedChanges,
+      technicalDiff,
+      ...file.conflicts.map(() => h("p", { class: "sp-connect-warning", text: message("This file has a conflict that needs review.") }))));
+  }
+  if (preview.duplicates.length) panel.append(h("p", { class: "sp-connect-warning", text: message("Duplicate events: {events}", { events: preview.duplicates.map((duplicate) => duplicate.event).join(", ") }) }));
+  for (const _warning of preview.conflicts) panel.append(h("p", { class: "sp-connect-warning", text: message("This preview contains a conflict that needs review.") }));
+  if (preview.requiresOriginalMigration) panel.append(confirmation(message("I approve migrating Original Nook hooks.")));
+  if (preview.devScopesRequiringApproval.length) preview.devScopesRequiringApproval.forEach((scope) => panel.append(confirmation(message("I approve removing Nook Dev hooks from {scope}.", { scope: connectScopeLabel(scope) }))));
+  if (preview.codexTrustRequired) panel.append(confirmation(message("I understand Codex may ask me to trust these hooks in its own prompt.")));
+  const copyStatus = h("span", { class: "sp-connect-copy-status", role: "status" });
+  const copyChanges = button(message("Copy changes"), "secondary", () => {
+    const fullDiff = preview.files.map((file) => `--- ${file.path} (${connectScopeLabel(file.scope)})\n${file.diff || message("No file changes.")}`).join("\n\n");
+    const write = navigator.clipboard?.writeText;
+    if (!write) {
+      copyStatus.textContent = message("Clipboard unavailable. Try again while the Settings window is focused.");
+      return;
+    }
+    void write.call(navigator.clipboard, fullDiff).then(() => {
+      copyStatus.textContent = message("Copied changes.");
+    }).catch(() => {
+      copyStatus.textContent = message("Clipboard unavailable. Try again while the Settings window is focused.");
+    });
+  });
+  panel.append(h("div", { class: "sp-connect-copy" }, copyChanges, copyStatus));
+  const writable = nookStandalone && !!preview.previewId && preview.conflicts.length === 0 && preview.files.every((file) => !file.conflicts.length) && preview.devScopesRequiringApproval.length === 0;
+  if (nookStandalone) panel.append(h("p", { class: "sp-connect-mode", text: message("Standalone Safe Apply") }));
+  let stale = nookStandalone && (!connectScan || !connectPreviewIsFresh(preview, connectScan, agent));
+  const staleNotice = h("p", { class: "sp-connect-warning sp-connect-stale", role: "alert", text: message("Configuration changed since this preview. Apply is blocked; review a fresh preview.") });
+  staleNotice.hidden = !stale;
+  const refreshPreview = button(message("Review fresh preview"), "secondary", () => { close(); void showConnectPreview(agent, operation); });
+  refreshPreview.hidden = !stale;
+  panel.append(staleNotice, refreshPreview);
+  const apply = button(operation === "Disconnect" ? message("Confirm disconnect") : operation === "Repair" ? message("Confirm repair") : message("Confirm connect"), "primary", async () => {
+    if ((connectPreviewStates.get(agent)?.stale ?? stale) || !writable || checkboxes.some((checkbox) => !checkbox.checked) || !preview.previewId) return;
+    try {
+      const result = await nook.connectApply(preview.previewId, preview.approvedDevScopes, preview.codexTrustRequired, preview.requiresOriginalMigration, true);
+      if (result) {
+        connectScan = await nook.connectScan();
+        if (connectPreviewGate.isCurrent(agent, token)) { close(); follow(); }
+      }
+    } catch (error) {
+      if (!connectPreviewGate.isCurrent(agent, token)) return;
+      stale = true;
+      const state = connectPreviewStates.get(agent);
+      if (state) state.stale = true;
+      apply.disabled = true;
+      staleNotice.hidden = false;
+      staleNotice.textContent = message("The configuration changed or could not be saved. No changes were applied. Review a fresh preview before trying again.");
+      refreshPreview.hidden = false;
+    }
+  });
+  apply.disabled = stale || !writable || checkboxes.length > 0;
+  for (const checkbox of checkboxes) checkbox.addEventListener("change", () => {
+    apply.disabled = (connectPreviewStates.get(agent)?.stale ?? stale) || !writable || checkboxes.some((item) => !item.checked);
+  });
+  if (preview.devScopesRequiringApproval.length) panel.append(button(message("Review Dev scope removal…"), "secondary", async () => {
+    if (checkboxes.some((checkbox) => !checkbox.checked)) return;
+    const reviewed = await nook.connectPreview(agent, operation, preview.devScopesRequiringApproval);
+    if (!connectPreviewGate.isCurrent(agent, token)) return;
+    if (!reviewed) return;
+    panel.remove();
+    connectPreviewPanels.delete(agent);
+    await showConnectPlan(agent, operation, reviewed);
+  }));
+  const close = () => {
+    if (connectPreviewGate.isCurrent(agent, token)) connectPreviewGate.cancel(agent, token);
+    if (connectPreviewPanels.get(agent) === panel) {
+      connectPreviewPanels.delete(agent);
+      connectPreviewStates.delete(agent);
+      syncConnectPreviewScanTimer();
+    }
+    panel.remove();
+  };
+  panel.append(apply, button(message("Cancel"), "secondary", close));
+  card.append(panel);
+  connectPreviewPanels.set(agent, panel);
+  connectPreviewStates.set(agent, { preview, apply, notice: staleNotice, refresh: refreshPreview, stale, writable, checkboxes });
+  syncConnectPreviewScanTimer();
+}
+
+function syncConnectPreviewScanTimer() {
+  if (connectPreviewStates.size && !connectPreviewScanTimer) {
+    connectPreviewScanTimer = window.setInterval(() => { void refreshConnectInventory(); }, 2000);
+  } else if (!connectPreviewStates.size && connectPreviewScanTimer) {
+    window.clearInterval(connectPreviewScanTimer);
+    connectPreviewScanTimer = 0;
+  }
+}
+
+function connectScopeLabel(scope: string): string {
+  return scope === "Global" || scope === "User" ? message("User scope")
+    : scope.startsWith("Project") ? message("Project scope") : scope;
+}
+
+function connectOwnerLabel(owner: string): string {
+  const labels: Record<string, string> = {
+    OriginalNook: message("Original Nook"), NookDev: message("Nook Dev"), StandaloneNook: message("Standalone Nook"),
+    ThirdParty: message("Third-party"), Unknown: message("Unknown"),
+  };
+  return labels[owner] ?? owner;
+}
+
+async function showConnectPlan(agent: ConnectAgent, operation: ConnectOperation, preview: ConnectPreview) {
+  await showConnectPreview(agent, operation, preview);
+}
+
+function quotaWindowRow(label: string, window: QuotaWindowDisplay | null, status: string): HTMLElement {
+  if (window?.state === "unavailable") {
+    return h("div", { class: "sp-codex-quota-row" },
+      h("strong", { text: label }),
+      h("span", { class: "sp-codex-quota-empty", text: "Unavailable" }));
+  }
+  if (!window) {
+    const message = status === "Loading" ? "Waiting for provider update" : status === "Disabled" ? "Provider is disabled" : "Unavailable";
+    return h("div", { class: "sp-codex-quota-row" },
+      h("strong", { text: label }),
+      h("span", { class: "sp-codex-quota-empty", text: message }));
+  }
+  return h("div", { class: "sp-codex-quota-row" },
+    h("strong", { text: label }),
+    h("span", { text: `${formatQuotaPercent(window.percent)} used` }),
+    h("span", { class: "sp-codex-quota-reset", text: `Resets ${formatResetTime(window.resetsAt)} (local time)` }));
+}
+
+function paintCodexQuota() {
+  if ((!nookDev && !nookStandalone) || !CODEX_QUOTA_BUILD || !codexQuotaPanel) return;
+  const display = quotaProviderDisplay(settings.codexQuotaEnabled, codexQuota);
+  clear(codexQuotaPanel);
+  codexQuotaPanel.dataset.status = display.status.toLowerCase();
+  codexQuotaPanel.append(
+    h("div", { class: "sp-codex-quota-heading" },
+      h("strong", { text: "Status" }),
+      h("span", { class: "sp-codex-quota-state", text: display.status })),
+    quotaWindowRow("Codex 5h", display.fiveHour, display.status),
+    quotaWindowRow("Codex 7d", display.sevenDay, display.status),
+    h("div", { class: "sp-codex-quota-meta" },
+      h("span", { text: message("Last successful update: {time}{stale}", { time: display.lastSuccessfulUpdate ?? message("None yet"), stale: codexQuota?.stale ? ` · ${message("Stale data")}` : "" }) }),
+      display.failureReason ? h("span", { text: message("Failure reason: {reason}", { reason: quotaFailureReasonLabel(display.failureReason) }) }) : null,
+      h("span", { text: "Source: Codex Desktop App Server" })));
+}
+
+function quotaFailureReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    timeout: "Timed out", unauthorized: "Not authorized", protocolError: "Unexpected provider response",
+    cliUnavailable: "Codex CLI unavailable", spawnFailed: "Could not start Codex", serverExited: "Codex provider stopped",
+    quotaUnavailable: "Quota data unavailable", disabled: "Provider is disabled", processIsolationUnavailable: "Process isolation unavailable",
+  };
+  return message(labels[reason] ?? "Unknown error");
+}
+
+function codexQuotaDiagnostics(): HTMLElement {
+  const panel = h("section", { class: "sp-codex-quota", "aria-label": "Codex quota diagnostics" });
+  codexQuotaPanel = panel;
+  followers.push(paintCodexQuota);
+  paintCodexQuota();
+  return panel;
 }
 
 /** settings.json may have changed while the window was away: its state is read again, never written. */
@@ -1203,6 +1560,21 @@ async function refreshClaude() {
   const before = JSON.stringify([hooks, usage, reply, cursor, codex]);
   await readClaude();
   if (JSON.stringify([hooks, usage, reply, cursor, codex]) !== before && onShow()) paintClaude();
+}
+
+async function refreshConnectInventory() {
+  if (!nook) return;
+  const next = await nook.connectScan();
+  if (!next) return;
+  connectScan = next;
+  for (const [agent, state] of connectPreviewStates) {
+    const stale = nookStandalone && !connectPreviewIsFresh(state.preview, next, agent);
+    state.stale = stale;
+    state.notice.hidden = !stale;
+    state.refresh.hidden = !stale;
+    state.apply.disabled = stale || !state.writable || state.checkboxes.some((checkbox) => !checkbox.checked);
+  }
+  follow();
 }
 
 // ── Shortcuts ─────────────────────────────────────────────────────────────────
@@ -1482,7 +1854,7 @@ function agentsSection(): Kid[] {
     head("agents"),
     group("The list",
       row("Show the agents list",
-        "Each project's state, how much of Claude's memory it has used, and its last message. Click a row to go to its window. It never takes the keyboard.",
+        "Each project's state, latest activity and, when available, an estimate of context-window use. Click a row to open its window. The list never takes the keyboard.",
         agentsList.el, "agents list window projects overlay sessions always on top floating"),
       row("Fade when not in use", "It dims a few seconds after your pointer leaves it, but never while something waits for you.", agentsFade.el,
         "fade dim idle transparent", fadeNeeds),
@@ -1515,6 +1887,7 @@ type MetricRow = CompactMetric;
 const METRIC_ROWS: readonly MetricRow[] = COMPACT_METRICS;
 const metricName = (id: MetricRow) => COMPACT_CELLS[id].name;
 const isMetric = (id: string): id is CompactMetric => (COMPACT_METRICS as readonly string[]).includes(id);
+const isUsageMetric = (id: CompactMetric) => id === "usage5h" || id === "usage7d";
 
 /** The compact island, live: at the top of the Island page and of Look and colours, whichever is on show. */
 const folded = islandPreview(islandBot);
@@ -1567,19 +1940,21 @@ const metricPicker = (() => {
       h("i", { class: "glyph" }, cellIcon(id, 16)),
       h("span", { class: "name", text: name }),
       h("span", { class: "sample", text: COMPACT_CELLS[id].sample }));
-    // A machine that reports no GPU use shows "—" in its cell: it can still be picked.
-    if (id === "gpu") check.title = "Shows — on a computer that does not report its graphics use.";
     check.addEventListener("click", () => {
       const on = chosen();
       if (on.includes(id)) {
-        change({ compactMetrics: on.filter((x) => x !== id) });
+        const next = isUsageMetric(id) ? on.filter((x) => !isUsageMetric(x)) : on.filter((x) => x !== id);
+        change({ compactMetrics: next });
         refuse(null);
       } else if (on.length >= MAX_COMPACT_METRICS) {
         // Refused, and said so: nothing is dropped to make room. Rust holds
         // the same line on save, whatever a page sends.
         return refuse(id);
       } else {
-        change({ compactMetrics: [...on, id] });
+        const next = isUsageMetric(id)
+          ? [...on.filter((x) => !isUsageMetric(x)), "usage5h", "usage7d"] as CompactMetric[]
+          : [...on, id];
+        change({ compactMetrics: next });
         refuse(null);
       }
       paint();
@@ -1629,8 +2004,7 @@ const HIDE_AFTER_WORDS: Record<HideAfter, string> = { 5: "5 s", 10: "10 s", 30: 
  * on one machine (the app at rest with the folded island up, across Nook and
  * its WebView2 processes, 3 October 2026) — not a promise for another.
  */
-const ALWAYS_SHOWN_NOTE =
-  "While the island is on show, Nook checks your computer's numbers every 2.5 seconds; hidden, it checks nothing. On the PC it was measured on, Nook at rest with the compact island showing took about 7.7 % of one processor core (0.5 % of that 16-core machine) and about 290 MB of memory, WebView2 included. Yours will differ.";
+const ALWAYS_SHOWN_NOTE = "The compact island stays visible until you hide it or close Nook.";
 
 function islandSection(): Kid[] {
   // Where it sits.
@@ -1714,7 +2088,7 @@ function islandSection(): Kid[] {
         metricPicker.refusal,
         h("p", { class: "sp-note", text: "Pick up to three. Drag a chosen one by its handle to change the order. With none, the island is narrower. Numbers in the island preview are samples." }))),
     "What the compact island shows", "Pick up to three numbers to show beside Gullu.",
-    "metrics numbers stats cpu processor gpu graphics ram memory usage limits weekly waiting sessions show", true),
+    "metrics numbers stats usage limits weekly waiting sessions show", true),
     resetFoot("island"),
   ];
 }
@@ -1727,7 +2101,7 @@ function botColours(): HTMLElement {
   const swatches = h("div", { class: "sp-swatches", role: "radiogroup", "aria-label": "Gullu's colour" });
   const worn = () => (isBotTheme(settings.botTheme) ? settings.botTheme : names[0]);
   const buttons = names.map((name) => {
-    const b = h("button", { class: "sp-swatch", type: "button", role: "radio", "aria-label": BOT_THEMES[name].label, title: BOT_THEMES[name].label },
+    const b = h("button", { class: "sp-swatch", type: "button", role: "radio", "aria-label": message(BOT_THEMES[name].label), title: message(BOT_THEMES[name].label) },
       h("i", { style: `--c:${BOT_THEMES[name].b}` }));
     b.addEventListener("click", () => pick(name));
     return b;
@@ -1739,7 +2113,7 @@ function botColours(): HTMLElement {
       b.setAttribute("aria-checked", String(on));
       b.tabIndex = on ? 0 : -1;
     });
-    label.textContent = BOT_THEMES[worn()].label;
+    label.textContent = message(BOT_THEMES[worn()].label);
   };
   const pick = (name: (typeof names)[number]) => {
     if (name !== worn()) change({ botTheme: name });
@@ -1765,10 +2139,10 @@ function lookSection(): Kid[] {
   const writeHelp = () => {
     // Asked of the system only while following it: a picked theme answers for itself.
     themeHelp.textContent = settings.theme === "system"
-      ? `Follows your computer, which is set to ${systemDark.matches ? "dark" : "light"} right now. The island itself is always dark.`
-      : "The island itself is always dark.";
+      ? message(`Follows your computer, which is set to ${systemDark.matches ? "dark" : "light"} right now. The island itself is always dark.`)
+      : message("The island itself is always dark.");
   };
-  const theme = segmented<Theme>("Colours of this window", [["light", "Light"], ["dark", "Dark"], ["system", "Match computer"]], settings.theme, (v) => {
+  const theme = segmented<Theme>("Colours of this window", [["light", message("Light")], ["dark", message("Dark")], ["system", message("Match computer")]], settings.theme, (v) => {
     change({ theme: v });
     writeHelp();
   });
@@ -1915,7 +2289,7 @@ const shelfPicker = (() => {
 
 function shelfSection(): Kid[] {
   followers.push(() => shelfPicker.paint(false));
-  return [
+  const children: Kid[] = [
     head("shelf"),
     h("div", { class: "sp-flash note sp-intro", role: "note" }, icon(LUCIDE.info, 15),
       h("span", { text: "The Shelf tab of the island shows these in this order, and you can drag its cards there too. A widget that is off never runs: no timer, no reminder, no camera, nothing is read." })),
@@ -1924,103 +2298,63 @@ function shelfSection(): Kid[] {
       h("p", { class: "sp-note", text: "Drag a card to move it, or click it and use the arrow keys. Switch one off to leave it out." })),
     "Shelf widgets", "Which widgets the Shelf shows, and their order.",
     "shelf widgets widget media music player to-do todo tasks timer countdown reminders mirror camera projects folders order hide", true),
-    resetFoot("shelf"),
   ];
+  children.push(resetFoot("shelf"));
+  return children;
+}
+
+function shelfTraceControls(): HTMLElement {
+  const status = h("span", { class: "sp-shelf-trace-status", role: "status" });
+  const start = button("Start UI trace", "primary", () => { void startShelfTrace(); });
+  const copy = button("Copy UI trace", "quiet", () => {
+    void navigator.clipboard.writeText(exportShelfTrace()).then(() => {
+      status.textContent = `Copied ${shelfTraceCount()} trace events.`;
+    }).catch(() => {
+      status.textContent = "Clipboard unavailable. Try again while the Settings window is focused.";
+    });
+  });
+  const stop = button("Stop UI trace", "quiet", () => { void stopShelfTrace(); });
+  const update = () => {
+    const active = isShelfTraceRecording();
+    const count = shelfTraceCount();
+    start.disabled = active;
+    stop.disabled = !active;
+    copy.disabled = count === 0;
+    status.textContent = active ? `Recording · ${count} events` : `${count} events retained in memory`;
+  };
+  subscribeShelfTrace(update);
+  update();
+  return h("div", { class: "sp-shelf-trace" },
+    h("div", { class: "sp-row-text" },
+      h("div", { class: "sp-row-label", text: "Island and Home render diagnostics (Dev only)" }),
+      h("p", { class: "sp-help", text: "Start the trace, open and close Expanded Home twice, then return here and copy it. Keeps up to 500 event timings, locale tags, mutation counts, and geometry values in memory; never records visible text, session data, settings, or credentials." })),
+    h("div", { class: "sp-shelf-trace-actions" }, start, copy, stop),
+    status);
 }
 
 // ── About ─────────────────────────────────────────────────────────────────────
 
-/**
- * The owner's links. What is written here is only what the row says: the
- * address each one opens is a constant in Rust (about.rs), picked by its id.
- */
-const LINKS: readonly { which: AboutLink; name: string; where: string; mark: () => SVGSVGElement }[] = [
-  { which: "portfolio", name: "Portfolio", where: "zubyr.dev", mark: () => icon(LUCIDE.globe, 16) },
-  { which: "github", name: "GitHub", where: "github.com/zubairbinshaukat", mark: () => brand(BRANDS.github, 16) },
-  // Simple Icons carries no LinkedIn mark: a neutral glyph of the set stands for it.
-  { which: "linkedin", name: "LinkedIn", where: "linkedin.com/in/zubairbinshaukat", mark: () => icon(LUCIDE.briefcaseBusiness, 16) },
-  { which: "x", name: "X", where: "x.com/zubyrdev", mark: () => brand(BRANDS.x, 14) },
-];
-
-/**
- * Updates: the one thing Nook uses the internet for, and only on the user's
- * say — the switch (a check a day) or the button (a check now). What a check
- * found is said here; the island says it too while the switch is on.
- */
-function updatesGroup(): HTMLElement {
-  const auto = toggle(settings.checkUpdates, "Check for updates every day", (on) => change({ checkUpdates: on }));
-  followers.push(() => auto.set(settings.checkUpdates));
-  const status = h("p", { class: "sp-help", role: "status" });
-  const check = button("Check now", "quiet", () => void run());
-  const get = button("Get it…", "primary", () => void nook.updateOpen());
-  let found: UpdateInfo | null = null;
-  let busy = false;
-  let failed: string | null = null;
-
-  const paint = () => {
-    get.style.display = found?.available && !busy ? "" : "none";
-    check.disabled = busy;
-    check.textContent = busy ? "Checking…" : "Check now";
-    status.classList.toggle("sp-danger-text", failed != null);
-    status.textContent = failed
-      ?? (busy ? "Asking GitHub…"
-        : !found ? "Not checked yet."
-          : found.available ? `Nook ${found.latest} is out. Get it opens its download page in your browser.`
-            : `You have the latest version.${found.checkedAt ? ` Checked ${new Date(found.checkedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}.` : ""}`);
-  };
-  async function run() {
-    if (busy) return;
-    busy = true;
-    failed = null;
-    paint();
-    try {
-      found = await nook.updateCheck();
-    } catch (err) {
-      failed = reason(err) || "The check could not be made.";
-    }
-    busy = false;
-    paint();
-  }
-  void nook.updateLast().then((last) => {
-    if (last && !busy) found = last;
-    paint();
-  });
-  paint();
-
-  return group("Updates",
-    row("Check for updates every day",
-      "Once a day, Nook asks GitHub whether a newer version is out, and tells you here and in the island. It sends nothing about you. Off, Nook never connects to the internet by itself.",
-      auto.el, "update updates upgrade new version automatic auto check daily github release internet network"),
-    findable(h("div", { class: "sp-row" },
-      rowText(version ? `You have version ${version}` : "This version", null, status),
-      h("div", { class: "sp-update-actions" }, get, check)),
-    "Check now", "Ask GitHub now whether a newer version of Nook is out.", "update updates check now latest version download upgrade"));
-}
-
 function aboutSection(): Kid[] {
+  const language = segmented<Language>("Language", [["uk", "Українська"], ["en", "English"]], resolveLanguage(settings.language), (value) => change({ language: value }));
+  followers.push(() => language.set(resolveLanguage(settings.language)));
   const place = (label: string, help: string, path: string | undefined, keys: string) =>
     findable(h("div", { class: "sp-row" },
       rowText(label, help),
       h("span", { class: "sp-path" }, ...(path ? breakable(path) : ["—"]))), label, help, keys);
-  const link = ({ which, name, where, mark }: (typeof LINKS)[number]) =>
-    h("button", {
-      class: "sp-social", type: "button", title: where,
-      "aria-label": `${name}: ${where}. Opens in your browser.`, onclick: () => void nook.openLink(which),
-    }, h("i", {}, mark()), h("span", { text: name }));
   return [
     head("about"),
+    group("Language", row("Language", "Choose the language used throughout Nook.", language.el)),
     h("div", { class: "sp-about" },
       h("div", { class: "sp-nook", "aria-hidden": "true" }, aboutBot.el),
       h("div", {},
         h("p", { class: "sp-about-name", text: "Nook" }),
         h("p", { class: "sp-about-version", text: version ? `Version ${version}` : "" }),
-        h("p", { class: "sp-about-version", text: "With Gullu, Nook's buddy" }))),
-    updatesGroup(),
+        h("p", { class: "sp-about-version", text: "Nook Personal Edition · With Gullu, Nook's buddy" }))),
     findable(bare("Privacy",
       h("div", { class: "sp-box sp-privacy" },
         icon(LUCIDE.circleCheck, 18, 2),
-        h("p", { text: "Nook sends nothing anywhere, and tracks nothing. It uses the internet for one thing only, and only if you ask: checking whether a newer version is out. Everything else stays on this computer." }))),
-    "Privacy", "Nook sends nothing anywhere: everything stays on this computer.",
+        h("p", { text: "Nook does not send personal data or track you. Agent connections and settings stay on this computer." }))),
+    "Privacy", "Nook does not send personal data or track you. Agent connections and settings stay on this computer.",
     "privacy private telemetry tracking data network internet offline online send", true),
     group("Where your things are kept",
       place("Settings", "Your choices in this window", paths?.settings, "files folder location data settings where stored path"),
@@ -2030,12 +2364,11 @@ function aboutSection(): Kid[] {
         h("button", { class: "sp-link", type: "button", onclick: () => void nook.openLogFolder() },
           icon(LUCIDE.folderOpen, 16), h("span", { class: "sp-link-text", text: "Open the log folder" }), icon(LUCIDE.arrowUpRight, 14))),
       "Open the log folder", null, "logs log folder open explorer files")),
-    findable(bare("Made by",
+    findable(bare("Developed by",
       h("div", { class: "sp-credit" },
-        h("p", { class: "sp-made", text: "Zubair Bin Shaukat" }),
-        h("div", { class: "sp-links", role: "group", "aria-label": "Zubair Bin Shaukat's links" }, ...LINKS.map(link))),
+        h("p", { class: "sp-made", text: "Valentyn Fetisov" })),
       h("p", { class: "sp-credits", text: "Open source, under the MIT licence." })),
-    "Made by", "Zubair Bin Shaukat. Open source, under the MIT licence.",
+    "Developed by", "Valentyn Fetisov. Open source, under the MIT licence.",
     "author made by credits github linkedin website portfolio contact licence license open source", true),
   ];
 }
@@ -2065,12 +2398,10 @@ const ENTER: Partial<Record<Section, () => (() => void) | void>> = {
     metricPicker.refuse(null);
     metricPicker.paint(false);
     heads.get("island")!.after(folded.el);
-    return folded.run();
   },
   look: () => {
     paintPreview(false);
     heads.get("look")!.after(folded.el);
-    return folded.run();
   },
 };
 
@@ -2117,12 +2448,20 @@ function setSection(next: Section, animate = true) {
 // ── Go ────────────────────────────────────────────────────────────────────────
 
 async function start() {
+  if (__NOOK_DEV_BUILD__) shelfTrace("locale-before-boot", { locale: currentLanguage(), languagePreference: settings.language, source: "settings" });
   nook = await connect();
-  const [boot, , statuses, where] = await Promise.all([nook.boot(), readClaude(), nook.shortcutStatus(), nook.dataPaths()]);
+  const [boot, , statuses, where, connectInventory] = await Promise.all([nook.boot(), readClaude(), nook.shortcutStatus(), nook.dataPaths(), nook.connectScan()]);
+  connectScan = connectInventory;
   if (boot) {
     settings = { ...settings, ...boot.settings };
     version = boot.version;
+    nookDev = boot.nookDev ?? false;
+    nookStandalone = boot.nookStandalone ?? false;
   }
+  setLanguage(resolveLanguage(settings.language), "settings.boot");
+  void nook.setTrayLabels(trayMenuLabels());
+  if (__NOOK_DEV_BUILD__) shelfTrace("locale-after-boot", { locale: currentLanguage(), languagePreference: settings.language, source: boot ? "settings.boot" : "settings.boot-unavailable" });
+  if (__NOOK_DEV_BUILD__) await enableShelfTraceCapture(nookDev);
   shortcutsNow = statuses;
   paths = where;
   applyAppearance();
@@ -2134,6 +2473,10 @@ async function start() {
     const pane = h("div", { class: "sp-pane", id: `pane-${id}`, role: "tabpanel", "aria-labelledby": `tab-${id}`, hidden: true }, ...BUILD[id]());
     panes.set(id, pane);
     main.append(pane);
+  }
+  if (__NOOK_DEV_BUILD__ && nookDev && devSimulatorHost) {
+    const { createDevSimulatorControl } = await import("../dev-simulator");
+    devSimulatorHost.append(createDevSimulatorControl());
   }
   main.append(results);
 
@@ -2148,11 +2491,38 @@ async function start() {
       nook.fake ? h("div", { class: "sp-fake", text: "Fake data", title: "Nothing here is read from or written to this machine." }) : null),
     main);
   root.append(app, live);
+  // Some controls are assembled before they are attached to the document.
+  // Translate the complete initial tree before the browser paints it.
+  setLanguage(resolveLanguage(settings.language), "settings.initial-dom");
+  void nook.setTrayLabels(trayMenuLabels());
   setSection(sectionNamed(nook.start) ?? "connect", false);
   paintResets();
   startBots(still);
 
   nook.onSettingsChanged(settingsChanged);
+  await nook.onConnectActivity(async () => {
+    await refreshConnectInventory();
+  });
+  if (CODEX_QUOTA_BUILD && (nookDev || nookStandalone)) {
+    await nook.onCodexQuotaChanged((snapshot) => {
+      const accepted = codexQuotaGate.acceptEvent(snapshot);
+      if (!accepted) return;
+      codexQuota = accepted as CodexQuotaSnapshot;
+      codexQuotaRevision++;
+      paintCodexQuota();
+    });
+    codexQuotaGate.setEnabled(settings.codexQuotaEnabled);
+    const revision = codexQuotaRevision;
+    const enabledAtRead = settings.codexQuotaEnabled;
+    void nook.codexQuotaLast().then((snapshot) => {
+      if (!codexQuotaGate.prime(snapshot)) return;
+      const accepted = codexQuotaGate.acceptEvent(snapshot);
+      if (accepted && enabledAtRead && settings.codexQuotaEnabled && codexQuotaRevision === revision) {
+        codexQuota = accepted as CodexQuotaSnapshot;
+        paintCodexQuota();
+      }
+    });
+  }
   systemDark.addEventListener("change", () => {
     applyAppearance();
     follow();
@@ -2161,8 +2531,10 @@ async function start() {
   // The window lives hidden between two looks at it: what it shows of
   // settings.json is read again when it comes back.
   window.addEventListener("focus", () => void refreshClaude());
+  window.addEventListener("focus", () => void refreshConnectInventory());
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") void refreshClaude();
+    if (document.visibilityState === "visible") void refreshConnectInventory();
   });
 
   if (nook.fake) await fakeStates();

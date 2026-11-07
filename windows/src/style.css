@@ -227,6 +227,39 @@ body {
   height: 100%;
 }
 
+.ci-idle-status {
+  display: none;
+  flex: 0 0 auto;
+  height: 34px;
+  align-items: center;
+  gap: var(--idle-clock-battery-gap);
+  color: var(--dim-1);
+  pointer-events: none;
+}
+
+#compact.idle .ci-idle-status { display: flex; }
+.ci-idle-time { box-sizing: border-box; flex: 0 0 var(--idle-clock-w); width: var(--idle-clock-w); text-align: center; white-space: nowrap; font-size: 19px; font-variant-numeric: tabular-nums; font-weight: 650; letter-spacing: .04em; }
+.ci-battery-display { box-sizing: border-box; display: none; flex: 0 0 var(--idle-battery-group-w); width: var(--idle-battery-group-w); align-items: center; gap: 4px; }
+#compact.has-battery .ci-battery-display { display: inline-flex; }
+.ci-battery-value { box-sizing: border-box; flex: 0 0 34px; width: 34px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ci-battery-ring {
+  --battery-color: var(--green-2);
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--battery-color);
+  background: conic-gradient(var(--battery-color) var(--battery-progress, 0%), var(--dim-4) 0);
+  position: relative;
+}
+.ci-battery-ring::before { content: ""; position: absolute; inset: 2px; border-radius: 50%; background: var(--card); }
+.ci-battery-ring svg { z-index: 1; stroke: currentColor; fill: none; }
+.ci-battery-ring[data-level="yellow"] { --battery-color: var(--amber); }
+.ci-battery-ring[data-level="red"] { --battery-color: var(--red-text); }
+.ci-battery-ring[data-level="unknown"] { --battery-color: var(--dim-3); background: var(--dim-4); }
+
 .ci-dots {
   flex: 0 0 auto;
   display: flex;
@@ -320,14 +353,55 @@ body {
   width: var(--w);
   display: flex;
   align-items: center;
-  gap: 5px;
+  justify-content: center;
   overflow: hidden;
   color: var(--dim-2);
   white-space: nowrap;
 }
 
+.ci-metric[data-kind="waiting"] {
+  transition: color 0.18s ease-out;
+}
+
+.ci-metric[data-kind="waiting"].waiting-active,
+.ci-metric[data-kind="waiting"].waiting-active b {
+  color: var(--amber);
+}
+
 .ci-metric svg {
   flex: 0 0 auto;
+}
+
+.ci-metric-icon {
+  position: relative;
+  flex: 0 0 14px;
+  width: 14px;
+  height: 14px;
+  display: grid;
+  place-items: center;
+}
+
+.ci-metric-reading {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--compact-reading-gap);
+}
+
+.ci-metric-agent {
+  flex: 0 0 var(--agent-slot-w);
+  width: var(--agent-slot-w);
+  height: var(--agent-icon-size);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+}
+
+.ci-metric-agent svg {
+  flex: 0 0 var(--agent-icon-size);
+  width: var(--agent-icon-size);
+  height: var(--agent-icon-size);
 }
 
 .ci-metric b {
@@ -335,6 +409,19 @@ body {
   font-variant-numeric: tabular-nums;
   color: var(--ink-2);
   transition: color 0.3s ease-out;
+}
+
+.ci-metric[data-kind="usage5h"] b,
+.ci-metric[data-kind="usage7d"] b {
+  flex: 0 0 30px;
+  width: 30px;
+  text-align: center;
+}
+
+.ci-metric[data-kind="waiting"] b {
+  flex: 0 0 14px;
+  width: 14px;
+  text-align: center;
 }
 
 /* How much of a usage window is gone: calm, warming, nearly all of it. */
@@ -376,6 +463,18 @@ body {
   height: var(--bot-slot);
 }
 
+:root:is([data-dock="left"], [data-dock="right"]) .ci-idle-status {
+  width: 46px;
+  height: var(--idle-side-clock-h);
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--idle-side-group-gap);
+}
+:root:is([data-dock="left"], [data-dock="right"]) #compact.has-battery .ci-idle-status { height: calc(var(--idle-side-clock-h) + var(--idle-side-group-gap) + var(--idle-side-battery-h)); }
+:root:is([data-dock="left"], [data-dock="right"]) .ci-idle-time { flex-basis: 46px; width: 46px; font-size: 12px; letter-spacing: 0; }
+:root:is([data-dock="left"], [data-dock="right"]) .ci-battery-display { flex-basis: 46px; width: 46px; height: var(--idle-side-battery-h); flex-direction: column; gap: 2px; }
+:root:is([data-dock="left"], [data-dock="right"]) .ci-battery-value { flex: 0 0 12px; width: auto; min-width: 0; height: 12px; line-height: 12px; font-size: 10px; text-align: center; }
+
 :root:is([data-dock="left"], [data-dock="right"]) .ci-dots {
   flex-direction: column;
 }
@@ -396,6 +495,19 @@ body {
 
 :root:is([data-dock="left"], [data-dock="right"]) .ci-metric b {
   line-height: 16px;
+}
+
+:root:is([data-dock="left"], [data-dock="right"]) .ci-metric-reading {
+  flex-direction: column;
+  gap: 0;
+}
+
+:root:is([data-dock="left"], [data-dock="right"]) .ci-metric-agent {
+  flex-basis: var(--agent-slot-h);
+  width: auto;
+  height: var(--agent-icon-size);
+  justify-content: center;
+  margin-block-end: calc(-1 * var(--agent-side-overlap));
 }
 
 @keyframes dot-pulse {
@@ -437,10 +549,7 @@ body {
   transition: opacity 0.2s ease-in-out;
 }
 
-/* Keep it light: 0 % CPU when the island is hidden. Folded or hidden, the
-   views are invisible but still in the page, and an animation with no end — a
-   shimmering line, a pulsing dot, a turning ring — would go on being computed
-   for nobody. They all stop, and pick up when the island unfolds. */
+/* Folded or hidden, the views are invisible but still in the page. Animations pause until the island unfolds. */
 #content.away * {
   animation-play-state: paused !important;
 }
@@ -534,107 +643,6 @@ body {
   box-shadow: 0 0 0 2px #000;
 }
 
-/* The strip of numbers between the tabs and the buttons. It is its own size
-   container: how much of it shows follows the width the island gives it. */
-.hstats {
-  flex: 1 1 0;
-  min-width: 0;
-  container-type: inline-size;
-  padding: 0 8px;
-}
-
-.hs-row {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  gap: 11px;
-  height: 22px;
-  overflow: hidden;
-  white-space: nowrap;
-}
-
-.hs {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.hs[hidden] {
-  display: none;
-}
-
-.hs-label {
-  font: 600 10px var(--font);
-  letter-spacing: 0.02em;
-  color: var(--dim-3);
-}
-
-.hs-icon {
-  display: none;
-  color: var(--dim-3);
-}
-
-.hs-icon svg {
-  display: block;
-}
-
-.hs .hs-bar {
-  width: 22px;
-  height: 3px;
-  flex: 0 0 auto;
-}
-
-.hs .hs-bar i {
-  transition: none;
-}
-
-/* Calm under 60 %, warm to 85 %, hot past it — on the machine's fill only. */
-.hs[data-level="warm"] .hs-bar i {
-  background: var(--amber);
-}
-
-.hs[data-level="hot"] .hs-bar i {
-  background: var(--red);
-}
-
-.hs .res-value.hs-value {
-  width: 26px;
-  margin: 0;
-  font-size: 10.5px;
-}
-
-.hs-usage .res-bar i {
-  background-image: linear-gradient(90deg, var(--green-2) 0%, var(--green-2) 42%, var(--amber) 70%, var(--red) 94%);
-  background-size: calc(100% / max(var(--used, 1), 0.02)) 100%;
-  background-repeat: no-repeat;
-}
-
-.hs-usage.dim {
-  opacity: 0.45;
-}
-
-@container (max-width: 419px) {
-  .hs-7d { display: none; }
-}
-
-@container (max-width: 334px) {
-  .hs-gpu { display: none; }
-}
-
-@container (max-width: 254px) {
-  .hs-label { display: none; }
-  .hs-icon { display: block; }
-}
-
-@container (max-width: 189px) {
-  .hs .hs-bar { display: none; }
-}
-
-@container (max-width: 139px) {
-  .hs-usage { display: none; }
-}
-
 .header-actions button {
   border: 0;
   background: transparent;
@@ -686,6 +694,26 @@ body {
   pointer-events: auto;
   transition: opacity 0.3s ease-out 0.16s, transform 0.3s cubic-bezier(0.3, 1.2, 0.4, 1) 0.16s;
 }
+
+/* Home's text is already rendered and localized before reveal. Do not fade or
+   scale its cards separately: the Island's own spring carries the entrance. */
+.view.home-view {
+  inset: 0 auto auto 0;
+  width: var(--home-frame-width);
+  height: var(--home-frame-height);
+  opacity: 0;
+  transform: none;
+  transition: none;
+}
+
+.view.home-view.on {
+  opacity: 1;
+  transform: none;
+  transition: none;
+}
+
+/* Keep Home's final layout box fixed while the outer Island grows around it.
+   The Island clip reveals the same lines progressively without rewrapping. */
 
 /* A view that is not on is only transparent, not gone: an infinite animation
    inside it would keep the webview repainting every frame for as long as the
@@ -2109,6 +2137,89 @@ html.vt-back::view-transition-group(*) {
   margin-bottom: -3px;
 }
 
+/* The wrapper and section flatten when only Claude is shown, preserving the
+   original card's three children and spacing. With Codex enabled they become
+   a local scroll area: two matching usage sections in the same card. */
+.res-content,
+.res-provider {
+  display: contents;
+}
+
+:root .home-res .res-provider[hidden] {
+  display: none;
+}
+
+.res-state {
+  margin-left: auto;
+  font: 500 8px var(--font);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--dim-3);
+}
+
+.home-res:not(.has-codex) .res-provider-claude .res-state {
+  display: none;
+}
+
+.home-res.has-codex {
+  min-height: 0;
+  overflow: hidden;
+  gap: 0;
+  padding: 8px 9px 7px;
+}
+
+.home-res.has-codex .res-content {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 5px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+
+.home-res.has-codex .res-provider {
+  display: flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.home-res.has-codex .lane-h {
+  min-height: 12px;
+  margin: 0;
+  font-size: 8.5px;
+}
+
+.home-res.has-codex .res-usage {
+  gap: 4px;
+}
+
+.home-res.has-codex .res-row {
+  gap: 2px;
+}
+
+.home-res.has-codex .res-head {
+  height: 13px;
+}
+
+.home-res.has-codex .res-bar {
+  height: 3px;
+}
+
+.home-res.has-codex .res-age {
+  flex-basis: 11px;
+  font-size: 9px;
+}
+
+.home-res.has-codex .res-sub {
+  font-size: 9px;
+}
+
 .res-row {
   display: flex;
   flex-direction: column;
@@ -2136,18 +2247,6 @@ html.vt-back::view-transition-group(*) {
   color: var(--dim-3);
 }
 
-/* The machine: a line each — what it is, how full, and the figure. */
-.res-machine {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.res-machine .res-bar {
-  flex: 1 1 0;
-  min-width: 0;
-}
-
 .res-value {
   flex: 0 0 auto;
   margin-left: auto;
@@ -2156,12 +2255,6 @@ html.vt-back::view-transition-group(*) {
   color: var(--ink-2);
   text-align: right;
   white-space: nowrap;
-}
-
-/* "100%" fits; "—" sits in the same cell. */
-.res-value.pct {
-  width: 30px;
-  margin-left: 0;
 }
 
 /* A usage figure wears its level's colour, like the leading edge of its bar. */
@@ -2337,7 +2430,7 @@ html.vt-back::view-transition-group(*) {
    stage a column of its own on the left — the island's bot stands on it, from
    layout.ts HOME_STAGE.column, so its box here is that one: the card's 1 px
    border, then 8 px of padding on top and on the left, the stage 76 × 73 —
-   and the session's words beside it. Under it the lanes, then the machine and
+   and the session's words beside it. Under it the lanes and usage
    usage side by side. The heights are layout.ts's (by way of views/home.ts);
    when the window is too short for them, the lanes and resources scroll under
    the bot's card, which stays. */
@@ -2405,38 +2498,46 @@ html.vt-back::view-transition-group(*) {
   flex-basis: 32px;
 }
 
-/* The machine on the left, Claude's usage on the right, how old it is under both. */
+/* Claude's usage and its age below it. */
+.res-title { display: flex; align-items: center; justify-content: space-between; }
 :root:is([data-dock="left"], [data-dock="right"]) .home-res {
   flex: 0 0 auto;
   height: auto;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto auto;
-  column-gap: 14px;
   row-gap: 8px;
 }
 
-:root:is([data-dock="left"], [data-dock="right"]) .home-res .res-machine {
-  grid-column: 1;
-  grid-row: 1 / span 2;
-  align-self: center;
-}
-
 :root:is([data-dock="left"], [data-dock="right"]) .home-res .lane-h {
-  grid-column: 2;
+  grid-column: 1;
   grid-row: 1;
   margin: 0;
 }
 
 :root:is([data-dock="left"], [data-dock="right"]) .home-res .res-usage {
-  grid-column: 2;
+  grid-column: 1;
   grid-row: 2;
 }
 
 :root:is([data-dock="left"], [data-dock="right"]) .home-res .res-age {
-  grid-column: 1 / span 2;
+  grid-column: 1;
   grid-row: 3;
   margin-top: 0;
+}
+
+:root:is([data-dock="left"], [data-dock="right"]) .home-res:not(.has-codex) .res-content,
+:root:is([data-dock="left"], [data-dock="right"]) .home-res:not(.has-codex) .res-provider {
+  display: contents;
+}
+
+:root:is([data-dock="left"], [data-dock="right"]) .home-res.has-codex {
+  flex: 1 1 0;
+  height: auto;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  row-gap: 0;
 }
 
 .agent:focus {
@@ -2529,6 +2630,40 @@ html.vt-back::view-transition-group(*) {
   font: 400 11px var(--font);
   color: var(--dim-2);
 }
+
+.agent-status-row { min-width: 0; }
+.agent-status-list {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.agent-status-badge {
+  min-width: 0;
+  max-width: 100%;
+  line-height: 12px;
+}
+.agent-status-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-agent-status {
+  flex: 0 0 auto;
+  flex-direction: row;
+  gap: 9px;
+  padding: 0 2px 4px;
+  border-bottom: 1px solid var(--hairline);
+}
+.home-agent-status .agent-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: 500 9px var(--font);
+  color: var(--dim-2);
+}
+.home-agent-status .agent-status-label { max-width: 125px; }
 
 /* ── Settings view (in-island) ──────────────────────────────────────────── */
 

@@ -15,6 +15,7 @@ import { ICONS } from "../views/icons";
 import type { ProjectInfo } from "../core/bridge";
 import { ShelfBackend } from "./backend";
 import { notifyShelf } from "./core";
+import { message } from "../core/i18n";
 import { widgetOn } from "./defs";
 import { frame, mini, setIcon, shared, type Widget, type WidgetContext } from "./ui";
 
@@ -109,7 +110,7 @@ export function buildProjects(ctx: WidgetContext): Widget {
   let shown: string | null = null;
   function paint() {
     const items = state.list;
-    count.textContent = `${items.length} folder${items.length === 1 ? "" : "s"}`;
+    count.textContent = message(items.length === 1 ? "{count} folder" : "{count} folders", { count: items.length });
     const key = items.map((p) => `${p.path}${p.at}${saying(p, "code") ? "c" : ""}${saying(p, "claude") ? "n" : ""}`).join("|")
       + (state.said.ok ? "" : "!");
     // The words ("5 min ago") grow old by themselves: the lines are drawn again when a minute has gone, as the rest changes.

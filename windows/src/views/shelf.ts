@@ -17,8 +17,9 @@
 
 import { Bridge } from "../core/bridge";
 import { Spring, clamp } from "../core/anim";
-import { Room, SHELF_CARD_GAP, SHELF_CARD_H, SHELF_CARD_W, sideDock } from "../core/layout";
+import { Room, SHELF_CARD_GAP, SHELF_CARD_H, SHELF_CARD_W, shelfWidth, shelfWidthChange, sideDock } from "../core/layout";
 import { State } from "../core/state";
+import { shelfTrace } from "../core/shelf-trace";
 import { BUILDERS } from "../widgets";
 import { flushWidgets, onShelfChange } from "../widgets/core";
 import { SHELF_WIDGETS, WIDGET_IDS, expandedSize, shelfWidgets, type ShelfWidgetId } from "../widgets/defs";
@@ -52,6 +53,10 @@ export interface ShelfHost extends ViewHost {
   readonly focused: ShelfWidgetId | null;
   /** The island's bar steps aside for an expanded widget. */
   readonly bare: boolean;
+  /** The same content-driven width used by islandSize and tab paging. */
+  readonly width?: number;
+  /** Number of visible mini cards, for the shared geometry calculation. */
+  readonly visibleCards: number;
   /** Back to the row, with the morph: Escape, Backspace, a swipe to the right. False when there was nothing to go back from. */
   closeWidget(): boolean;
   /** A timer ran out, a reminder is due: the widget is expanded at once, with no morph. */
@@ -171,6 +176,8 @@ export function buildShelf(actions: ViewActions): ShelfHost {
   // ── The widgets ─────────────────────────────────────────────────────────────
 
   let focus: ShelfWidgetId | null = null;
+  // Last target handed to the Island spring; State.settings is already new by sync().
+  let geometryWidth: number | null = null;
   const widgets = new Map<ShelfWidgetId, Widget>();
   const placeholders = new Map<ShelfWidgetId, HTMLElement>();
 
@@ -226,10 +233,11 @@ export function buildShelf(actions: ViewActions): ShelfHost {
   }
 
   /** The row, the order Settings says — less what `ranked` moves. */
-  function drawRow(inOrder: ShelfWidgetId[]) {
+  function drawRow(inOrder: ShelfWidgetId[]): boolean {
     const shown = ranked(inOrder);
     const next = shown.join();
-    if (next === key) return;
+    if (next === key) return false;
+    if (__NOOK_DEV_BUILD__) shelfTrace("draw-row", { previous: key, shown, visibleCount: shown.length });
     key = next;
     clear(row);
     for (const id of shown) row.append(widgets.get(id)?.small ?? placeholders.get(id)!);
@@ -237,6 +245,7 @@ export function buildShelf(actions: ViewActions): ShelfHost {
     empty.style.display = shown.length ? "none" : "";
     row.scrollTo({ left: 0, top: 0 });
     edges();
+    return true;
   }
 
   // A card dragged to another place, or a swipe: the order is Settings'. The same
@@ -288,8 +297,8 @@ export function buildShelf(actions: ViewActions): ShelfHost {
   /** What a widget changed, said while the Shelf is on show: repainted at once. Off the screen, nothing is painted. */
   onShelfChange(() => {
     if (!live) return;
-    // What a widget has to say may have changed its place in the row — never under a card being carried.
-    if (!focus && !row.classList.contains("reordering") && !row.classList.contains("dragging")) drawRow(shelfWidgets());
+    if (__NOOK_DEV_BUILD__) shelfTrace("on-shelf-change", { shown: shelfWidgets(), focused: focus });
+    // A widget repaint cannot change the visible set. Settings sync owns row structure and geometry.
     paintAll();
   });
 
@@ -383,8 +392,12 @@ export function buildShelf(actions: ViewActions): ShelfHost {
    */
   function go(change: () => void, id: ShelfWidgetId, open: boolean) {
     const widget = widgets.get(id);
-    if (widget && actions.morph(change, morphNames(widget, open), open)) return;
-    change();
+    const apply = () => {
+      change();
+      geometryWidth = focus ? expandedSize(focus).w : shelfWidth(shelfWidgets().length);
+    };
+    if (widget && actions.morph(apply, morphNames(widget, open), open)) return;
+    apply();
     actions.resized(!open);
   }
 
@@ -421,8 +434,11 @@ export function buildShelf(actions: ViewActions): ShelfHost {
     get bare() {
       return focus != null;
     },
+    get visibleCards() {
+      return shelfWidgets().length;
+    },
     get width() {
-      return focus ? expandedSize(focus).w : undefined;
+      return focus ? expandedSize(focus).w : shelfWidth(shelfWidgets().length);
     },
     get height() {
       return focus ? expandedSize(focus).h : undefined;
@@ -430,14 +446,29 @@ export function buildShelf(actions: ViewActions): ShelfHost {
 
     sync() {
       const shown = shelfWidgets();
+      const wasFocused = focus;
       // Switched off in Settings while it was expanded: back to the row.
       if (focus && !shown.includes(focus)) {
         widgets.get(focus)?.stop?.("switched off");
         focus = null;
       }
-      drawRow(shown);
-      render();
-      paintAll();
+      const rowChanged = drawRow(shown);
+      if (rowChanged || wasFocused !== focus) {
+        render();
+        paintAll();
+      }
+      const widthAfter = focus ? expandedSize(focus).w : shelfWidth(shown.length);
+      const widthChange = shelfWidthChange(geometryWidth, widthAfter);
+      if (__NOOK_DEV_BUILD__) shelfTrace("sync", {
+        shown,
+        focused: focus,
+        previousWidth: geometryWidth,
+        nextWidth: widthAfter,
+        change: widthChange,
+        rowChanged,
+      });
+      if (widthChange) actions.resized(widthChange === "shrink");
+      geometryWidth = widthAfter;
     },
 
     closeWidget,
@@ -445,6 +476,7 @@ export function buildShelf(actions: ViewActions): ShelfHost {
     showWidget(id) {
       if (!widgets.has(id)) return;
       focus = id;
+      geometryWidth = expandedSize(id).w;
       render();
       paintAll();
     },

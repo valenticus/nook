@@ -45,7 +45,11 @@ const MAX_DIGITS: usize = 7;
 /// One `:digits` taken off the end of a path, if it ends on one.
 fn strip_number(text: &str) -> Option<(&str, u32)> {
     let (rest, digits) = text.rsplit_once(':')?;
-    if rest.is_empty() || digits.is_empty() || digits.len() > MAX_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if rest.is_empty()
+        || digits.is_empty()
+        || digits.len() > MAX_DIGITS
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     Some((rest, digits.parse().ok()?))
@@ -54,7 +58,9 @@ fn strip_number(text: &str) -> Option<(&str, u32)> {
 /// A path as a reply writes it, with where in the file it points: `path`,
 /// `path:line` or `path:line:col`. A drive's own `:` is never read as one.
 pub fn split_position(text: &str) -> (&str, Option<u32>, Option<u32>) {
-    let Some((rest, last)) = strip_number(text) else { return (text, None, None) };
+    let Some((rest, last)) = strip_number(text) else {
+        return (text, None, None);
+    };
     match strip_number(rest) {
         Some((path, line)) => (path, Some(line), Some(last)),
         None => (rest, Some(last), None),
@@ -75,7 +81,10 @@ fn well_formed(path: &str) -> bool {
         let drive = two.len() == 2 && two[0].is_ascii_alphabetic() && two[1] == ':';
         let after = if drive { &path[2..] } else { path };
         // `C:\…` or nothing with a colon; and never from the root of no drive in particular.
-        if after.contains(':') || (drive && !after.starts_with(['\\', '/'])) || (!drive && path.starts_with(['\\', '/'])) {
+        if after.contains(':')
+            || (drive && !after.starts_with(['\\', '/']))
+            || (!drive && path.starts_with(['\\', '/']))
+        {
             return false;
         }
     }
@@ -92,7 +101,9 @@ fn on_a_drive(canonical: &Path) -> Option<PathBuf> {
             // `\\?\C:\…` is the same file as `C:\…`, which is how everything else writes it.
             canonical.to_str()?.strip_prefix(r"\\?\").map(PathBuf::from)
         }
-        Component::Prefix(prefix) if matches!(prefix.kind(), Prefix::Disk(_)) => Some(canonical.to_path_buf()),
+        Component::Prefix(prefix) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+            Some(canonical.to_path_buf())
+        }
         _ => None,
     }
 }
@@ -173,11 +184,19 @@ mod tests {
 
     impl Sandbox {
         fn new() -> Self {
-            let name = format!("nook-openfile-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed));
+            let name = format!(
+                "nook-openfile-{}-{}",
+                std::process::id(),
+                COUNT.fetch_add(1, Ordering::Relaxed)
+            );
             let root = std::env::temp_dir().join(name);
             fs::create_dir_all(root.join("project").join("src")).unwrap();
             fs::create_dir_all(root.join("project").join("docs")).unwrap();
-            fs::write(root.join("project").join("src").join("main.rs"), "fn main() {}\n").unwrap();
+            fs::write(
+                root.join("project").join("src").join("main.rs"),
+                "fn main() {}\n",
+            )
+            .unwrap();
             fs::write(root.join("project").join("README.md"), "# Project\n").unwrap();
             fs::write(root.join("outside.txt"), "outside\n").unwrap();
             // As `resolve` gives paths back: whole, with no `\\?\` before the drive.
@@ -203,17 +222,35 @@ mod tests {
     #[test]
     fn a_position_is_read_off_the_end_of_a_path() {
         assert_eq!(split_position("src/main.rs"), ("src/main.rs", None, None));
-        assert_eq!(split_position("src/main.rs:12"), ("src/main.rs", Some(12), None));
-        assert_eq!(split_position("src/main.rs:12:5"), ("src/main.rs", Some(12), Some(5)));
+        assert_eq!(
+            split_position("src/main.rs:12"),
+            ("src/main.rs", Some(12), None)
+        );
+        assert_eq!(
+            split_position("src/main.rs:12:5"),
+            ("src/main.rs", Some(12), Some(5))
+        );
         // A drive's colon is not a position, with or without one after it.
-        assert_eq!(split_position(r"C:\work\a.rs"), (r"C:\work\a.rs", None, None));
-        assert_eq!(split_position(r"C:\work\a.rs:7"), (r"C:\work\a.rs", Some(7), None));
-        assert_eq!(split_position(r"C:\work\a.rs:7:3"), (r"C:\work\a.rs", Some(7), Some(3)));
+        assert_eq!(
+            split_position(r"C:\work\a.rs"),
+            (r"C:\work\a.rs", None, None)
+        );
+        assert_eq!(
+            split_position(r"C:\work\a.rs:7"),
+            (r"C:\work\a.rs", Some(7), None)
+        );
+        assert_eq!(
+            split_position(r"C:\work\a.rs:7:3"),
+            (r"C:\work\a.rs", Some(7), Some(3))
+        );
         // Not numbers, too long to be one, or nothing before them: left as they are.
         assert_eq!(split_position("a.rs:"), ("a.rs:", None, None));
         assert_eq!(split_position("a.rs:x"), ("a.rs:x", None, None));
         assert_eq!(split_position("a.rs:-3"), ("a.rs:-3", None, None));
-        assert_eq!(split_position("a.rs:12345678"), ("a.rs:12345678", None, None));
+        assert_eq!(
+            split_position("a.rs:12345678"),
+            ("a.rs:12345678", None, None)
+        );
         assert_eq!(split_position(":12"), (":12", None, None));
         assert_eq!(split_position(""), ("", None, None));
         // Only the last two: a third number stays in the path, which then names no file.
@@ -227,7 +264,10 @@ mod tests {
         assert_eq!(sandbox.open("src/main.rs"), Some(main.clone()));
         assert_eq!(sandbox.open("./src/main.rs"), Some(main.clone()));
         assert_eq!(sandbox.open("  src/main.rs  "), Some(main.clone()));
-        assert_eq!(sandbox.open("README.md"), Some(sandbox.root.join("project").join("README.md")));
+        assert_eq!(
+            sandbox.open("README.md"),
+            Some(sandbox.root.join("project").join("README.md"))
+        );
         if cfg!(windows) {
             assert_eq!(sandbox.open(r"src\main.rs"), Some(main.clone()));
         }
@@ -236,7 +276,13 @@ mod tests {
         // Relative to nothing, it names nothing: no folder recorded, an empty one, one that is not there, one that is not absolute.
         assert_eq!(resolve(None, "src/main.rs"), None);
         assert_eq!(resolve(Some(""), "src/main.rs"), None);
-        assert_eq!(resolve(Some(&sandbox.root.join("gone").to_string_lossy()), "src/main.rs"), None);
+        assert_eq!(
+            resolve(
+                Some(&sandbox.root.join("gone").to_string_lossy()),
+                "src/main.rs"
+            ),
+            None
+        );
         assert_eq!(resolve(Some("project"), "src/main.rs"), None);
     }
 
@@ -245,17 +291,29 @@ mod tests {
         let sandbox = Sandbox::new();
         let outside = sandbox.root.join("outside.txt");
         // Outside the session's folder, and with no folder known at all.
-        assert_eq!(sandbox.open(&outside.to_string_lossy()), Some(outside.clone()));
-        assert_eq!(resolve(None, &outside.to_string_lossy()), Some(outside.clone()));
+        assert_eq!(
+            sandbox.open(&outside.to_string_lossy()),
+            Some(outside.clone())
+        );
+        assert_eq!(
+            resolve(None, &outside.to_string_lossy()),
+            Some(outside.clone())
+        );
         if cfg!(windows) {
             // Forward slashes are the same path.
-            assert_eq!(resolve(None, &outside.to_string_lossy().replace('\\', "/")), Some(outside.clone()));
+            assert_eq!(
+                resolve(None, &outside.to_string_lossy().replace('\\', "/")),
+                Some(outside.clone())
+            );
         }
         // `..` may lead out of the session's folder: the rule is that the file exists, not where it is.
         assert_eq!(sandbox.open("../outside.txt"), Some(outside.clone()));
         assert_eq!(sandbox.open("src/../../outside.txt"), Some(outside));
         // …and back in: the path handed on is the real one, with no `..` left in it.
-        assert_eq!(sandbox.open("docs/../src/main.rs"), Some(sandbox.root.join("project").join("src").join("main.rs")));
+        assert_eq!(
+            sandbox.open("docs/../src/main.rs"),
+            Some(sandbox.root.join("project").join("src").join("main.rs"))
+        );
     }
 
     #[test]
@@ -267,10 +325,19 @@ mod tests {
         }
         assert_eq!(resolve(None, &sandbox.cwd()), None);
         // Nothing by that name.
-        for missing in ["src/gone.rs", "gone/main.rs", "main.rs", "../project/gone.txt", "README.md.bak"] {
+        for missing in [
+            "src/gone.rs",
+            "gone/main.rs",
+            "main.rs",
+            "../project/gone.txt",
+            "README.md.bak",
+        ] {
             assert_eq!(sandbox.open(missing), None, "{missing} does not exist");
         }
-        assert_eq!(resolve(None, &sandbox.root.join("gone.txt").to_string_lossy()), None);
+        assert_eq!(
+            resolve(None, &sandbox.root.join("gone.txt").to_string_lossy()),
+            None
+        );
         // A position still on the path names no file: it is taken off before, by `split_position`.
         assert_eq!(sandbox.open("src/main.rs:12"), None);
     }
@@ -280,21 +347,51 @@ mod tests {
         let sandbox = Sandbox::new();
         let long = "a/".repeat(MAX_CHARS);
         for weird in [
-            "", "   ", "\n", "src/main.rs\n--wait", "src/\u{0}main.rs", long.as_str(),
+            "",
+            "   ",
+            "\n",
+            "src/main.rs\n--wait",
+            "src/\u{0}main.rs",
+            long.as_str(),
             // Shares, devices and verbatim paths are never asked for.
-            r"\\server\share\file.txt", "//server/share/file.txt", r"\\?\C:\Windows\win.ini", r"\\.\NUL", r"\\.\PhysicalDrive0",
+            r"\\server\share\file.txt",
+            "//server/share/file.txt",
+            r"\\?\C:\Windows\win.ini",
+            r"\\.\NUL",
+            r"\\.\PhysicalDrive0",
             // Not paths at all.
-            "https://example.com/a.rs", "file:///C:/Windows/win.ini", "--goto", "-n", "*.rs", "src/*.rs", "$(calc)", "%COMSPEC%", "a & calc", "| calc",
+            "https://example.com/a.rs",
+            "file:///C:/Windows/win.ini",
+            "--goto",
+            "-n",
+            "*.rs",
+            "src/*.rs",
+            "$(calc)",
+            "%COMSPEC%",
+            "a & calc",
+            "| calc",
         ] {
             assert_eq!(sandbox.open(weird), None, "{weird:?} must be refused");
         }
         if cfg!(windows) {
-            let outside = sandbox.root.join("outside.txt").to_string_lossy().into_owned();
+            let outside = sandbox
+                .root
+                .join("outside.txt")
+                .to_string_lossy()
+                .into_owned();
             for weird in [
                 // A device, wherever it is said to be.
-                "NUL", "CON", "COM1", "src/NUL", "nul.txt",
+                "NUL",
+                "CON",
+                "COM1",
+                "src/NUL",
+                "nul.txt",
                 // A drive's own folder, a stream of a file, the root of no drive in particular.
-                "C:outside.txt", "README.md:stream", "README.md::$DATA", r"\Windows\win.ini", "/Windows/win.ini",
+                "C:outside.txt",
+                "README.md:stream",
+                "README.md::$DATA",
+                r"\Windows\win.ini",
+                "/Windows/win.ini",
             ] {
                 assert_eq!(sandbox.open(weird), None, "{weird:?} must be refused");
             }
@@ -307,21 +404,58 @@ mod tests {
     #[test]
     fn asking_whether_files_exist_is_the_opening_rule_and_says_only_yes_or_no() {
         let sandbox = Sandbox::new();
-        let ask = |paths: &[&str]| exist(Some(&sandbox.cwd()), &paths.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        let ask = |paths: &[&str]| {
+            exist(
+                Some(&sandbox.cwd()),
+                &paths.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            )
+        };
         // A bare name is a file of the session's folder, or it is not: `node.js` is a name, not a file.
-        assert_eq!(ask(&["README.md", "node.js", "main.rs", "src/main.rs", "README.md:12"]), [true, false, false, true, true]);
+        assert_eq!(
+            ask(&[
+                "README.md",
+                "node.js",
+                "main.rs",
+                "src/main.rs",
+                "README.md:12"
+            ]),
+            [true, false, false, true, true]
+        );
         // What opening refuses is "no" here too: a folder, a share, a stream, a device, nothing.
-        assert_eq!(ask(&["docs", "src", "", "//server/share/a.txt", "README.md:stream", "NUL", "..", "missing.ts"]), [false; 8]);
+        assert_eq!(
+            ask(&[
+                "docs",
+                "src",
+                "",
+                "//server/share/a.txt",
+                "README.md:stream",
+                "NUL",
+                "..",
+                "missing.ts"
+            ]),
+            [false; 8]
+        );
         // And what opening allows is "yes": out of the folder, by `..` or by a full path.
-        let outside = sandbox.root.join("outside.txt").to_string_lossy().into_owned();
+        let outside = sandbox
+            .root
+            .join("outside.txt")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(ask(&["../outside.txt", &outside]), [true, true]);
         // No folder recorded for the session: a relative name cannot be looked up.
-        assert_eq!(exist(None, &["README.md".to_string(), outside.clone()]), [false, true]);
+        assert_eq!(
+            exist(None, &["README.md".to_string(), outside.clone()]),
+            [false, true]
+        );
         // One question looks at twenty paths: the rest are told no, file or not.
-        let many: Vec<String> = (0..MAX_CHECKS + 5).map(|_| "README.md".to_string()).collect();
+        let many: Vec<String> = (0..MAX_CHECKS + 5)
+            .map(|_| "README.md".to_string())
+            .collect();
         let said = exist(Some(&sandbox.cwd()), &many);
         assert_eq!(said.len(), many.len());
-        assert!(said[..MAX_CHECKS].iter().all(|yes| *yes) && said[MAX_CHECKS..].iter().all(|yes| !*yes));
+        assert!(
+            said[..MAX_CHECKS].iter().all(|yes| *yes) && said[MAX_CHECKS..].iter().all(|yes| !*yes)
+        );
         assert_eq!(exist(Some(&sandbox.cwd()), &[]), Vec::<bool>::new());
     }
 
@@ -330,8 +464,14 @@ mod tests {
         let file = Path::new("work").join("a b & c.rs");
         let plain = file.to_string_lossy().into_owned();
         assert_eq!(goto_argument(&file, None, None), OsString::from(&plain));
-        assert_eq!(goto_argument(&file, Some(12), None), OsString::from(format!("{plain}:12")));
-        assert_eq!(goto_argument(&file, Some(12), Some(5)), OsString::from(format!("{plain}:12:5")));
+        assert_eq!(
+            goto_argument(&file, Some(12), None),
+            OsString::from(format!("{plain}:12"))
+        );
+        assert_eq!(
+            goto_argument(&file, Some(12), Some(5)),
+            OsString::from(format!("{plain}:12:5"))
+        );
         // A column with no line means nothing.
         assert_eq!(goto_argument(&file, None, Some(5)), OsString::from(&plain));
     }

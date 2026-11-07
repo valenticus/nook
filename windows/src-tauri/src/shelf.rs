@@ -41,7 +41,10 @@ fn path() -> PathBuf {
 
 /// The file as it is, or nothing: a missing or damaged file is an empty shelf, not an error.
 fn read(file: &Path) -> Map<String, Value> {
-    match std::fs::read(file).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
+    match std::fs::read(file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    {
         Some(Value::Object(map)) => map,
         _ => Map::new(),
     }
@@ -52,7 +55,8 @@ fn write(file: &Path, map: &Map<String, Value>) -> std::io::Result<()> {
     if let Some(dir) = file.parent() {
         crate::platform::ensure_private_dir(dir)?;
     }
-    let json = serde_json::to_vec_pretty(map).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_vec_pretty(map)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let temp = file.with_extension("json.tmp");
     std::fs::write(&temp, json)?;
     std::fs::rename(&temp, file).inspect_err(|_| {
@@ -77,7 +81,9 @@ pub fn capped(widget: &str, value: &Value) -> Result<Value, String> {
         "reminders" => value = cap_reminders(&value),
         _ => {}
     }
-    let size = serde_json::to_vec(&value).map(|b| b.len()).unwrap_or(usize::MAX);
+    let size = serde_json::to_vec(&value)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
     if size > MAX_BYTES {
         return Err(format!("`{widget}` is too big to keep"));
     }
@@ -85,16 +91,26 @@ pub fn capped(widget: &str, value: &Value) -> Result<Value, String> {
 }
 
 fn cap_todo(value: &mut Value) {
-    let Some(object) = value.as_object_mut() else { return };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
     if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
         items.truncate(MAX_TODO_ITEMS);
         for item in items.iter_mut() {
-            if let Some(text) = item.get("text").and_then(Value::as_str).map(|t| cut(t, MAX_ITEM_CHARS)) {
+            if let Some(text) = item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|t| cut(t, MAX_ITEM_CHARS))
+            {
                 item["text"] = Value::String(text);
             }
         }
     }
-    if let Some(notes) = object.get("notes").and_then(Value::as_str).map(|n| cut(n, MAX_NOTES_CHARS)) {
+    if let Some(notes) = object
+        .get("notes")
+        .and_then(Value::as_str)
+        .map(|n| cut(n, MAX_NOTES_CHARS))
+    {
         object.insert("notes".into(), Value::String(notes));
     }
 }
@@ -102,7 +118,11 @@ fn cap_todo(value: &mut Value) {
 /// The timer as it is kept: its five fields and nothing else, the numbers whole and within range.
 fn cap_timer(value: &Value) -> Value {
     let number = |key: &str, max: f64| {
-        let n = value.get(key).and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0);
+        let n = value
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite())
+            .unwrap_or(0.0);
         Value::from(n.clamp(0.0, max).round() as i64)
     };
     let flag = |key: &str| Value::Bool(value.get(key).and_then(Value::as_bool).unwrap_or(false));
@@ -120,9 +140,18 @@ fn cap_reminders(value: &Value) -> Value {
     let items: Vec<Value> = value
         .get("items")
         .and_then(Value::as_array)
-        .map(|all| all.iter().filter_map(cap_reminder).take(MAX_REMINDERS).collect())
+        .map(|all| {
+            all.iter()
+                .filter_map(cap_reminder)
+                .take(MAX_REMINDERS)
+                .collect()
+        })
         .unwrap_or_default();
-    let next_id = value.get("nextId").and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(1.0);
+    let next_id = value
+        .get("nextId")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
+        .unwrap_or(1.0);
     let mut kept = Map::new();
     kept.insert("items".into(), Value::Array(items));
     kept.insert("nextId".into(), Value::from(next_id.clamp(1.0, 1e9) as i64));
@@ -134,7 +163,14 @@ fn cap_reminder(item: &Value) -> Option<Value> {
     if text.trim().is_empty() {
         return None;
     }
-    let number = |key: &str, max: f64| item.get(key).and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0).clamp(0.0, max).round() as i64;
+    let number = |key: &str, max: f64| {
+        item.get(key)
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, max)
+            .round() as i64
+    };
     let flag = |key: &str| item.get(key).and_then(Value::as_bool).unwrap_or(false);
     let mut kept = Map::new();
     kept.insert("id".into(), Value::from(number("id", 1e9)));
@@ -158,7 +194,9 @@ impl Store {
     }
 
     pub fn get(&self, widget: &str) -> Value {
-        self.with(&path(), |map| map.get(widget).cloned().unwrap_or(Value::Null))
+        self.with(&path(), |map| {
+            map.get(widget).cloned().unwrap_or(Value::Null)
+        })
     }
 
     /// Nook's own write of a widget's part (the project folders): not held to `WRITABLE`.
@@ -209,7 +247,8 @@ mod tests {
     fn what_is_saved_is_read_back() {
         let file = scratch("round");
         let store = Store::default();
-        let todo = json!({"items": [{"id": 1, "text": "Buy milk", "done": false}], "notes": "a\nb"});
+        let todo =
+            json!({"items": [{"id": 1, "text": "Buy milk", "done": false}], "notes": "a\nb"});
         store.put_in(&file, "todo", todo.clone()).unwrap();
         // Another store, as after a restart: from the disk alone.
         let again = Store::default();
@@ -222,7 +261,9 @@ mod tests {
     fn a_save_leaves_no_temporary_file_and_keeps_the_other_widgets() {
         let file = scratch("temp");
         let store = Store::default();
-        store.put_in(&file, "projects", json!({"recent": []})).unwrap();
+        store
+            .put_in(&file, "projects", json!({"recent": []}))
+            .unwrap();
         store.put_in(&file, "todo", json!({"items": []})).unwrap();
         assert!(!file.with_extension("json.tmp").exists());
         let on_disk = read(&file);
@@ -257,16 +298,25 @@ mod tests {
         let kept = capped("todo", &json!({"items": items, "notes": notes})).unwrap();
         let kept_items = kept["items"].as_array().unwrap();
         assert_eq!(kept_items.len(), MAX_TODO_ITEMS);
-        assert_eq!(kept_items[0]["text"].as_str().unwrap().chars().count(), MAX_ITEM_CHARS);
-        assert_eq!(kept["notes"].as_str().unwrap().chars().count(), MAX_NOTES_CHARS);
+        assert_eq!(
+            kept_items[0]["text"].as_str().unwrap().chars().count(),
+            MAX_ITEM_CHARS
+        );
+        assert_eq!(
+            kept["notes"].as_str().unwrap().chars().count(),
+            MAX_NOTES_CHARS
+        );
     }
 
     #[test]
     fn the_timer_keeps_its_five_fields_within_range() {
-        let kept = capped("timer", &json!({
-            "durationMs": 9_999_999_999.0, "remainingMs": -5, "endsAt": 1_700_000_000_000_i64,
-            "running": true, "done": "yes", "extra": "x".repeat(1000),
-        }))
+        let kept = capped(
+            "timer",
+            &json!({
+                "durationMs": 9_999_999_999.0, "remainingMs": -5, "endsAt": 1_700_000_000_000_i64,
+                "running": true, "done": "yes", "extra": "x".repeat(1000),
+            }),
+        )
         .unwrap();
         assert_eq!(kept["durationMs"], json!(MAX_TIMER_MS as i64));
         assert_eq!(kept["remainingMs"], json!(0));
@@ -275,7 +325,10 @@ mod tests {
         assert_eq!(kept["done"], json!(false));
         assert_eq!(kept.as_object().unwrap().len(), 5);
         // Not an object at all: all zeros and no flags, never an error.
-        assert_eq!(capped("timer", &json!("junk")).unwrap()["running"], json!(false));
+        assert_eq!(
+            capped("timer", &json!("junk")).unwrap()["running"],
+            json!(false)
+        );
     }
 
     #[test]
@@ -288,10 +341,16 @@ mod tests {
         let kept = capped("reminders", &json!({"items": items, "nextId": 5})).unwrap();
         let kept_items = kept["items"].as_array().unwrap();
         assert_eq!(kept_items.len(), MAX_REMINDERS);
-        assert_eq!(kept_items[0]["text"].as_str().unwrap().chars().count(), MAX_ITEM_CHARS);
+        assert_eq!(
+            kept_items[0]["text"].as_str().unwrap().chars().count(),
+            MAX_ITEM_CHARS
+        );
         assert_eq!(kept_items[0].as_object().unwrap().len(), 6);
         assert_eq!(kept["nextId"], json!(5));
-        assert_eq!(capped("reminders", &json!(null)).unwrap()["items"], json!([]));
+        assert_eq!(
+            capped("reminders", &json!(null)).unwrap()["items"],
+            json!([])
+        );
     }
 
     #[test]

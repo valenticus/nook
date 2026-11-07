@@ -1,5 +1,7 @@
 // Minimal DOM helpers — no framework, as specified.
 
+import { shelfTrace } from "../core/shelf-trace";
+
 type Attrs = Record<string, string | number | boolean | EventListener | undefined>;
 type Child = Node | string | null | undefined | false;
 
@@ -13,8 +15,29 @@ export function h<K extends keyof HTMLElementTagNameMap>(
     if (v == null || v === false) continue;
     if (k === "class") el.className = String(v);
     else if (k === "text") el.textContent = String(v);
+    else if (k === "data-nook-action") {
+      if (__NOOK_DEV_BUILD__) el.setAttribute(k, String(v));
+    }
     else if (k.startsWith("on") && typeof v === "function") {
-      el.addEventListener(k.slice(2).toLowerCase(), v as EventListener);
+      const type = k.slice(2).toLowerCase();
+      const listener = type === "click" && __NOOK_DEV_BUILD__
+        ? (event: Event) => {
+            if (!el.closest("#island")) {
+              (v as EventListener).call(el, event);
+              return;
+            }
+            const action = el.dataset.nookAction;
+            const classes = [...el.classList].slice(0, 2).join(".").replace(/[^a-zA-Z0-9_.-]/g, "");
+            const label = action ?? `${el.tagName.toLowerCase()}.${classes || "unmarked"}`;
+            shelfTrace("ui-handler", { source: `start.click.${label}`, mutationType: "handler" });
+            try {
+              (v as EventListener).call(el, event);
+            } finally {
+              shelfTrace("ui-handler", { source: `end.click.${label}`, mutationType: "handler" });
+            }
+          }
+        : v as EventListener;
+      el.addEventListener(type, listener);
     } else if (k === "style") el.setAttribute("style", String(v));
     else el.setAttribute(k, v === true ? "" : String(v));
   }
@@ -48,6 +71,50 @@ export function svg(path: string, size = 14, opts: { fill?: string; stroke?: num
 
 export function clear(el: Element) {
   while (el.firstChild) el.removeChild(el.firstChild);
+}
+
+/** Write text only when its rendered value changes; avoids needless text-node replacement. */
+export function setTextIfChanged(el: Node, value: string): boolean {
+  if (el.textContent === value) return false;
+  el.textContent = value;
+  return true;
+}
+
+/** Reflect an attribute only when the rendered value changes. */
+export function setAttributeIfChanged(el: Element, name: string, value: string): boolean {
+  if (el.getAttribute(name) === value) return false;
+  el.setAttribute(name, value);
+  return true;
+}
+
+export function removeAttributeIfPresent(el: Element, name: string): boolean {
+  if (!el.hasAttribute(name)) return false;
+  el.removeAttribute(name);
+  return true;
+}
+
+export function setHiddenIfChanged(el: HTMLElement, hidden: boolean): boolean {
+  if (el.hidden === hidden) return false;
+  el.hidden = hidden;
+  return true;
+}
+
+export function setStylePropertyIfChanged(el: HTMLElement, name: string, value: string): boolean {
+  if (el.style.getPropertyValue(name) === value) return false;
+  el.style.setProperty(name, value);
+  return true;
+}
+
+export function removeStylePropertyIfPresent(el: HTMLElement, name: string): boolean {
+  if (!el.style.getPropertyValue(name)) return false;
+  el.style.removeProperty(name);
+  return true;
+}
+
+export function setStyleValueIfChanged(el: HTMLElement, name: keyof CSSStyleDeclaration & string, value: string): boolean {
+  if (el.style[name] === value) return false;
+  (el.style[name] as string) = value;
+  return true;
 }
 
 /** Card dot used in every "who" row. */

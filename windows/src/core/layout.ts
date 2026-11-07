@@ -12,6 +12,7 @@ export type IslandViewName =
   | "error"
   | "finished"
   | "confused"
+  | "battery"
   | "settings"
   | "greeting"
   | "session"
@@ -133,12 +134,31 @@ export const EXPANDED_W = 640;
 export const COMPACT_PAD = 12;
 export const COMPACT_SLOT_GAP = 10;
 export const COMPACT_BOT_SLOT = 34;
+/** Fixed Idle clock and battery slots keep changing text from shifting the Island. */
+export const IDLE_CLOCK_W = 64;
+export const IDLE_CLOCK_BATTERY_GAP = 8;
+export const IDLE_BATTERY_GROUP_W = 66;
+export const IDLE_SIDE_CLOCK_H = 20;
+export const IDLE_SIDE_BATTERY_H = 42;
+export const IDLE_SIDE_GROUP_GAP = 5;
 /** The bot in its slot: its diameter (`botPosition`). */
 export const COMPACT_BOT = 26;
 export const COMPACT_DOT = 9;
 export const COMPACT_DOT_GAP = 6;
 export const COMPACT_MORE_W = 24;
 export const COMPACT_METRIC_GAP = 8;
+/** Fixed icon-to-reading spacing and cell widths for stable centered metric groups. */
+export const COMPACT_READING_GAP = 5;
+export const COMPACT_USAGE_CELL_W = 52;
+export const COMPACT_WAITING_CELL_W = 34;
+/** Compact Island shows at most four session dots before folding the rest into +N. */
+export const COMPACT_MAX_VISIBLE = 4;
+/** Fixed inline agent-icon slot; its square SVG is 16 px in both dock orientations. */
+export const COMPACT_AGENT_ICON_SIZE = 16;
+export const COMPACT_AGENT_ICON_W = COMPACT_AGENT_ICON_SIZE;
+export const COMPACT_AGENT_ICON_H = COMPACT_AGENT_ICON_SIZE;
+/** Preserve the previous 10 px side-dock advance; the icon uses the existing gap. */
+export const COMPACT_AGENT_SIDE_ADVANCE = 10;
 /** Sessions on show — dots here, mini bots on the home view — before the rest fold into "+N". */
 export const MAX_VISIBLE = 6;
 /** It is never wider than this, ears included… */
@@ -203,13 +223,14 @@ export interface CompactLayout {
 
 /**
  * What of the folded island fits under `cap`, for this many sessions and metric
- * cells of these widths. Short of room, the last metric goes first, then dots
+ * cells of these widths. `agentMarkBefore` inserts a fixed-size provider mark
+ * before that metric without changing either usage cell. Short of room, the last metric goes first, then dots
  * fold into "+N": the bot and a way to the sessions always stay. On a side the
  * same slots are stacked, and it is the column's length that is capped: a cell
  * is COMPACT_CELL_H tall whatever its width in the row, "+N" COMPACT_MORE_H.
  */
 export function compactLayout(
-  sessions: number, metricWidths: readonly number[], dock: Dock = Room.dock, cap = compactCap(dock),
+  sessions: number, metricWidths: readonly number[], dock: Dock = Room.dock, cap = compactCap(dock), agentMarkBefore = -1,
 ): CompactLayout {
   const side = sideDock(dock);
   const dotsLength = (dots: number) => {
@@ -218,15 +239,19 @@ export function compactLayout(
     const cells = dots + (more ? 1 : 0);
     return dots * COMPACT_DOT + more + Math.max(0, cells - 1) * COMPACT_DOT_GAP;
   };
-  const metricsLength = (count: number) =>
-    metricWidths.slice(0, count).reduce((w, m) => w + (side ? COMPACT_CELL_H : m), 0) +
-    Math.max(0, count - 1) * COMPACT_METRIC_GAP;
+  const metricsLength = (count: number) => {
+    const hasAgentMark = agentMarkBefore >= 0 && agentMarkBefore < count;
+    const slots = count + (hasAgentMark ? 1 : 0);
+    return metricWidths.slice(0, count).reduce((w, m) => w + (side ? COMPACT_CELL_H : m), 0) +
+      (hasAgentMark ? (side ? COMPACT_AGENT_SIDE_ADVANCE : COMPACT_AGENT_ICON_W) : 0) +
+      Math.max(0, slots - 1) * COMPACT_METRIC_GAP;
+  };
   const body = (dots: number, count: number) => {
     const d = dotsLength(dots);
     const m = metricsLength(count);
     return COMPACT_PAD + COMPACT_BOT_SLOT + (d ? COMPACT_SLOT_GAP + d : 0) + (m ? COMPACT_SLOT_GAP + m : 0) + COMPACT_PAD;
   };
-  let dots = Math.min(MAX_VISIBLE, sessions);
+  let dots = Math.min(COMPACT_MAX_VISIBLE, sessions);
   let metrics = metricWidths.length;
   while (metrics > 0 && body(dots, metrics) + 2 * EAR_COMPACT > cap) metrics--;
   while (dots > 0 && body(dots, metrics) + 2 * EAR_COMPACT > cap) dots--;
@@ -324,18 +349,26 @@ const HOME_SEAT = botOnStage(HOME_STAGE.row, HOME_BOT);
 export const SHELF_H = 212;
 export const SHELF_CARD_W = 200;
 export const SHELF_CARD_GAP = 10;
-/** The row's inner width: four whole cards and a sliver of the fifth, so the row reads as one that goes on. */
-const SHELF_VISIBLE_CARDS = 4;
-const SHELF_PEEK = 12;
-/** The island's side padding (style.css `#content`). */
-const ISLAND_SIDE_PAD = 10;
-/** The Shelf's width at its widest: wider than Home, so that its cards are not cut. */
-export const SHELF_W =
-  SHELF_VISIBLE_CARDS * (SHELF_CARD_W + SHELF_CARD_GAP) + SHELF_PEEK + 2 * ISLAND_SIDE_PAD;
+/** The #content horizontal padding (style.css): the row sits inside it. */
+export const SHELF_SIDE_PAD = 10;
+/** Minimum outer width: one full card plus the row's shell padding. */
+export const SHELF_MIN_W = SHELF_CARD_W + 2 * SHELF_SIDE_PAD;
+/** The largest natural row: every current Shelf widget, with gaps and shell padding. */
+const WIDGET_COUNT = 6;
+export const SHELF_W = WIDGET_COUNT * SHELF_CARD_W + (WIDGET_COUNT - 1) * SHELF_CARD_GAP + 2 * SHELF_SIDE_PAD;
 
-/** The Shelf's width on this display, at the top or bottom: as wide as the window has room for, never narrower than Home. */
-export function shelfWidth(): number {
-  return Math.max(EXPANDED_W, Math.min(SHELF_W, Room.w - OVERSHOOT_W));
+/** Natural width for the visible cards, capped to the room left for island spring overshoot. */
+export function shelfWidth(visibleCards = WIDGET_COUNT): number {
+  const count = Math.max(0, Math.floor(visibleCards));
+  const content = count * SHELF_CARD_W + Math.max(0, count - 1) * SHELF_CARD_GAP;
+  const desired = Math.max(SHELF_MIN_W, content + 2 * SHELF_SIDE_PAD);
+  return Math.min(desired, Math.max(SHELF_MIN_W, Room.w - OVERSHOOT_W));
+}
+
+/** Whether a new Shelf target differs from the last target sent to the spring. */
+export function shelfWidthChange(previous: number | null, next: number): "grow" | "shrink" | null {
+  if (previous == null || Math.abs(previous - next) < 0.5) return null;
+  return next < previous ? "shrink" : "grow";
 }
 
 /** How far a tab's view travels sideways as it gives way to the other, and the bot with it. */
@@ -353,6 +386,7 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   error: { height: 160, botX: 62, botY: null, botDiameter: 58, agentMode: "column" },
   finished: { height: 160, botX: 62, botY: null, botDiameter: 58, agentMode: "column" },
   confused: { height: 160, botX: 76, botY: null, botDiameter: 66, agentMode: "column" },
+  battery: { height: 160, botX: 62, botY: null, botDiameter: 56, agentMode: "column" },
   settings: { height: 160, botX: 54, botY: null, botDiameter: 46, agentMode: "none" },
   greeting: { height: 150, botX: 320, botY: 90, botDiameter: 0, agentMode: "none" },
   // Windows only, no macOS counterpart yet: what a Claude Code session did —
@@ -467,9 +501,16 @@ export function homeSize(dock: Dock = Room.dock): { w: number; h: number } {
   return { w: Math.min(SIDE_W, room.w), h: Math.min(HOME_SIDE_H, room.h) };
 }
 
+/** The Home view's fixed inner box, which is clipped by the Island while its outer spring grows. */
+export function homeContentSize(dock: Dock = Room.dock): { width: number; height: number } {
+  const target = homeSize(dock);
+  // #content has 10 px horizontal insets and 8/10 px vertical insets plus the 34 px header.
+  return { width: Math.max(0, target.w - 20), height: Math.max(0, target.h - 52) };
+}
+
 /** The Shelf's size on this dock: its row at the top and bottom; its column on a side, as Home's. */
-export function shelfSize(dock: Dock = Room.dock): { w: number; h: number } {
-  if (!sideDock(dock)) return { w: shelfWidth(), h: SHELF_H };
+export function shelfSize(dock: Dock = Room.dock, visibleCards = WIDGET_COUNT): { w: number; h: number } {
+  if (!sideDock(dock)) return { w: shelfWidth(visibleCards), h: SHELF_H };
   const room = sideRoom();
   return { w: Math.min(SIDE_W, room.w), h: Math.min(SHELF_SIDE_H, room.h) };
 }
@@ -482,6 +523,7 @@ export function islandSize(
   large = false,
   compact: { w: number; h: number } = { w: COMPACT_W, h: NOTCH_H },
   fittedW: number | null = null,
+  shelfCards = WIDGET_COUNT,
 ): { w: number; h: number } {
   switch (mode) {
     case "hidden":
@@ -497,12 +539,12 @@ export function islandSize(
       // The two tabs at rest — no widget of the Shelf expanded — have the dock's own size.
       if (fitted == null && fittedW == null) {
         if (view === "overview") return homeSize();
-        if (view === "shelf") return shelfSize();
+        if (view === "shelf") return shelfSize(Room.dock, shelfCards);
       }
       const h = fitted ?? viewLayout(view).height;
       const room = proposal && view === "approval" ? PROPOSAL_ROOM : 0;
       // An expanded widget of the Shelf is as wide as it says: no wider than the window's normal panel.
-      return { w: fittedW != null ? Math.min(fittedW, PANEL_W) : view === "shelf" ? shelfWidth() : EXPANDED_W, h: h + room };
+      return { w: fittedW != null ? Math.min(fittedW, PANEL_W) : view === "shelf" ? shelfWidth(shelfCards) : EXPANDED_W, h: h + room };
     }
   }
 }

@@ -9,6 +9,7 @@ import "../style.css";
 import "./agents.css";
 import { Bridge, IS_TAURI, onEvent } from "../core/bridge";
 import { DEFAULT_SETTINGS, FADE_MAX, FADE_MIN, usageLevel, usageShown, type Settings, type Usage } from "../core/state";
+import { resolveLanguage, setLanguage } from "../core/i18n";
 import { h } from "../views/dom";
 import { toolMark } from "../views/tool";
 import { fadeOf } from "./fade";
@@ -355,11 +356,13 @@ function take(value: unknown) {
 async function main() {
   const boot = await Bridge.boot();
   if (boot) settings = { ...settings, ...boot.settings };
+  setLanguage(resolveLanguage(settings.language));
   applyAppearance();
   applyFade();
   systemStill.addEventListener("change", applyAppearance);
   await onEvent<Settings>("settings-changed", (next) => {
     settings = { ...settings, ...next };
+    setLanguage(resolveLanguage(settings.language));
     applyAppearance();
     // Live: a new opacity, or the fade turned off or on, shows at once.
     calmSince = Date.now();

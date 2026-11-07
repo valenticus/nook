@@ -11,7 +11,10 @@
 
 use serde::Serialize;
 
-use crate::island::{PANEL_MAX_H, PANEL_MAX_W, PANEL_MIN_H, PANEL_MIN_W, SCREEN_MARGIN_H, SCREEN_MARGIN_W, STRIP_H, STRIP_W};
+use crate::island::{
+    PANEL_MAX_H, PANEL_MAX_W, PANEL_MIN_H, PANEL_MIN_W, SCREEN_MARGIN_H, SCREEN_MARGIN_W, STRIP_H,
+    STRIP_W,
+};
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -98,8 +101,15 @@ pub fn panel_size(dock: Dock, monitor: Rect, work: Rect, scale: f64) -> (f64, f6
 
 /// The wake strip's physical size: thin across the edge it is docked to.
 pub fn strip_size(dock: Dock, scale: f64) -> (u32, u32) {
-    let (long, thin) = ((STRIP_W * scale).round().max(1.0) as u32, (STRIP_H * scale).round().max(1.0) as u32);
-    if dock.vertical() { (thin, long) } else { (long, thin) }
+    let (long, thin) = (
+        (STRIP_W * scale).round().max(1.0) as u32,
+        (STRIP_H * scale).round().max(1.0) as u32,
+    );
+    if dock.vertical() {
+        (thin, long)
+    } else {
+        (long, thin)
+    }
 }
 
 /// Where a window of this physical size goes. Top and bottom are centred on the
@@ -123,8 +133,16 @@ pub fn place(dock: Dock, monitor: Rect, work: Rect, scale: f64, collapsed: bool)
     // In whole physical pixels, and told to the front end as it really is.
     let full_pw = (w * scale).round().max(1.0);
     let full_ph = (h * scale).round().max(1.0);
-    let size = if collapsed { strip_size(dock, scale) } else { (full_pw as u32, full_ph as u32) };
-    Placement { panel: (full_pw / scale, full_ph / scale), size, pos: window_pos(dock, monitor, work, size) }
+    let size = if collapsed {
+        strip_size(dock, scale)
+    } else {
+        (full_pw as u32, full_ph as u32)
+    };
+    Placement {
+        panel: (full_pw / scale, full_ph / scale),
+        size,
+        pos: window_pos(dock, monitor, work, size),
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +154,12 @@ mod tests {
     }
 
     /// Placement as it was written before docks existed.
-    fn old_formulas(monitor: Rect, work: Rect, scale: f64, collapsed: bool) -> ((f64, f64), (u32, u32), (i32, i32)) {
+    fn old_formulas(
+        monitor: Rect,
+        work: Rect,
+        scale: f64,
+        collapsed: bool,
+    ) -> ((f64, f64), (u32, u32), (i32, i32)) {
         let free_h = (work.y + work.h as i32 - monitor.y).max(0) as f64 / scale;
         let panel = (
             (monitor.w as f64 / scale - 32.0).clamp(720.0, 1136.0),
@@ -145,7 +168,10 @@ mod tests {
         let full_pw = (panel.0 * scale).round().max(1.0);
         let full_ph = (panel.1 * scale).round().max(1.0);
         let (pw, ph) = if collapsed {
-            ((240.0 * scale).round().max(1.0) as u32, (6.0 * scale).round().max(1.0) as u32)
+            (
+                (240.0 * scale).round().max(1.0) as u32,
+                (6.0 * scale).round().max(1.0) as u32,
+            )
         } else {
             (full_pw as u32, full_ph as u32)
         };
@@ -154,7 +180,12 @@ mod tests {
     }
 
     /// 1920 × 1080 at 100 %, taskbar 48 px.
-    const MON: Rect = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+    const MON: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 1920,
+        h: 1080,
+    };
 
     fn bottom_taskbar() -> Rect {
         rect(0, 0, 1920, 1032)
@@ -189,7 +220,11 @@ mod tests {
                 for collapsed in [false, true] {
                     let got = place(Dock::Top, monitor, work, scale, collapsed);
                     let (panel, size, pos) = old_formulas(monitor, work, scale, collapsed);
-                    assert_eq!((got.panel, got.size, got.pos), (panel, size, pos), "{monitor:?} {work:?} {scale} {collapsed}");
+                    assert_eq!(
+                        (got.panel, got.size, got.pos),
+                        (panel, size, pos),
+                        "{monitor:?} {work:?} {scale} {collapsed}"
+                    );
                 }
             }
         }
@@ -198,14 +233,26 @@ mod tests {
     #[test]
     fn the_top_dock_measures_down_to_the_end_of_the_work_area() {
         // Bottom taskbar: 1032 free, minus the margin.
-        assert_eq!(panel_size(Dock::Top, MON, bottom_taskbar(), 1.0), (1136.0, 654.0));
+        assert_eq!(
+            panel_size(Dock::Top, MON, bottom_taskbar(), 1.0),
+            (1136.0, 654.0)
+        );
         // A small laptop at 150 %: 1024 × 640 logical, 600 free above the taskbar.
         let laptop = rect(0, 0, 1536, 960);
-        assert_eq!(panel_size(Dock::Top, laptop, rect(0, 0, 1536, 900), 1.5), (1024.0 - 32.0, 600.0 - 24.0));
+        assert_eq!(
+            panel_size(Dock::Top, laptop, rect(0, 0, 1536, 900), 1.5),
+            (1024.0 - 32.0, 600.0 - 24.0)
+        );
         // A top taskbar does not shorten it: the window hangs over it, from the display's edge.
-        assert_eq!(panel_size(Dock::Top, MON, rect(0, 48, 1920, 1032), 1.0), (1136.0, 654.0));
+        assert_eq!(
+            panel_size(Dock::Top, MON, rect(0, 48, 1920, 1032), 1.0),
+            (1136.0, 654.0)
+        );
         // Too small: the normal panel.
-        assert_eq!(panel_size(Dock::Top, rect(0, 0, 700, 300), rect(0, 0, 700, 300), 1.0), (720.0, 320.0));
+        assert_eq!(
+            panel_size(Dock::Top, rect(0, 0, 700, 300), rect(0, 0, 700, 300), 1.0),
+            (720.0, 320.0)
+        );
     }
 
     #[test]
@@ -223,7 +270,10 @@ mod tests {
         let top_bar = rect(0, 48, 1920, 1032);
         let p = place(Dock::Bottom, MON, top_bar, 1.0, false);
         assert_eq!((p.size, p.pos), ((1136, 654), (392, 1080 - 654)));
-        assert_eq!(place(Dock::Bottom, MON, top_bar, 1.0, true).pos, (840, 1074));
+        assert_eq!(
+            place(Dock::Bottom, MON, top_bar, 1.0, true).pos,
+            (840, 1074)
+        );
         // Taskbar on a side: the full height, and still centred on the display.
         let p = place(Dock::Bottom, MON, rect(48, 0, 1872, 1080), 1.0, false);
         assert_eq!(p.pos, (392, 1080 - 654));
@@ -231,7 +281,16 @@ mod tests {
         let p = place(Dock::Bottom, MON, MON, 1.0, false);
         assert_eq!(p.pos, (392, 1080 - 654));
         // Room is the work area's height: 500 free gives 500 - 24.
-        assert_eq!(panel_size(Dock::Bottom, rect(0, 0, 1920, 600), rect(0, 40, 1920, 500), 1.0).1, 476.0);
+        assert_eq!(
+            panel_size(
+                Dock::Bottom,
+                rect(0, 0, 1920, 600),
+                rect(0, 40, 1920, 500),
+                1.0
+            )
+            .1,
+            476.0
+        );
     }
 
     #[test]
@@ -244,13 +303,31 @@ mod tests {
         assert_eq!(p.pos, (1920 - 1136, (1080 - 654) / 2));
         // Taskbar on the right.
         let right_bar = rect(0, 0, 1872, 1080);
-        assert_eq!(place(Dock::Right, MON, right_bar, 1.0, false).pos.0, 1872 - 1136);
+        assert_eq!(
+            place(Dock::Right, MON, right_bar, 1.0, false).pos.0,
+            1872 - 1136
+        );
         assert_eq!(place(Dock::Left, MON, right_bar, 1.0, false).pos.0, 0);
         // Taskbar at the bottom or top: centred on what is left.
-        assert_eq!(place(Dock::Left, MON, bottom_taskbar(), 1.0, false).pos, (0, (1032 - 654) / 2));
-        assert_eq!(place(Dock::Right, MON, rect(0, 48, 1920, 1032), 1.0, false).pos, (1920 - 1136, 48 + (1032 - 654) / 2));
+        assert_eq!(
+            place(Dock::Left, MON, bottom_taskbar(), 1.0, false).pos,
+            (0, (1032 - 654) / 2)
+        );
+        assert_eq!(
+            place(Dock::Right, MON, rect(0, 48, 1920, 1032), 1.0, false).pos,
+            (1920 - 1136, 48 + (1032 - 654) / 2)
+        );
         // Width is held to the work area's.
-        assert_eq!(panel_size(Dock::Left, rect(0, 0, 1000, 1080), rect(0, 0, 1000, 1080), 1.0).0, 1000.0 - 32.0);
+        assert_eq!(
+            panel_size(
+                Dock::Left,
+                rect(0, 0, 1000, 1080),
+                rect(0, 0, 1000, 1080),
+                1.0
+            )
+            .0,
+            1000.0 - 32.0
+        );
         // The strip is thin across the edge and long along it, centred on the work area.
         let s = place(Dock::Left, MON, left_bar, 1.0, true);
         assert_eq!((s.size, s.pos), ((6, 240), (48, 420)));
@@ -275,16 +352,28 @@ mod tests {
         // Left of the primary, taskbar at the bottom.
         let mon = rect(-1920, 0, 1920, 1080);
         let work = rect(-1920, 0, 1920, 1032);
-        assert_eq!(place(Dock::Bottom, mon, work, 1.0, false).pos, (-1920 + 392, 1032 - 654));
-        assert_eq!(place(Dock::Top, mon, work, 1.0, false).pos, (-1920 + 392, 0));
+        assert_eq!(
+            place(Dock::Bottom, mon, work, 1.0, false).pos,
+            (-1920 + 392, 1032 - 654)
+        );
+        assert_eq!(
+            place(Dock::Top, mon, work, 1.0, false).pos,
+            (-1920 + 392, 0)
+        );
         assert_eq!(place(Dock::Left, mon, work, 1.0, false).pos.0, -1920);
         assert_eq!(place(Dock::Right, mon, work, 1.0, false).pos.0, -1136);
         // Above the primary.
         let mon = rect(0, -1080, 1920, 1080);
         let work = rect(0, -1080, 1920, 1032);
-        assert_eq!(place(Dock::Bottom, mon, work, 1.0, false).pos, (392, -48 - 654));
+        assert_eq!(
+            place(Dock::Bottom, mon, work, 1.0, false).pos,
+            (392, -48 - 654)
+        );
         assert_eq!(place(Dock::Top, mon, work, 1.0, false).pos, (392, -1080));
-        assert_eq!(place(Dock::Left, mon, work, 1.0, false).pos, (0, -1080 + (1032 - 654) / 2));
+        assert_eq!(
+            place(Dock::Left, mon, work, 1.0, false).pos,
+            (0, -1080 + (1032 - 654) / 2)
+        );
     }
 
     #[test]
@@ -297,9 +386,16 @@ mod tests {
             for dock in [Dock::Top, Dock::Bottom, Dock::Left, Dock::Right] {
                 let p = place(dock, mon, work, scale, false);
                 // The size told to the page is the physical size over the scale, exactly.
-                assert_eq!(p.panel, (p.size.0 as f64 / scale, p.size.1 as f64 / scale), "{dock:?} {scale}");
+                assert_eq!(
+                    p.panel,
+                    (p.size.0 as f64 / scale, p.size.1 as f64 / scale),
+                    "{dock:?} {scale}"
+                );
                 assert!(p.panel.0 >= PANEL_MIN_W && p.panel.1 >= PANEL_MIN_H);
-                assert!(p.size.0 as f64 <= PANEL_MAX_W * scale + 0.5 && p.size.1 as f64 <= PANEL_MAX_H * scale + 0.5);
+                assert!(
+                    p.size.0 as f64 <= PANEL_MAX_W * scale + 0.5
+                        && p.size.1 as f64 <= PANEL_MAX_H * scale + 0.5
+                );
             }
             let p = place(Dock::Bottom, mon, work, scale, false);
             // The flush edge lands on the work area's last physical pixel, whatever the scale.
@@ -309,7 +405,13 @@ mod tests {
             assert_eq!(s.pos.1 + s.size.1 as i32, work.bottom(), "{scale}");
         }
         // 1.25: 1136 × 1.25 = 1420 exactly, 654 × 1.25 = 817.5 rounds to 818.
-        let p = place(Dock::Bottom, rect(0, 0, 2560, 1440), rect(0, 0, 2560, 1380), 1.25, false);
+        let p = place(
+            Dock::Bottom,
+            rect(0, 0, 2560, 1440),
+            rect(0, 0, 2560, 1380),
+            1.25,
+            false,
+        );
         assert_eq!(p.size, (1420, 818));
         assert_eq!(p.pos, (570, 1380 - 818));
     }

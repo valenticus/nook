@@ -19,11 +19,28 @@ pub const TOOL: &str = "codex";
 /// Shown before the session's id, so ids of two tools never collide.
 const ID_PREFIX: &str = "codex:";
 const MAX_ID: usize = 96;
-/// The events Nook follows (src-tauri/src/codex_hooks.rs installs these and no other).
-const EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop"];
+/// The documented Codex hook events Nook follows (src-tauri/src/codex_hooks.rs installs these).
+const EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd",
+    "Interrupt",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+];
 
 fn text<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
-    payload.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// Codex's payload as the event Nook knows. None for an event Nook does not
@@ -34,9 +51,20 @@ pub fn translate(payload: &Value, arg_event: &str) -> Option<Value> {
         return None;
     }
     let session = text(payload, "session_id")?;
+    // These hooks must be attributable before they are allowed to change
+    // lifecycle state. Their current Codex schema supplies both identifiers.
+    if event == "Interrupt" && text(payload, "turn_id").is_none() {
+        return None;
+    }
+    if matches!(event, "SubagentStart" | "SubagentStop") && text(payload, "agent_id").is_none() {
+        return None;
+    }
     let mut out = payload.as_object()?.clone();
     out.insert("hook_event_name".into(), json!(event));
-    out.insert("session_id".into(), json!(format!("{ID_PREFIX}{}", clip(session, MAX_ID))));
+    out.insert(
+        "session_id".into(),
+        json!(format!("{ID_PREFIX}{}", clip(session, MAX_ID))),
+    );
     out.insert("nook_tool".into(), json!(TOOL));
     // Codex's transcript is written its own way: nothing of Claude Code's is to be read in it.
     out.remove("transcript_path");
@@ -72,20 +100,68 @@ mod tests {
         assert!(out.get("transcript_path").is_none());
         // No session to put it under, or the event named on the command line only.
         assert!(translate(&json!({ "hook_event_name": "Stop" }), "").is_none());
-        assert_eq!(translate(&json!({ "session_id": "s" }), "Stop").unwrap()["hook_event_name"], "Stop");
+        assert_eq!(
+            translate(&json!({ "session_id": "s" }), "Stop").unwrap()["hook_event_name"],
+            "Stop"
+        );
     }
 
     #[test]
     fn an_event_nook_does_not_follow_goes_nowhere() {
-        for event in ["PreCompact", "PostCompact", "somethingNew", ""] {
+        for event in ["somethingNew", ""] {
             assert!(translate(&base(event), "").is_none(), "{event}");
+        }
+        for event in ["PreCompact", "PostCompact"] {
+            assert_eq!(
+                translate(&base(event), "").unwrap()["hook_event_name"],
+                event
+            );
         }
     }
 
     #[test]
+    fn documented_lifecycle_events_keep_parent_and_subagent_ids() {
+        for event in [
+            "SessionEnd",
+            "Interrupt",
+            "SubagentStart",
+            "SubagentStop",
+            "PreCompact",
+            "PostCompact",
+        ] {
+            let mut payload = base(event);
+            payload["agent_id"] = json!("agent-01");
+            payload["agent_type"] = json!("general");
+            payload["trigger"] = json!("auto");
+            let out = translate(&payload, "").unwrap();
+            assert_eq!(out["hook_event_name"], event);
+            assert_eq!(out["session_id"], "codex:s-1");
+            assert_eq!(out["nook_tool"], "codex");
+            if event.starts_with("Subagent") {
+                assert_eq!(out["agent_id"], "agent-01");
+                assert_eq!(out["agent_type"], "general");
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_events_without_required_identity_are_dropped() {
+        assert!(translate(
+            &json!({ "hook_event_name": "Interrupt", "session_id": "s" }),
+            ""
+        )
+        .is_none());
+        assert!(translate(&json!({ "hook_event_name": "SubagentStop", "session_id": "s", "agent_type": "general" }), "").is_none());
+    }
+
+    #[test]
     fn a_permission_request_goes_through_the_common_path_with_what_it_asks() {
-        let asked = with("PermissionRequest", json!({ "tool_name": "Bash", "tool_input": { "command": "npm test", "description": "Run the tests" } }));
-        let event = crate::event_of(translate(&asked, "").unwrap(), String::new(), String::new()).unwrap();
+        let asked = with(
+            "PermissionRequest",
+            json!({ "tool_name": "Bash", "tool_input": { "command": "npm test", "description": "Run the tests" } }),
+        );
+        let event =
+            crate::event_of(translate(&asked, "").unwrap(), String::new(), String::new()).unwrap();
         assert_eq!(event.name, "PermissionRequest");
         let sent: Value = serde_json::from_str(&event.line).unwrap();
         assert_eq!(sent["session_id"], "codex:s-1");
@@ -94,13 +170,19 @@ mod tests {
         // Claude Code's session path, not an agent pill's.
         assert!(sent.get("nook_agent").is_none());
         // And the answer is the one Claude Code reads, which Codex documents.
-        assert!(crate::reply_json("allow", None).unwrap().contains(r#""behavior":"allow""#));
+        assert!(crate::reply_json("allow", None)
+            .unwrap()
+            .contains(r#""behavior":"allow""#));
     }
 
     #[test]
     fn a_turn_ends_on_what_codex_said() {
-        let stop = with("Stop", json!({ "stop_hook_active": false, "last_assistant_message": " Done. " }));
-        let event = crate::event_of(translate(&stop, "").unwrap(), String::new(), String::new()).unwrap();
+        let stop = with(
+            "Stop",
+            json!({ "stop_hook_active": false, "last_assistant_message": " Done. " }),
+        );
+        let event =
+            crate::event_of(translate(&stop, "").unwrap(), String::new(), String::new()).unwrap();
         let sent: Value = serde_json::from_str(&event.line).unwrap();
         assert_eq!(sent["last_message"], "Done.");
         assert!(sent.get("session_title").is_none() && sent.get("context_tokens").is_none());

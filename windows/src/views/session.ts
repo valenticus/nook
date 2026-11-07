@@ -27,6 +27,7 @@ import { diffLine, extBadge, fileKind, plusMinus, readPatch, splitPath, type Fil
 import { ICONS } from "./icons";
 import { COLOR } from "./palette";
 import { LUCIDE, lucide } from "./iconset";
+import { message } from "../core/i18n";
 import { collapses, reply as replyView, type PathOpener, type ReplyFold } from "./markdown";
 import { Bridge } from "../core/bridge";
 import {
@@ -204,7 +205,7 @@ export function leaveSubagent(): boolean {
   return true;
 }
 
-const counted = (n: number, one: string) => `${n} ${n === 1 ? one : `${one}s`}`;
+const counted = (n: number, one: string) => message(`{count} ${n === 1 ? one : `${one}s`}`, { count: n });
 
 // ── Several sessions ──────────────────────────────────────────────────────────
 
@@ -257,7 +258,13 @@ export function sessionsChip(onOpen: () => void): { el: HTMLElement; sync(): voi
       const calling = State.sessions.find((s) => s.id !== State.frontId && calls(s));
       el.classList.toggle("calls", calling != null);
       el.style.setProperty("--c", calling ? standing(calling).color : "currentColor");
-      el.title = calling ? `${sessionName(calling)} ${standing(calling).words}${calling.attention ? ` — ${ATTENTION_WORDS.toLowerCase()}` : ""}` :"Every session followed, Claude Code and Cursor";
+      el.title = calling
+        ? message("{name} {state}{attention}", {
+            name: sessionName(calling),
+            state: standing(calling).words,
+            attention: calling.attention ? message(" — {attention}", { attention: message("new activity") }) : "",
+          })
+        : message("Every tracked session — Claude Code, Codex or Cursor.");
     },
   };
 }
@@ -424,7 +431,7 @@ function askedView(step: SessionStep): HTMLElement {
     el.append(h("div", { class: "jr-q" }, h("div", { class: "jr-q-title", text: q.question }), options));
   }
   if (!step.answers) {
-    el.append(h("div", { class: "jr-waiting", text: step.state === "running" ? "Waiting for an answer…" : step.state === "failed" ? "Left unanswered." : "Answered in Claude Code." }));
+    el.append(h("div", { class: "jr-waiting", text: step.state === "running" ? "Waiting for an answer…" : step.state === "failed" || step.state === "interrupted" ? "Left unanswered." : "Answered in Claude Code." }));
   }
   return el;
 }
@@ -438,7 +445,7 @@ function askedView(step: SessionStep): HTMLElement {
  * step what it gave back. `said` is what a reply is drawn with: the way to the
  * files it names, and which of its two forms a long one is in.
  */
-function journalEntry(step: SessionStep, large: boolean, said: Said, typed?: ToType[]): HTMLElement {
+function journalEntry(step: SessionStep, large: boolean, said: Said, agent: SessionAgent, typed?: ToType[]): HTMLElement {
   if (step.kind === "prompt") {
     return h("div", { class: "jr jr-asked" }, h("div", { class: "sess-asked", text: step.target ?? "", title: clock(step.at) }));
   }
@@ -446,7 +453,7 @@ function journalEntry(step: SessionStep, large: boolean, said: Said, typed?: ToT
     return h(
       "div",
       { class: "jr jr-reply" },
-      h("div", { class: "sess-said" }, dot(COLOR.green, 6), h("b", { text: "Claude" }), h("span", { text: clock(step.at) })),
+      h("div", { class: "sess-said" }, dot(COLOR.green, 6), h("b", { text: TOOL_NAME[agent] }), h("span", { text: clock(step.at) })),
       step.target ? replyView(step.target, said.opener, said.fold(step)) : h("div", { class: "jr-waiting", text: "The turn ended without a word." }),
     );
   }
@@ -520,7 +527,7 @@ export function buildSession(actions: ViewActions): ViewHost {
   const nameModel = h("span", { class: "sess-name-model" });
   const tree =h("div", { class: "sess-tree", role: "tree", "aria-label": "Sessions and their subagents" });
   // All · Claude Code · Cursor · Codex: there only while sessions of more than one tool are followed.
-  let toolFilter: "all" | SessionAgent = "all";
+  let toolFilter: "all" | Exclude<SessionAgent, "unknown"> = "all";
   const toolChips = h("div", { class: "sess-tools", role: "group", "aria-label": "Show sessions of" });
   toolChips.hidden = true;
   const rail = h(
@@ -684,9 +691,10 @@ export function buildSession(actions: ViewActions): ViewHost {
   /** A session picked in the sidebar: it comes in front, on its journal. The one in front goes back to its journal. */
   function pickSession(id: string) {
     actions.blip();
+    const session = State.sessions.find((s) => s.id === id);
     if (id !== State.frontId) actions.pickSession(id);
     // One whose last reply waits on a decision is picked to read it: it opens whole.
-    wantWhole = State.sessions.find((s) => s.id === id)?.decision === true;
+    wantWhole = session?.decision === true;
     go({ kind: "live" });
   }
 
@@ -770,6 +778,7 @@ export function buildSession(actions: ViewActions): ViewHost {
           ...subs.map((a) => [a.id, a.type, subagentTask(a), subagentStanding(session, a), a.model?.label].join(":")),
         ].join("~"))
       .concat(front.id, onAgent ?? "", owed?.id ?? "")
+      .concat("all-sessions")
       .join("|");
     if (next === railKey) return;
     railKey = next;
@@ -794,7 +803,14 @@ export function buildSession(actions: ViewActions): ViewHost {
         role: "treeitem",
         "aria-level": 1,
         "aria-selected": String(inFront && !onAgent),
-        title: `${TOOL_NAME[session.agent]} — ${folder} — ${session.title ?? TOOL_NAME[session.agent]}${session.model ? ` — ${session.model.label}` : ""} — ${at.words}${subs.length ? ` — ${counted(subs.length, "subagent")}, ${going} running` : ""}`,
+        title: message("{agent} — {folder} — {title}{model} — {state}{children}", {
+          agent: TOOL_NAME[session.agent],
+          folder,
+          title: session.title ?? TOOL_NAME[session.agent],
+          model: session.model ? ` — ${session.model.label}` : "",
+          state: at.words,
+          children: subs.length ? message(" — {count} subagents, {running} running", { count: subs.length, running: going }) : "",
+        }),
       });
       row.dataset.key = key;
       row.dataset.session = session.id;
@@ -816,7 +832,11 @@ export function buildSession(actions: ViewActions): ViewHost {
         row.append(h("span", {
           class: asking > 0 ? "sess-count asking" : going > 0 ? "sess-count going" : "sess-count",
           text: String(subs.length),
-          title: `${counted(subs.length, "subagent")}: ${going} running${asking ? `, ${asking} waiting for you` : ""}`,
+          title: message("{summary}: {running} running{waiting}", {
+            summary: counted(subs.length, "subagent"),
+            running: going,
+            waiting: asking ? message(", {count} waiting for you", { count: asking }) : "",
+          }),
         }));
       }
       // The way to where it runs, from its own line: no need to put it in
@@ -835,7 +855,7 @@ export function buildSession(actions: ViewActions): ViewHost {
         goto.addEventListener("click", (e) => {
           e.stopPropagation();
           actions.blip();
-          actions.goToSession(session.id);
+          actions.goToSession(session);
         });
         goto.addEventListener("dblclick", (e) => e.stopPropagation());
         row.append(goto);
@@ -852,7 +872,7 @@ export function buildSession(actions: ViewActions): ViewHost {
       if ((session.attention && !inFront) || session === owed) {
         row.classList.add("attn");
         row.append(h("i", { class: "sess-new", role: "img", "aria-label": ATTENTION_WORDS, title: ATTENTION_WORDS }));
-        row.title += ` — ${ATTENTION_WORDS.toLowerCase()}`;
+        row.title += message(" — {attention}", { attention: message("new activity") });
       }
       row.append(mark);
       row.addEventListener("click", () => pickSession(session.id));
@@ -883,7 +903,11 @@ export function buildSession(actions: ViewActions): ViewHost {
             "aria-level": 2,
             "aria-selected": String(on),
             // All of both lines, however they were cut: its type and task, its model, how it stands.
-            title: `${fullName(a)}${a.model ? ` — ${a.model.label}` : ""} — ${statusWords(session, a)}`,
+            title: message("{name}{model} — {status}", {
+              name: fullName(a),
+              model: a.model ? ` — ${a.model.label}` : "",
+              status: statusWords(session, a),
+            }),
           },
           MARKS[stands](),
           // Two lines: what it was launched to do, and under it, quieter, which agent it is and the model it runs on.
@@ -975,7 +999,7 @@ export function buildSession(actions: ViewActions): ViewHost {
     // Ctrl+Enter on a session's line: to where it runs, as its ↗ does.
     if (e.key === "Enter" && e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && !row.dataset.agent) {
       e.preventDefault();
-      if (targetTip(session)) actions.goToSession(session.id);
+      if (targetTip(session)) actions.goToSession(session);
       return;
     }
     if (e.altKey || e.ctrlKey || e.metaKey) return;
@@ -1241,7 +1265,7 @@ export function buildSession(actions: ViewActions): ViewHost {
         const fresh = step.patch != null && !typedSteps.has(step) && !entering && Date.now() - step.at < FRESH_MS;
         if (step.patch != null) typedSteps.add(step);
         const lines: ToType[] = [];
-        const drawn = launched ? launchRow(session, launched) : journalEntry(step, large, said, fresh ? lines : undefined);
+        const drawn = launched ? launchRow(session, launched) : journalEntry(step, large, said, session.agent, fresh ? lines : undefined);
         // A line that is new comes in; one that got something more — what the
         // tool gave back, what was decided — only brings that in.
         if (!entering) drawn.classList.add(known ? "more" : "in");

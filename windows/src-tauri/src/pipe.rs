@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::connect_scanner;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,6 +42,10 @@ use crate::{log, platform, usage, visibility};
 
 /// Slightly under nook-hook's own 110 s wait, so we always answer first.
 const DECISION_TIMEOUT: Duration = Duration::from_secs(108);
+#[cfg(feature = "nook-dev")]
+const TEST_DECISION_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(feature = "nook-dev")]
+const MANUAL_ALERT_DECISION_TIMEOUT: Duration = Duration::from_secs(280);
 /// How long the island gets to say "the card is up". This is the whole of B4:
 /// without it, an island that is paused, hidden behind a crashed webview or
 /// simply not listening would leave Claude Code staring at a prompt nobody can
@@ -62,17 +67,144 @@ pub enum Reply {
 }
 
 /// Permission requests the island has been told about.
+pub struct PendingRequest {
+    sender: mpsc::Sender<Reply>,
+    #[cfg(feature = "nook-dev")]
+    session_id: String,
+    #[cfg(feature = "nook-dev")]
+    turn_id: Option<String>,
+    deny_only: bool,
+}
+
 #[derive(Default)]
-pub struct Pending(pub Mutex<HashMap<String, mpsc::Sender<Reply>>>);
+pub struct Pending(pub Mutex<HashMap<String, PendingRequest>>);
+
+#[cfg(feature = "nook-dev")]
+fn test_session_id(session_id: &str) -> bool {
+    session_id.starts_with("nook-test:") || session_id.starts_with("codex:nook-test:")
+}
+
+#[cfg(feature = "nook-dev")]
+fn is_real_claude_dev_event(payload: &Value) -> bool {
+    if payload
+        .get("nook_tool")
+        .and_then(Value::as_str)
+        .is_some_and(|tool| tool != "claude")
+        || payload.get("nook_agent").is_some()
+        || payload.get("nook_simulated").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    let session = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !session.starts_with("nook-test:")
+        && !session.starts_with("codex:nook-test:")
+        && !session.starts_with("nook-sim:")
+        && !session.starts_with("codex:nook-sim:")
+}
+
+/// Sanitized Dev-only hook diagnostics. Event and outcome values are allowlisted;
+/// prompt text, paths, tool input, credentials and session IDs never enter these lines.
+#[cfg(feature = "nook-dev")]
+fn dev_hook_trace(event: &str, detail: &str) -> String {
+    let event = match event {
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
+        | "PermissionRequest" | "Stop" | "SessionEnd" => event,
+        _ => "Other",
+    };
+    let detail = match detail {
+        "state=session-started"
+        | "state=prompt-submitted"
+        | "state=tool-started"
+        | "state=tool-finished"
+        | "state=turn-stopped"
+        | "state=session-ended"
+        | "state=permission-pending"
+        | "pending=cleared outcome=allow"
+        | "pending=cleared outcome=deny"
+        | "pending=cleared outcome=skip"
+        | "pending=cleared outcome=no-decision"
+        | "pending=cancelled" => detail,
+        _ => "state=processed",
+    };
+    format!("claude-e2e event={event} ipc=received {detail}")
+}
+
+#[cfg(feature = "nook-dev")]
+fn manual_alert_session_id(session_id: &str) -> bool {
+    session_id.starts_with("nook-test:two-pending-alerts:")
+        || session_id.starts_with("codex:nook-test:two-pending-alerts:")
+}
+
+fn decision_for_request(deny_only: bool, decision: &str) -> Option<&'static str> {
+    match decision {
+        "allow" if deny_only => Some("deny"),
+        "allow" => Some("allow"),
+        "skip" if deny_only => Some("deny"),
+        "skip" => Some("skip"),
+        "deny" => Some("deny"),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "nook-dev")]
+fn cancel_matching(pending: &Pending, session_id: &str, turn_id: Option<&str>) -> usize {
+    let cancelled = {
+        let mut requests = pending.0.lock().unwrap();
+        let ids: Vec<String> = requests
+            .iter()
+            .filter(|(_, req)| {
+                req.deny_only
+                    && req.session_id == session_id
+                    && turn_id.map_or(true, |turn| req.turn_id.as_deref() == Some(turn))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| requests.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    let count = cancelled.len();
+    for request in cancelled {
+        let _ = request.sender.try_send(Reply::Decline);
+    }
+    count
+}
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// `\\.\pipe\nook-<sid>` — must match nook-hook's `pipe_path()` exactly.
+/// `\\.\pipe\nook[-dev]-<sid>`; Dev uses a separate namespace.
 #[cfg(windows)]
 pub fn pipe_name() -> String {
     let key = crate::platform::current_user_sid()
         .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "user".into()));
-    format!(r"\\.\pipe\nook-{key}")
+    let namespace = if cfg!(feature = "nook-dev") {
+        "-dev"
+    } else if cfg!(feature = "nook-standalone") {
+        "-standalone"
+    } else {
+        ""
+    };
+    format!(r"\\.\pipe\nook{namespace}-{key}")
+}
+
+#[cfg(all(test, windows))]
+mod isolation_tests {
+    #[test]
+    fn dev_pipe_has_an_independent_name() {
+        let name = super::pipe_name();
+        if cfg!(feature = "nook-dev") {
+            assert!(name.contains(r"\pipe\nook-dev-"));
+        } else if cfg!(feature = "nook-standalone") {
+            assert!(name.contains(r"\pipe\nook-standalone-"));
+        } else {
+            assert!(name.contains(r"\pipe\nook-"));
+            assert!(!name.contains(r"\pipe\nook-dev-"));
+            assert!(!name.contains(r"\pipe\nook-standalone-"));
+        }
+    }
 }
 
 /// Why the relay pipe could not be opened, for Settings; None while it is up.
@@ -133,8 +265,16 @@ impl PipeAcl {
         let mut options = ServerOptions::new();
         // first_pipe_instance also means we refuse to join a pipe somebody else
         // already owns under our name, rather than serving on top of it.
-        options.first_pipe_instance(first).reject_remote_clients(true).max_instances(MAX_INSTANCES);
-        unsafe { options.create_with_security_attributes_raw(name, (&mut attrs as *mut SECURITY_ATTRIBUTES).cast()) }
+        options
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .max_instances(MAX_INSTANCES);
+        unsafe {
+            options.create_with_security_attributes_raw(
+                name,
+                (&mut attrs as *mut SECURITY_ATTRIBUTES).cast(),
+            )
+        }
     }
 }
 
@@ -183,7 +323,9 @@ pub fn start(app: AppHandle) {
 
     tauri::async_runtime::spawn(async move {
         let Some(path) = crate::platform::relay_socket_path() else {
-            log::line("no private runtime directory ($XDG_RUNTIME_DIR) — Claude Code hooks are inactive");
+            log::line(
+                "no private runtime directory ($XDG_RUNTIME_DIR) — Claude Code hooks are inactive",
+            );
             return;
         };
         // A socket file left behind by a crash answers nothing and can go. One
@@ -264,7 +406,10 @@ async fn read_line(pipe: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
         }
         Some(buf)
     };
-    tokio::time::timeout(READ_TIMEOUT, read).await.ok().flatten()
+    tokio::time::timeout(READ_TIMEOUT, read)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// The tool that launches a subagent, by its name today and the one older versions gave it.
@@ -281,7 +426,13 @@ fn noted(value: Option<&Value>) -> String {
         Some(text) => text
             .chars()
             .take(NOTE_CHARS)
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') { c } else { '?' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                    c
+                } else {
+                    '?'
+                }
+            })
             .collect(),
     }
 }
@@ -296,15 +447,23 @@ fn noted(value: Option<&Value>) -> String {
 /// every one is written here, shown or not, so the two can be told apart and
 /// counted (`agent=… type=""` is not a subagent of the session's).
 fn subagent_note(event: &str, payload: &Value) -> Option<String> {
-    let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or_default();
+    let tool = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let lifecycle = matches!(event, "SubagentStart" | "SubagentStop");
-    let launch = matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure") && AGENT_TOOLS.contains(&tool);
+    let launch = matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+        && AGENT_TOOLS.contains(&tool);
     if !lifecycle && !launch {
         return None;
     }
     let mut keys: Vec<&str> = payload.as_object()?.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    let mut note = format!(" agent={} type={}", noted(payload.get("agent_id")), noted(payload.get("agent_type")));
+    let mut note = format!(
+        " agent={} type={}",
+        noted(payload.get("agent_id")),
+        noted(payload.get("agent_type"))
+    );
     if launch {
         let input = payload.get("tool_input");
         note.push_str(&format!(
@@ -326,7 +485,9 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
         Some(i) => &buf[..i],
         None => &buf[..],
     };
-    let Ok(mut payload) = serde_json::from_slice::<Value>(line) else { return };
+    let Ok(mut payload) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
     if !payload.is_object() {
         return;
     }
@@ -336,6 +497,8 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    #[cfg(feature = "nook-dev")]
+    let is_claude_event = is_real_claude_dev_event(&payload);
 
     // Claude Code's status line, not a hook: the usage limits and the session's
     // model (usage.rs). It names no session to the island's session handling,
@@ -346,36 +509,184 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
         return;
     }
 
+    // This point is reachable only from the real relay IPC path. The tracker
+    // additionally rejects reserved synthetic fixture IDs and unsupported events.
+    let real_delivery = connect_scanner::real_delivery(&payload, &event);
+    connect_scanner::record_real_delivery(
+        &app.state::<connect_scanner::DeliveryTracker>(),
+        &payload,
+        &event,
+    );
+    if let Some(agent) = real_delivery {
+        let _ = app.emit("connect-activity", serde_json::json!({ "agent": agent, "event": event }));
+    }
+
     // Where the session runs: kept here for the island's ↗, and told to the page
     // as a target in the place of the processes the relay named.
     let named = payload.get("ancestors").is_some();
-    let target = app.state::<Sessions>().note(&mut payload, platform::EDITOR_FROM_ENV, |chain| {
-        target::hosting_terminal(&platform::top_windows(), chain)
-    });
+    let target = app
+        .state::<Sessions>()
+        .note(&mut payload, platform::EDITOR_FROM_ENV, |chain| {
+            target::hosting_terminal(&platform::top_windows(), chain)
+        });
     if named {
-        log::line(format!("hook {event} runs in {}", if target.label.is_empty() { "an unknown place" } else { target.label }));
+        log::line(format!(
+            "hook {event} runs in {}",
+            if target.label.is_empty() {
+                "an unknown place"
+            } else {
+                target.label
+            }
+        ));
     }
 
     if event != "PermissionRequest" {
-        log::line(format!("hook {event}{}", subagent_note(&event, &payload).unwrap_or_default()));
+        #[cfg(feature = "nook-dev")]
+        {
+            let session_id = payload
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match event.as_str() {
+                "SessionEnd" => {
+                    let cancelled = cancel_matching(&app.state::<Pending>(), session_id, None);
+                    if is_claude_event {
+                        log::line(dev_hook_trace(&event, "state=session-ended"));
+                        if cancelled > 0 {
+                            log::line(dev_hook_trace(&event, "pending=cancelled"));
+                        }
+                    }
+                }
+                "Interrupt" => {
+                    let turn_id = payload.get("turn_id").and_then(Value::as_str);
+                    if let Some(turn_id) = turn_id {
+                        cancel_matching(&app.state::<Pending>(), session_id, Some(turn_id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        log::line(format!(
+            "hook {event}{}",
+            subagent_note(&event, &payload).unwrap_or_default()
+        ));
+        #[cfg(feature = "nook-dev")]
+        let emitted = app.emit_to(WINDOW_LABEL, "hook", payload).is_ok();
+        #[cfg(not(feature = "nook-dev"))]
         let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
+        #[cfg(feature = "nook-dev")]
+        {
+            let state = match event.as_str() {
+                "SessionStart" => "state=session-started",
+                "UserPromptSubmit" => "state=prompt-submitted",
+                "PreToolUse" => "state=tool-started",
+                "PostToolUse" => "state=tool-finished",
+                "Stop" => "state=turn-stopped",
+                "SessionEnd" => "state=session-ended",
+                _ => "state=processed",
+            };
+            if is_claude_event {
+                log::line(format!(
+                    "{} webview_emit={}",
+                    dev_hook_trace(&event, state),
+                    if emitted { "ok" } else { "failed" }
+                ));
+            }
+        }
         pipe.finish();
         return;
     }
 
-    let id = format!("{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    let id = format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    #[cfg(feature = "nook-dev")]
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    #[cfg(feature = "nook-dev")]
+    let turn_id = payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    #[cfg(feature = "nook-dev")]
+    let deny_only = test_session_id(&session_id);
+    #[cfg(feature = "nook-dev")]
+    let manual_alert = manual_alert_session_id(&session_id);
+    #[cfg(not(feature = "nook-dev"))]
+    let deny_only = false;
+    #[cfg(feature = "nook-dev")]
+    if deny_only {
+        payload["nook_test_deny_only"] = json!(true);
+    }
+    #[cfg(feature = "nook-dev")]
+    if manual_alert {
+        payload["nook_test_manual_alert"] = json!(true);
+    }
     let (tx, mut rx) = mpsc::channel::<Reply>(4);
     {
         let pending = app.state::<Pending>();
-        pending.0.lock().unwrap().insert(id.clone(), tx);
+        pending.0.lock().unwrap().insert(
+            id.clone(),
+            PendingRequest {
+                sender: tx,
+                #[cfg(feature = "nook-dev")]
+                session_id,
+                #[cfg(feature = "nook-dev")]
+                turn_id,
+                deny_only,
+            },
+        );
     }
     payload["request_id"] = json!(id);
     log::line(format!("hook PermissionRequest id={id}"));
+    #[cfg(feature = "nook-dev")]
+    let emitted = app.emit_to(WINDOW_LABEL, "hook", payload).is_ok();
+    #[cfg(not(feature = "nook-dev"))]
     let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
+    #[cfg(feature = "nook-dev")]
+    if is_claude_event {
+        log::line(format!(
+            "{} webview_emit={}",
+            dev_hook_trace("PermissionRequest", "state=permission-pending"),
+            if emitted { "ok" } else { "failed" }
+        ));
+    }
 
-    let mut card = Card { app: app.clone(), up: false };
-    let decision = wait_for_decision(&id, &mut rx, || card.raise()).await;
+    let mut card = Card {
+        app: app.clone(),
+        up: false,
+    };
+    #[cfg(feature = "nook-dev")]
+    let timeout = if manual_alert {
+        MANUAL_ALERT_DECISION_TIMEOUT
+    } else if deny_only {
+        TEST_DECISION_TIMEOUT
+    } else {
+        DECISION_TIMEOUT
+    };
+    #[cfg(not(feature = "nook-dev"))]
+    let timeout = DECISION_TIMEOUT;
+    let decision = wait_for_decision(&id, &mut rx, timeout, || card.raise()).await;
     app.state::<Pending>().0.lock().unwrap().remove(&id);
+    #[cfg(feature = "nook-dev")]
+    {
+        let outcome = match decision.as_deref().map(word) {
+            Some("allow") => "pending=cleared outcome=allow",
+            Some("deny") => "pending=cleared outcome=deny",
+            Some("skip") => "pending=cleared outcome=skip",
+            _ => "pending=cleared outcome=no-decision",
+        };
+        // Hook-generated data was moved into the webview payload above; use only
+        // this bounded outcome label in the Dev trace.
+        if is_claude_event {
+            log::line(dev_hook_trace("PermissionRequest", outcome));
+        }
+    }
     // Over, however it ended: an island that came up for it may go.
     drop(card);
 
@@ -416,7 +727,12 @@ impl Drop for Card {
 
 /// Two waits: a short one for "the card is up", then the long one for a human.
 /// on_ack is called when it is.
-async fn wait_for_decision(id: &str, rx: &mut mpsc::Receiver<Reply>, on_ack: impl FnOnce()) -> Option<String> {
+async fn wait_for_decision(
+    id: &str,
+    rx: &mut mpsc::Receiver<Reply>,
+    decision_timeout: Duration,
+    on_ack: impl FnOnce(),
+) -> Option<String> {
     match tokio::time::timeout(ACK_TIMEOUT, rx.recv()).await {
         Ok(Some(Reply::Ack)) => on_ack(),
         // A click that beats the ack is still a click.
@@ -430,12 +746,14 @@ async fn wait_for_decision(id: &str, rx: &mut mpsc::Receiver<Reply>, on_ack: imp
         }
         Ok(None) => return None,
         Err(_) => {
-            log::line(format!("hook id={id} island never acknowledged — terminal takes over"));
+            log::line(format!(
+                "hook id={id} island never acknowledged — terminal takes over"
+            ));
             return None;
         }
     }
 
-    match tokio::time::timeout(DECISION_TIMEOUT, rx.recv()).await {
+    match tokio::time::timeout(decision_timeout, rx.recv()).await {
         Ok(Some(Reply::Decision(d))) => {
             log::line(format!("hook id={id} answered {}", word(&d)));
             Some(d)
@@ -460,7 +778,11 @@ fn send(app: &AppHandle, request_id: &str, reply: Reply, keep: bool) {
     let sender = {
         let pending = app.state::<Pending>();
         let mut map = pending.0.lock().unwrap();
-        if keep { map.get(request_id).cloned() } else { map.remove(request_id) }
+        if keep {
+            map.get(request_id).map(|request| request.sender.clone())
+        } else {
+            map.remove(request_id).map(|request| request.sender)
+        }
     };
     match sender {
         Some(tx) => {
@@ -484,12 +806,15 @@ pub fn decline(app: &AppHandle, request_id: &str) {
 /// Called by the island's Allow / Deny buttons. Only ever a bare word: turning
 /// it into Claude Code's JSON is nook-hook's job.
 pub fn answer(app: &AppHandle, request_id: &str, decision: &str) {
-    let word = match decision {
-        "allow" => "allow",
-        "skip" => "skip",
-        "deny" => "deny",
-        // Anything else is no answer: the terminal takes over.
-        _ => return,
+    let deny_only = app
+        .state::<Pending>()
+        .0
+        .lock()
+        .unwrap()
+        .get(request_id)
+        .is_some_and(|request| request.deny_only);
+    let Some(word) = decision_for_request(deny_only, decision) else {
+        return;
     };
     log::line(format!("decision id={request_id} {word}"));
     send(app, request_id, Reply::Decision(word.to_string()), false);
@@ -498,7 +823,22 @@ pub fn answer(app: &AppHandle, request_id: &str, decision: &str) {
 /// Called when the island answers a question Claude asked: what was picked,
 /// keyed by the question's own words. nook-hook puts it back in the tool's
 /// input, which is how Claude Code takes an answer.
-pub fn answer_question(app: &AppHandle, request_id: &str, answers: &serde_json::Map<String, Value>) {
+pub fn answer_question(
+    app: &AppHandle,
+    request_id: &str,
+    answers: &serde_json::Map<String, Value>,
+) {
+    let deny_only = app
+        .state::<Pending>()
+        .0
+        .lock()
+        .unwrap()
+        .get(request_id)
+        .is_some_and(|request| request.deny_only);
+    if deny_only {
+        send(app, request_id, Reply::Decision("deny".into()), false);
+        return;
+    }
     log::line(format!("decision id={request_id} answer"));
     let line = format!("answer {}", Value::Object(answers.clone()));
     send(app, request_id, Reply::Decision(line), false);
@@ -515,6 +855,146 @@ mod tests {
         assert!(!sddl.contains("WD") && !sddl.contains("BU"));
     }
 
+    #[cfg(feature = "nook-dev")]
+    #[test]
+    fn dev_hook_trace_contains_only_allowlisted_event_and_outcome_metadata() {
+        let line = dev_hook_trace("UserPromptSubmit", "state=prompt-submitted");
+        assert_eq!(
+            line,
+            "claude-e2e event=UserPromptSubmit ipc=received state=prompt-submitted"
+        );
+        assert_eq!(
+            dev_hook_trace("PermissionRequest", "pending=cleared outcome=deny"),
+            "claude-e2e event=PermissionRequest ipc=received pending=cleared outcome=deny"
+        );
+        assert_eq!(
+            dev_hook_trace("UserSecretPrompt", "C:\\private\\secret.txt"),
+            "claude-e2e event=Other ipc=received state=processed"
+        );
+        assert!(
+            !line.contains("prompt text")
+                && !line.contains("session_id")
+                && !line.contains("private")
+        );
+    }
+
+    #[cfg(feature = "nook-dev")]
+    #[test]
+    fn dev_claude_trace_excludes_synthetic_codex_and_other_agents() {
+        assert!(is_real_claude_dev_event(
+            &json!({ "hook_event_name": "SessionStart", "session_id": "claude-real-session" })
+        ));
+        assert!(is_real_claude_dev_event(
+            &json!({ "hook_event_name": "SessionStart", "session_id": "claude-real-session", "nook_tool": "claude" })
+        ));
+        assert!(!is_real_claude_dev_event(
+            &json!({ "hook_event_name": "SessionStart", "session_id": "nook-test:claude:fixture" })
+        ));
+        assert!(!is_real_claude_dev_event(
+            &json!({ "hook_event_name": "SessionStart", "session_id": "codex:nook-test:fixture", "nook_tool": "codex" })
+        ));
+        assert!(!is_real_claude_dev_event(
+            &json!({ "hook_event_name": "SessionStart", "session_id": "nook-sim:claude:fixture", "nook_simulated": true })
+        ));
+        assert!(!is_real_claude_dev_event(
+            &json!({ "hook_event_name": "SessionStart", "session_id": "other", "nook_agent": "other" })
+        ));
+    }
+
+    #[test]
+    fn production_decisions_keep_the_existing_allow_behavior() {
+        assert_eq!(decision_for_request(false, "allow"), Some("allow"));
+        assert_eq!(decision_for_request(false, "deny"), Some("deny"));
+    }
+
+    #[cfg(feature = "nook-dev")]
+    #[test]
+    fn synthetic_sessions_are_deny_only_even_if_the_ui_requests_allow_or_answer() {
+        assert!(test_session_id("nook-test:claude:fixture"));
+        assert!(test_session_id("codex:nook-test:codex:fixture"));
+        assert!(!test_session_id("codex:real-session"));
+        assert_eq!(decision_for_request(true, "allow"), Some("deny"));
+        assert_eq!(decision_for_request(true, "skip"), Some("deny"));
+        assert_eq!(decision_for_request(true, "deny"), Some("deny"));
+        assert_eq!(decision_for_request(true, "garbage"), None);
+        assert!(manual_alert_session_id(
+            "nook-test:two-pending-alerts:claude:run"
+        ));
+        assert!(manual_alert_session_id(
+            "codex:nook-test:two-pending-alerts:codex:run"
+        ));
+        assert!(!manual_alert_session_id("nook-test:other:run"));
+        assert_eq!(MANUAL_ALERT_DECISION_TIMEOUT, Duration::from_secs(280));
+        assert!(MANUAL_ALERT_DECISION_TIMEOUT < Duration::from_secs(290));
+    }
+
+    #[cfg(feature = "nook-dev")]
+    #[test]
+    fn lifecycle_cancellation_releases_only_matching_session_and_turn() {
+        let pending = Pending::default();
+        let (a_tx, mut a_rx) = mpsc::channel(2);
+        let (same_session_other_turn_tx, mut same_session_other_turn_rx) = mpsc::channel(2);
+        let (other_session_tx, mut other_session_rx) = mpsc::channel(2);
+        let (real_session_tx, mut real_session_rx) = mpsc::channel(2);
+        {
+            let mut map = pending.0.lock().unwrap();
+            map.insert(
+                "a".into(),
+                PendingRequest {
+                    sender: a_tx,
+                    session_id: "codex:nook-test:a".into(),
+                    turn_id: Some("turn-a".into()),
+                    deny_only: true,
+                },
+            );
+            map.insert(
+                "b".into(),
+                PendingRequest {
+                    sender: same_session_other_turn_tx,
+                    session_id: "codex:nook-test:a".into(),
+                    turn_id: Some("turn-b".into()),
+                    deny_only: true,
+                },
+            );
+            map.insert(
+                "c".into(),
+                PendingRequest {
+                    sender: other_session_tx,
+                    session_id: "nook-test:claude:b".into(),
+                    turn_id: None,
+                    deny_only: true,
+                },
+            );
+            map.insert(
+                "real".into(),
+                PendingRequest {
+                    sender: real_session_tx,
+                    session_id: "codex:real-session".into(),
+                    turn_id: Some("real-turn".into()),
+                    deny_only: false,
+                },
+            );
+        }
+        assert_eq!(
+            cancel_matching(&pending, "codex:nook-test:a", Some("turn-a")),
+            1
+        );
+        assert!(matches!(a_rx.try_recv(), Ok(Reply::Decline)));
+        assert!(same_session_other_turn_rx.try_recv().is_err());
+        assert!(other_session_rx.try_recv().is_err());
+        assert_eq!(cancel_matching(&pending, "codex:nook-test:a", None), 1);
+        assert!(matches!(
+            same_session_other_turn_rx.try_recv(),
+            Ok(Reply::Decline)
+        ));
+        assert_eq!(pending.0.lock().unwrap().len(), 2);
+        assert_eq!(cancel_matching(&pending, "nook-test:claude:b", None), 1);
+        assert!(matches!(other_session_rx.try_recv(), Ok(Reply::Decline)));
+        assert_eq!(cancel_matching(&pending, "codex:real-session", None), 0);
+        assert!(real_session_rx.try_recv().is_err());
+        assert_eq!(pending.0.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn the_log_says_which_agent_an_event_is_about_and_only_the_names_of_its_fields() {
         // A side agent of Claude Code's own stops: an id nothing launched, an empty type.
@@ -528,8 +1008,15 @@ mod tests {
 
         // A real one starts; an event with no type at all says so.
         let start = json!({ "hook_event_name": "SubagentStart", "agent_id": "af3d8c03f03bd405d", "agent_type": "general-purpose" });
-        assert!(subagent_note("SubagentStart", &start).unwrap().starts_with(" agent=af3d8c03f03bd405d type=general-purpose keys=["));
-        assert!(subagent_note("SubagentStop", &json!({ "hook_event_name": "SubagentStop" })).unwrap().starts_with(" agent=- type=- "));
+        assert!(subagent_note("SubagentStart", &start)
+            .unwrap()
+            .starts_with(" agent=af3d8c03f03bd405d type=general-purpose keys=["));
+        assert!(subagent_note(
+            "SubagentStop",
+            &json!({ "hook_event_name": "SubagentStop" })
+        )
+        .unwrap()
+        .starts_with(" agent=- type=- "));
 
         // The call that launches one: its kind and the id it came back with, never what it was asked.
         let call = json!({
@@ -541,10 +1028,17 @@ mod tests {
         assert!(!note.contains("Count files") && !note.contains("List the files"));
 
         // Any other event has nothing more to say than its name.
-        assert!(subagent_note("PreToolUse", &json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash" })).is_none());
+        assert!(subagent_note(
+            "PreToolUse",
+            &json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash" })
+        )
+        .is_none());
         assert!(subagent_note("Stop", &json!({ "hook_event_name": "Stop" })).is_none());
         // Something that is no id is not written as it came.
-        assert_eq!(noted(Some(&json!("an id\nwith a line break"))), "an?id?with?a?line?break");
+        assert_eq!(
+            noted(Some(&json!("an id\nwith a line break"))),
+            "an?id?with?a?line?break"
+        );
         assert_eq!(noted(Some(&json!("x".repeat(200)))).len(), NOTE_CHARS);
     }
 }

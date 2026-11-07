@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Nook Dev",
+  "identifier": "io.github.zubairbinshaukat.nook.dev",
+  "mainBinaryName": "nook-dev",
+  "build": {
+    "beforeDevCommand": "npm run dev:dev",
+    "beforeBuildCommand": "npm run build:dev",
+    "frontendDist": "../dist-dev"
+  },
+  "bundle": {
+    "shortDescription": "Isolated Nook development build",
+    "longDescription": "A separate development build of Nook with isolated data, IPC, and disabled agent configuration changes.",
+    "resources": {
+      "../target-nook-dev/release/nook-hook-dev.exe": "nook-hook-dev.exe",
+      "../../LICENSE": "LICENSE",
+      "../../NOTICE": "NOTICE"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "nsis/dev-hooks.nsh"
+      }
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "island",
+        "title": "Nook Dev",
+        "url": "index.html",
+        "width": 240,
+        "height": 6,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "visible": true,
+        "center": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "dragDropEnabled": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required"
+      }
+    ]
+  }
+}

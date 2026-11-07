@@ -3,6 +3,11 @@
 
 export type FsmState = "hidden" | "petit" | "home" | "greeting";
 
+/** Only Home uses the pointer-leave collapse timer; greeting has its own end. */
+export function shouldArmHomeCollapse(state: FsmState, pointerInIsland: boolean): boolean {
+  return state === "home" && !pointerInIsland;
+}
+
 /** What the timers are set with: the window's own, or a clock a self-check moves by hand. */
 export interface FsmTimers {
   set(run: () => void, ms: number): number;
@@ -16,8 +21,9 @@ const WINDOW_TIMERS: FsmTimers = {
 
 export class IslandStateMachine {
   state: FsmState = "hidden";
+  private timers: FsmTimers;
 
-  constructor(private timers: FsmTimers = WINDOW_TIMERS) {}
+  constructor(timers: FsmTimers = WINDOW_TIMERS) { this.timers = timers; }
 
   onTransition: ((from: FsmState, to: FsmState) => void) | null = null;
 
@@ -38,8 +44,10 @@ export class IslandStateMachine {
   greetAutoCollapseDelay = 0.6;
   /** greeting → petit while the mouse hovers the greeting. */
   greetHoverCollapseDelay = 10;
-  /** An alert waiting for an answer stays open, even when the mouse leaves. */
+  /** Retained as alert state; idle visual collapse is held by active interaction instead. */
   pinned = false;
+  /** A field, keyboard panel, or summoned view is actively in use. */
+  holdsHomeCollapse: () => boolean = () => false;
 
   /** The folded island was left alone: it hides when its time is up. Kept while nothing may hide it. */
   private leaving = false;
@@ -136,6 +144,10 @@ export class IslandStateMachine {
    * too when `restart` says the delay itself is another.
    */
   refresh(restart = false) {
+    if (this.state === "home") {
+      if (restart && this.homeCollapse != null) this.scheduleHomeCollapse();
+      return;
+    }
     if (this.state !== "petit" || !this.leaving) return;
     const held = !(this.petitToHiddenDelay > 0) || this.holds();
     if (held) this.clear("petitHide");
@@ -161,10 +173,10 @@ export class IslandStateMachine {
 
   private scheduleHomeCollapse() {
     this.clear("homeCollapse");
-    if (this.pinned) return;
+    if (this.holdsHomeCollapse()) return;
     this.homeCollapse = this.timers.set(() => {
       this.homeCollapse = null;
-      if (this.state === "home") this.transition("petit");
+      if (this.state === "home" && !this.holdsHomeCollapse()) this.transition("petit");
     }, this.homeToPetitDelay * 1000);
   }
 

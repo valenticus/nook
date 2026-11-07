@@ -20,8 +20,14 @@ fn main() {
     override_msvcrt_lib();
     // Libraries that would pull in the DLL runtime.
     for lib in [
-        "libvcruntimed.lib", "vcruntime.lib", "vcruntimed.lib", "libcmtd.lib",
-        "msvcrt.lib", "msvcrtd.lib", "libucrt.lib", "libucrtd.lib",
+        "libvcruntimed.lib",
+        "vcruntime.lib",
+        "vcruntimed.lib",
+        "libcmtd.lib",
+        "msvcrt.lib",
+        "msvcrtd.lib",
+        "libucrt.lib",
+        "libucrtd.lib",
     ] {
         println!("cargo:rustc-link-arg=/NODEFAULTLIB:{lib}");
     }
@@ -34,16 +40,55 @@ fn main() {
 /// What Windows shows under a file's Properties → Details, and what a security
 /// product reads to say whose program this is: the relay is a separate exe
 /// that Claude Code runs on every event, and without this it has no name at all.
-/// The version numbers come from the package's own version.
+/// Standalone has an independent release version; other relays follow the
+/// Original package version.
 #[cfg(windows)]
 fn version_info() {
     let mut res = tauri_winres::WindowsResource::new();
-    res.set("ProductName", "Nook");
-    res.set("FileDescription", "Nook hook relay for Claude Code");
+    let standalone = std::env::var_os("CARGO_FEATURE_STANDALONE_RELAY").is_some();
+    let dev = std::env::var_os("CARGO_FEATURE_NOOK_DEV_RELAY").is_some();
+    let product_name = if standalone {
+        "Nook Personal Edition"
+    } else if dev {
+        "Nook Dev"
+    } else {
+        "Nook"
+    };
+    let filename = if standalone {
+        "nook-hook-standalone.exe"
+    } else if dev {
+        "nook-hook-dev.exe"
+    } else {
+        "nook-hook.exe"
+    };
+    res.set("ProductName", product_name);
+    res.set(
+        "FileDescription",
+        if standalone {
+            "Nook Personal Edition"
+        } else if dev {
+            "Nook Dev hook relay"
+        } else {
+            "Nook hook relay for Claude Code"
+        },
+    );
     res.set("CompanyName", "Zubair Bin Shaukat");
     res.set("LegalCopyright", "© Zubair Bin Shaukat and contributors");
-    res.set("InternalName", "nook-hook");
-    res.set("OriginalFilename", "nook-hook.exe");
+    res.set(
+        "InternalName",
+        if standalone {
+            "nook-hook-standalone"
+        } else if dev {
+            "nook-hook-dev"
+        } else {
+            "nook-hook"
+        },
+    );
+    res.set("OriginalFilename", filename);
+    if standalone {
+        res.set("FileVersion", "0.1.0");
+        res.set("ProductVersion", "0.1.0");
+    }
     if let Err(err) = res.compile() {
         println!("cargo:warning=nook-hook: no version information ({err})");
     }
@@ -57,9 +102,10 @@ fn override_msvcrt_lib() {
         _ => return,
     };
     let bytes: &[u8] = &[
-        1, 0, 94, 3, 96, 98, 60, 0, 0, 0, 1, 0, 0, 0, 0, 0, 132, 1, 46, 100, 114, 101, 99, 116, 118,
-        101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        10, 16, 0, 46, 100, 114, 101, 99, 116, 118, 101, 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 4, 0, 0, 0,
+        1, 0, 94, 3, 96, 98, 60, 0, 0, 0, 1, 0, 0, 0, 0, 0, 132, 1, 46, 100, 114, 101, 99, 116,
+        118, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 10, 16, 0, 46, 100, 114, 101, 99, 116, 118, 101, 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 4, 0,
+        0, 0,
     ];
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let path = std::path::Path::new(&out_dir).join("msvcrt.lib");

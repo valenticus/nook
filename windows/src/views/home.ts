@@ -1,6 +1,6 @@
 // The home view (plans/design-plan.md §1, plans/subagents-plan.md §7): three
 // columns — the bot, speaking for the session that most needs attention; a
-// mini bot per session, in lanes; the machine and Claude's usage limits. On a
+// mini bot per session, in lanes; the existing Claude usage card. On a
 // side dock the three stand one above the other (style.css, layout.ts
 // SIDE_LAYOUTS): the same elements, laid out by the stylesheet.
 //
@@ -12,13 +12,19 @@
 
 import { createStateBot, releaseMiniBot, restMiniBot } from "../bot/minibots";
 import { hexToRGB, type BotEngine } from "../bot/engine";
-import { HOME_SIDE_BOT_H, HOME_SIDE_SESSIONS_H, HOME_STAGE, MAX_VISIBLE, washRGBA, type BotStateName, type Wash } from "../core/layout";
-import { DECISION_WORDS, State, USAGE_OLD_MS, USAGE_SOURCE_WORDS, ramPercent, ramWords, usageLevel, usageShown } from "../core/state";
-import { clear, h, svg } from "./dom";
+import { homeContentSize, HOME_SIDE_BOT_H, HOME_SIDE_SESSIONS_H, HOME_STAGE, MAX_VISIBLE, washRGBA, type BotStateName, type Wash } from "../core/layout";
+import { DECISION_WORDS, State } from "../core/state";
+import { currentLanguage, message, plural } from "../core/i18n";
+import { shelfTrace } from "../core/shelf-trace";
+import {
+  clear, h, setAttributeIfChanged, setHiddenIfChanged,
+  setStylePropertyIfChanged, setStyleValueIfChanged, setTextIfChanged, svg,
+} from "./dom";
 import { ICONS } from "./icons";
-import { LUCIDE, lucide } from "./iconset";
 import { TOOL_NAME, toolMark } from "./tool";
 import { wear } from "./palette";
+import { buildHomeUsage } from "./home-usage";
+import { buildClaudeHooksStatus } from "./claude-hooks-status";
 import {
   MAX_CHILD_DOTS, doingOf, labelOf, labelText, roster, runningSubagents, span, stateWords, subagentColor,
   subagentWords, type Entry, type Lane,
@@ -46,28 +52,11 @@ interface Cell {
   mark: HTMLElement;
   /** What it was last drawn for: nothing is touched when that has not changed. */
   key: string;
+  kidsKey: string;
   state: BotStateName | null;
 }
 
-/** The icons of the resources column, at the size of its words. */
-const RES_ICON = 12;
-
-/** A line of the machine: its icon and name, a slim bar for how full, and the figure — "—" in the same cell until it is known. */
-function gauge(name: string, icon: string) {
-  const value = h("span", { class: "res-value pct blank", text: "—" });
-  const fill = h("i");
-  const el = h("div", { class: "res-head" }, lucide(icon, RES_ICON), h("b", { text: name }), h("div", { class: "res-bar" }, fill), value);
-  return {
-    el,
-    /** `percent` is null while nothing is known; `more` is what the tooltip adds. */
-    set(percent: number | null, more = "") {
-      value.textContent = percent != null ? `${Math.round(percent)}%` : "—";
-      value.classList.toggle("blank", percent == null);
-      fill.style.width = `${percent ?? 0}%`;
-      el.title = more;
-    },
-  };
-}
+/** The icon used by the usage rows, at the size of their words. */
 
 export function buildHome(actions: ViewActions): ViewHost {
   // ── Left: the bot's card ────────────────────────────────────────────────────
@@ -79,6 +68,7 @@ export function buildHome(actions: ViewActions): ViewHost {
   const doing = h("div", { class: "hb-doing" });
   /** The session the card speaks for: what its button goes to. */
   let frontId = "";
+  let shownToolKey: string | null = null;
   // Built once: rebuilt between a mouse-down and its mouse-up, it would swallow the click.
   const reviewLabel = h("span");
   const review = h("button", { class: "btn primary", onclick: () => frontId && actions.reviewRequest(frontId) }, reviewLabel);
@@ -100,48 +90,29 @@ export function buildHome(actions: ViewActions): ViewHost {
   for (const { key, title } of LANES) {
     const count = h("i");
     const bots = h("div", { class: "lane-bots" });
-    lanes.set(key, { el: h("div", { class: `lane ${key}` }, h("div", { class: "lane-h" }, title, " ", count), bots), count, bots });
+    lanes.set(key, { el: h("div", { class: `lane ${key}` }, h("div", { class: "lane-h" }, message(title), " ", count), bots), count, bots });
   }
   const more = h("button", { class: "hs-more", onclick: (e: Event) => { e.stopPropagation(); toggleList(); } });
   const laneRow = h("div", { class: "hs-lanes" }, ...LANES.map((l) => lanes.get(l.key)!.el), more);
   const foot = h("div", { class: "hs-foot" });
   const empty = h("div", { class: "hs-empty" });
   const list = h("div", { class: "hs-list" });
-  const sessionsCard = h("div", { class: "card home-sessions" }, laneRow, empty, foot, list);
+  const integrations = buildClaudeHooksStatus(true);
+  const sessionsCard = h("div", { class: "card home-sessions" }, laneRow, integrations.el, empty, foot, list);
 
-  // ── Right: resources. Every line is built once and only its words change, so nothing moves. ──
-  const cpu = gauge("CPU", LUCIDE.cpu);
-  const gpu = gauge("GPU", LUCIDE.gpu);
-  const ram = gauge("RAM", LUCIDE.memoryStick);
-  const usageRows = ([["5 h", LUCIDE.timer], ["7 d", LUCIDE.calendarDays]] as const).map(([label, icon]) => {
-    const resets = h("span", { class: "res-sub" });
-    const value = h("span", { class: "res-value" });
-    const fill = h("i");
-    const el = h(
-      "div", { class: "res-row" },
-      h("div", { class: "res-head" }, lucide(icon, RES_ICON), h("b", { text: label }), resets, value),
-      h("div", { class: "res-bar" }, fill),
-    );
-    return { el, resets, value, fill };
-  });
-  const noUsage = h("div", { class: "res-none" });
-  const usageBox = h("div", { class: "res-usage", title: USAGE_SOURCE_WORDS }, usageRows[0].el, usageRows[1].el, noUsage);
-  const ageWhat = h("span", { class: "what", text: "as of last Claude Code activity" });
-  const ageWhen = h("span", { class: "when" });
-  const usageAge = h("div", { class: "res-age" }, ageWhat, ageWhen);
-  const resCard = h(
-    "div", { class: "card home-res" },
-    h("div", { class: "res-machine" }, cpu.el, gpu.el, ram.el),
-    h("div", { class: "lane-h", text: "Claude usage" }),
-    usageBox,
-    usageAge,
-  );
+  // ── Right: Claude usage. The rows are built once; only their words change. ──
+  const usagePanel = buildHomeUsage();
+  const resCard = usagePanel.el;
 
   // The lanes and the resources: two more columns at the top and bottom (the
   // wrapper has no box of its own there); on a side, what scrolls under the
   // bot's card when the window is too short for all three (style.css `.home-rest`).
   const rest = h("div", { class: "home-rest" }, sessionsCard, resCard);
-  const el = h("div", { class: "view" }, h("div", { class: "home" }, botCard, rest));
+  const el = h("div", { class: "view home-view" }, h("div", { class: "home" }, botCard, rest));
+  const homeFrame = homeContentSize();
+  el.style.setProperty("--home-frame-width", `${homeFrame.width}px`);
+  el.style.setProperty("--home-frame-height", `${homeFrame.height}px`);
+  if (__NOOK_DEV_BUILD__) shelfTrace("home-dom-created", { locale: currentLanguage(), source: "buildHome" });
   // Home upright on a side: its cards' heights and the stage's width, said once (layout.ts), read by the stylesheet.
   el.style.setProperty("--home-side-bot", `${HOME_SIDE_BOT_H}px`);
   el.style.setProperty("--home-side-sessions", `${HOME_SIDE_SESSIONS_H}px`);
@@ -196,12 +167,13 @@ export function buildHome(actions: ViewActions): ViewHost {
     cell.addEventListener("click", (e) => { e.stopPropagation(); open(id); });
     // A click does not leave it with the focus: the keyboard is the panel's.
     cell.addEventListener("mousedown", (e) => e.preventDefault());
-    return { el: cell, bot, kids, mark, key: "", state: null };
+    return { el: cell, bot, kids, mark, key: "", kidsKey: "", state: null };
   }
 
   function updateCell(cell: Cell, entry: Entry) {
     const running = entry.session ? runningSubagents(entry.session) : [];
-    const key = [entry.state, entry.lane, entry.unseen, entry.decision, running.map((r) => (r.asking ? "a" : "r")).join("")].join("~");
+    const runningKey = `${running.length}:${running.map((r) => (r.asking ? "a" : "r")).join("")}`;
+    const key = [entry.state, entry.lane, entry.unseen, entry.decision, runningKey].join("~");
     if (key === cell.key) return;
     cell.key = key;
     const changed = cell.state != null && cell.state !== entry.state;
@@ -213,15 +185,19 @@ export function buildHome(actions: ViewActions): ViewHost {
     restMiniBot(cell.bot.el, rest, changed);
     // One mark at its corner: the decision's comes before the plain "unseen". What the bot itself
     // wears — asking, an error — is not touched by either.
-    cell.mark.hidden = !(entry.unseen || entry.decision);
+    setHiddenIfChanged(cell.mark, !(entry.unseen || entry.decision));
     cell.mark.classList.toggle("decide", entry.decision);
-    cell.el.title = entry.decision ? DECISION_WORDS : "";
+    setAttributeIfChanged(cell.el, "title", entry.decision ? DECISION_WORDS : "");
 
-    clear(cell.kids);
-    for (const r of running.slice(0, MAX_CHILD_DOTS)) {
-      cell.kids.append(h("i", { class: r.asking ? "asking" : "", style: `--c:${subagentColor(r.asking)}` }));
+    const kidsKey = runningKey;
+    if (kidsKey !== cell.kidsKey) {
+      cell.kidsKey = kidsKey;
+      clear(cell.kids);
+      for (const r of running.slice(0, MAX_CHILD_DOTS)) {
+        cell.kids.append(h("i", { class: r.asking ? "asking" : "", style: `--c:${subagentColor(r.asking)}` }));
+      }
+      if (running.length > MAX_CHILD_DOTS) cell.kids.append(h("small", { text: `+${running.length - MAX_CHILD_DOTS}` }));
     }
-    if (running.length > MAX_CHILD_DOTS) cell.kids.append(h("small", { text: `+${running.length - MAX_CHILD_DOTS}` }));
   }
 
   function release(cell: Cell) {
@@ -292,10 +268,10 @@ export function buildHome(actions: ViewActions): ViewHost {
     for (const { key } of LANES) {
       const lane = lanes.get(key)!;
       const mine = visible.filter((e) => e.lane === key);
-      lane.el.hidden = mine.length === 0;
+      setHiddenIfChanged(lane.el, mine.length === 0);
       lane.el.classList.toggle("sep", !first && mine.length > 0);
       if (mine.length) first = false;
-      lane.count.textContent = String(mine.length);
+      setTextIfChanged(lane.count, String(mine.length));
       for (const entry of mine) {
         let cell = cells.get(entry.id);
         const fresh = !cell;
@@ -312,12 +288,12 @@ export function buildHome(actions: ViewActions): ViewHost {
     }
 
     // "+N" wears the colour of the most urgent session it hides: a hidden request is never silent.
-    more.hidden = hidden.length === 0;
+    setHiddenIfChanged(more, hidden.length === 0);
     if (hidden.length) {
-      more.textContent = `+${hidden.length}`;
+      setTextIfChanged(more, `+${hidden.length}`);
       wear(more, hidden[0].color);
       more.classList.toggle("calls", hidden[0].rank === 0);
-      more.title = `${hidden.length} more`;
+      setAttributeIfChanged(more, "title", message("{count} more", { count: hidden.length }));
     } else {
       listOpen = false;
     }
@@ -328,76 +304,90 @@ export function buildHome(actions: ViewActions): ViewHost {
     }
   }
 
-  function drawMain(front: Entry | null, tracked: number) {
+  function drawMain(front: Entry | null) {
     frontId = front?.session?.id ?? "";
     botCard.classList.toggle("opens", frontId !== "");
     if (!front) {
-      const missing = !State.settings.hooksInstalled && tracked === 0;
-      botCard.style.setProperty("--wash", washRGBA("soft"));
-      whoTool.replaceChildren();
-      whoName.textContent = missing ? "Not connected" : "No sessions";
-      whoName.title = "";
-      whoModel.textContent = "";
-      whoState.textContent = "";
-      doing.textContent = missing ? "Claude Code can't reach Nook yet" : "Nothing is running";
-      doing.title = "";
-      review.style.display = "none";
+      setStylePropertyIfChanged(botCard, "--wash", washRGBA("soft"));
+      if (shownToolKey !== "") {
+        shownToolKey = "";
+        if (whoTool.childNodes.length) whoTool.replaceChildren();
+      }
+      setAttributeIfChanged(whoName, "title", "");
+      setTextIfChanged(whoModel, "");
+      setTextIfChanged(whoState, "");
+      setTextIfChanged(whoName, message("No active sessions"));
+      setTextIfChanged(doing, message(State.nookDev
+        ? "This Dev build does not inspect or install global agent integrations. Only events sent to Nook Dev appear here."
+        : "Nook displays Claude Code and Codex sessions when their integrations report activity."));
+      setAttributeIfChanged(doing, "title", "");
+      setStyleValueIfChanged(review, "display", "none");
+      setTextIfChanged(reviewLabel, "");
       return;
     }
     const resting = front.lane === "done";
     const wash = resting && front.decision ? "indigo" : resting && !front.unseen ? "soft" : (WASH[front.state] ?? (front.unseen ? "green" : "soft"));
-    botCard.style.setProperty("--wash", washRGBA(wash));
+    setStylePropertyIfChanged(botCard, "--wash", washRGBA(wash));
     const tool = front.session?.agent;
-    if (tool) whoTool.replaceChildren(toolMark(tool, 11), TOOL_NAME[tool] + " ·");
-    else whoTool.replaceChildren();
-    whoName.textContent = labelText(front);
-    whoName.title = labelOf(front).path;
+    const toolKey = tool ?? "";
+    if (toolKey !== shownToolKey) {
+      shownToolKey = toolKey;
+      if (tool) whoTool.replaceChildren(toolMark(tool, 11), TOOL_NAME[tool] + " ·");
+      else if (whoTool.childNodes.length) whoTool.replaceChildren();
+    }
+    setTextIfChanged(whoName, labelText(front));
+    setAttributeIfChanged(whoName, "title", labelOf(front).path);
     // The model it runs on, when it said: nothing is shown for one that did not.
     const model = front.session?.model?.label ?? "";
-    whoModel.textContent = model;
-    whoModel.title = front.session?.model?.id ?? "";
-    whoModel.hidden = !model;
-    whoState.textContent = stateWords(front);
-    whoState.style.color = resting && !front.decision ? "" : front.color;
-    const what = doingOf(front);
-    doing.textContent = what;
-    doing.title = what;
+    setTextIfChanged(whoModel, model);
+    setAttributeIfChanged(whoModel, "title", front.session?.model?.id ?? "");
+    setHiddenIfChanged(whoModel, !model);
+    setTextIfChanged(whoState, message(stateWords(front)));
+    setStyleValueIfChanged(whoState, "color", resting && !front.decision ? "" : front.color);
+    const what = message(doingOf(front));
+    setTextIfChanged(doing, what);
+    setAttributeIfChanged(doing, "title", what);
     // No Allow here: this card cannot show a request whole, and Allow allows
     // all of it. The button goes to the request's own card, which can — and
     // which arms its buttons from the moment it is on show.
-    const asks = front.session?.question ? "Answer" : front.session?.approval ? "Review" : "";
-    review.style.display = asks ? "" : "none";
-    reviewLabel.textContent = asks;
+    const asks = front.session?.question ? message("Answer") : front.session?.approval ? message("Review") : "";
+    setStyleValueIfChanged(review, "display", asks ? "" : "none");
+    setTextIfChanged(reviewLabel, asks);
   }
 
   function drawEmpty(none: boolean, tracked: number) {
-    empty.hidden = !none;
-    laneRow.hidden = none;
-    foot.hidden = none;
-    const missing = !State.settings.hooksInstalled && tracked === 0;
-    const key = none ? `${missing}:${tracked}` : "";
+    setHiddenIfChanged(empty, !none);
+    setHiddenIfChanged(laneRow, none);
+    setHiddenIfChanged(foot, none);
+    const key = none ? `${tracked}:${State.nookDev}` : "";
     if (key === emptyKey) return;
     emptyKey = key;
     clear(empty);
     if (!none) return;
-    if (missing) {
-      empty.append(
-        h("div", { class: "title", text: "Hooks not installed" }),
-        h("div", { class: "sub", text: "Nook hears about sessions through Claude Code's hooks. Install them to see sessions here." }),
-        h("button", { class: "btn secondary", onclick: () => actions.openSettingsWindow() }, svg(ICONS.gear, 12), "Open Settings"),
-      );
-    } else if (tracked > 0) {
+    if (tracked > 0) {
       // Sessions are still followed: they have only been at rest long enough to leave the view.
+      const restingCopy = currentLanguage() === "uk"
+        ? plural(tracked, {
+            one: "{count} сесія зараз неактивна. Вона з’явиться тут, коли відновить роботу.",
+            few: "{count} сесії зараз неактивні. Вони з’являться тут, коли відновлять роботу.",
+            many: "{count} сесій зараз неактивні. Вони з’являться тут, коли відновлять роботу.",
+            other: "{count} сесії зараз неактивні. Вони з’являться тут, коли відновлять роботу.",
+          })
+        : plural(tracked, {
+            one: "{count} session is at rest. It will appear here when it works again.",
+            other: "{count} sessions are at rest. They will appear here when they work again.",
+          });
       empty.append(
-        h("div", { class: "title", text: "Nothing running" }),
-        h("div", { class: "sub", text: `${tracked} session${tracked === 1 ? " is" : "s are"} at rest. ${tracked === 1 ? "It comes" : "They come"} back here when ${tracked === 1 ? "it works" : "they work"} again.` }),
-        h("button", { class: "btn secondary", text: tracked === 1 ? "Show it" : "Show them", onclick: () => { actions.blip(); actions.openSessions(); } }),
+        h("div", { class: "title", text: message("Nothing running") }),
+        h("div", { class: "sub", text: restingCopy }),
+        h("button", { class: "btn secondary", text: message(tracked === 1 ? "Show it" : "Show them"), onclick: () => { actions.blip(); actions.openSessions(); } }),
       );
     } else {
-      empty.append(
-        h("div", { class: "title", text: "No Claude Code sessions" }),
-        h("div", { class: "sub" }, "Run ", h("code", { class: "code", text: "claude" }), " in any project folder and it shows up here."),
-      );
+      empty.append(h("div", { class: "title", text: message("No active sessions") }));
+      empty.append(h("div", { class: "sub", text: message(State.nookDev
+        ? "This Dev build does not inspect or install global agent integrations. Only events sent to Nook Dev appear here."
+        : "Nook displays Claude Code and Codex sessions when their integrations report activity.") }));
+      if (!State.nookDev) empty.append(h("button", { class: "btn secondary", onclick: () => actions.openSettingsWindow() }, svg(ICONS.gear, 12), message("Check integrations in Settings")));
     }
   }
 
@@ -411,14 +401,14 @@ export function buildHome(actions: ViewActions): ViewHost {
     clear(foot);
     if (!entry) {
       foot.classList.add("quiet");
-      foot.append(h("div", { class: "hf-doing", text: "Hover a bot for its project and what it is doing. Click opens its session." }));
+      foot.append(h("div", { class: "hf-doing", text: message("Hover a bot for its project and what it is doing. Click opens its session.") }));
       return;
     }
     foot.classList.remove("quiet");
     const { name, n, path } = labelOf(entry);
     const model = entry.session?.model;
     const subs = entry.session ? subagentWords(entry.session) : "";
-    const what = doingOf(entry);
+    const what = message(doingOf(entry));
     foot.append(
       h("div", { class: "hf-who" },
         h("i", { class: "dot", style: `width:6px;height:6px;background:${entry.color}` }),
@@ -426,14 +416,14 @@ export function buildHome(actions: ViewActions): ViewHost {
         h("b", { text: name, title: path }),
         n == null ? null : h("em", { text: `·${n}` }),
         model ? h("span", { class: "model", text: model.label, title: model.id }) : null,
-        h("span", { text: entry.task ? `agent · ${stateWords(entry)}` : stateWords(entry) }),
-        subs ? h("span", { class: "subs", text: subs }) : null),
+        h("span", { text: entry.task ? message("agent · {state}", { state: stateWords(entry) }) : message(stateWords(entry)) }),
+        subs ? h("span", { class: "subs", text: message(subs) }) : null),
       h("div", { class: "hf-doing", text: what, title: what }),
     );
   }
 
   function drawList(hidden: Entry[], now: number) {
-    list.hidden = !listOpen || hidden.length === 0;
+    setHiddenIfChanged(list, !listOpen || hidden.length === 0);
     const key = list.hidden ? "" : hidden.map((e) => [e.id, labelText(e), stateWords(e), e.color, span(now - e.since)].join("~")).join("|");
     if (key === listKey) return;
     listKey = key;
@@ -463,64 +453,7 @@ export function buildHome(actions: ViewActions): ViewHost {
 
   // ── Resources ───────────────────────────────────────────────────────────────
 
-  /** The machine: written when a sample comes, and at no other time. */
-  function drawGauges() {
-    const m = State.metrics;
-    // CPU and GPU need two readings: "—" in the same cell until the first real
-    // one — and, for the GPU, for good on a machine that does not report it.
-    cpu.set(m?.cpu ?? null);
-    gpu.set(m?.gpu ?? null);
-    // The share in use; how many gigabytes that is stays in the tooltip.
-    ram.set(ramPercent(m), ramWords(m));
-    drawUsage(Date.now());
-  }
-
-  /** Claude's limits: how much of each window is used, when it starts again, and how old that is. */
-  function drawUsage(now: number) {
-    const usage = State.usage;
-    const windows = usage ? [usage.fiveHour, usage.sevenDay] : [];
-    usageRows.forEach((row, i) => {
-      // What the window shows now (state.ts `usageShown`): past its reset, 0 % and the words for it.
-      const w = usageShown(windows[i], usage?.updatedAt ?? now, now);
-      row.el.style.visibility = w ? "visible" : "hidden";
-      if (!w) return;
-      const used = w.percent;
-      row.value.textContent = `${used}%`;
-      row.resets.textContent = w.countdown;
-      row.resets.title = w.countdown;
-      row.value.dataset.level = w.state === "reset" ? "" : usageLevel(used);
-      row.el.classList.toggle("dim", w.state !== "fresh");
-      row.fill.style.width = `${used}%`;
-      // The share of the bar's gradient the fill shows (style.css `.res-usage .res-bar i`).
-      row.fill.style.setProperty("--used", String(used / 100));
-    });
-
-    noUsage.hidden = usage != null;
-    if (!usage) {
-      const why = State.usageInstalled === false
-        ? "Turn on usage limits in Settings"
-        : State.usageInstalled
-          ? "Appears once a session has run"
-          : "Appears once a session has run with usage limits on in Settings";
-      if (noUsage.dataset.why !== why) {
-        noUsage.dataset.why = why;
-        clear(noUsage);
-        noUsage.append(h("b", { text: "No usage data yet" }), h("span", { text: why }));
-      }
-    }
-
-    // How old the numbers are, said as what they are: Claude Code's last word. Ticks with the home view's slow timer.
-    const age = usage ? now - usage.updatedAt : 0;
-    const when = !usage ? "" : age < 60_000 ? " · just now" : ` · ${span(age)} ago`;
-    usageAge.style.visibility = usage ? "visible" : "hidden";
-    usageAge.classList.toggle("old", usage != null && age > USAGE_OLD_MS);
-    if (ageWhen.textContent !== when) ageWhen.textContent = when;
-    const whole = usage ? `${ageWhat.textContent}${when}. ${USAGE_SOURCE_WORDS}` : "";
-    if (usageAge.title !== whole) usageAge.title = whole;
-  }
-
-  State.onGauges(drawGauges);
-  drawGauges();
+  // The usage panel refreshes from the shared gauge path and Home sync.
 
   return {
     el,
@@ -535,11 +468,12 @@ export function buildHome(actions: ViewActions): ViewHost {
       drawLanes(visible, hidden);
       drawEmpty(live.length === 0, faded);
       // The bot speaks for the most urgent one, whatever the pointer holds in place.
-      drawMain(live[0] ?? null, faded);
+      drawMain(live[0] ?? null);
       drawList(hidden, now);
       if (hoverId && !visible.some((e) => e.id === hoverId)) hoverId = null;
       drawFoot();
-      drawUsage(now);
+      usagePanel.draw(now);
+      integrations.sync();
     },
   };
 }

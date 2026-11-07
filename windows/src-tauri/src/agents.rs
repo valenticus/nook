@@ -18,7 +18,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, State, WebviewWindow, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, State, WebviewWindow,
+    WebviewWindowBuilder,
+};
 
 use crate::island;
 use crate::log;
@@ -90,11 +93,18 @@ pub struct Rect {
 fn overlap(a: Rect, b: Rect) -> i64 {
     let w = (a.x + a.w).min(b.x + b.w) as i64 - a.x.max(b.x) as i64;
     let h = (a.y + a.h).min(b.y + b.h) as i64 - a.y.max(b.y) as i64;
-    if w > 0 && h > 0 { w * h } else { 0 }
+    if w > 0 && h > 0 {
+        w * h
+    } else {
+        0
+    }
 }
 
 fn centre_gap(a: Rect, b: Rect) -> i64 {
-    let (dx, dy) = ((a.x + a.w / 2) as i64 - (b.x + b.w / 2) as i64, (a.y + a.h / 2) as i64 - (b.y + b.h / 2) as i64);
+    let (dx, dy) = (
+        (a.x + a.w / 2) as i64 - (b.x + b.w / 2) as i64,
+        (a.y + a.h / 2) as i64 - (b.y + b.h / 2) as i64,
+    );
     dx * dx + dy * dy
 }
 
@@ -122,7 +132,9 @@ pub fn clamp_width(want: f64, scale: f64, area_w: i32) -> i32 {
 /// window, not an empty one. Logical pixels in, physical out.
 pub fn clamp_height(content: f64, cap: f64, scale: f64, area_h: i32) -> i32 {
     let least = (MIN_HEIGHT * scale).round() as i32;
-    ((content.min(cap) * scale).round() as i32).min(area_h).max(least)
+    ((content.min(cap) * scale).round() as i32)
+        .min(area_h)
+        .max(least)
 }
 
 /// What the window is meant to be, in logical pixels: the width the user chose,
@@ -139,7 +151,12 @@ pub struct Wanted {
 /// after a display was unplugged — the nearest. A window bigger than the area
 /// sits at its corner. None only when there is no display to put it on.
 pub fn place_in(want: (i32, i32), size: (i32, i32), areas: &[Rect]) -> Option<(i32, i32)> {
-    let window = Rect { x: want.0, y: want.1, w: size.0, h: size.1 };
+    let window = Rect {
+        x: want.0,
+        y: want.1,
+        w: size.0,
+        h: size.1,
+    };
     let area = area_for(window, areas)?;
     let x = want.0.clamp(area.x, (area.x + area.w - size.0).max(area.x));
     let y = want.1.clamp(area.y, (area.y + area.h - size.1).max(area.y));
@@ -150,8 +167,19 @@ pub fn place_in(want: (i32, i32), size: (i32, i32), areas: &[Rect]) -> Option<(i
 /// of this `scale`: its physical x, y, width and height. The width and height are
 /// held to the display it lands on, then the place is held to that size, so that
 /// all of it is on a display.
-pub fn layout(want: (i32, i32), height: i32, wanted: Wanted, scale: f64, areas: &[Rect]) -> Option<(i32, i32, i32, i32)> {
-    let first = Rect { x: want.0, y: want.1, w: (wanted.width * scale).round() as i32, h: height };
+pub fn layout(
+    want: (i32, i32),
+    height: i32,
+    wanted: Wanted,
+    scale: f64,
+    areas: &[Rect],
+) -> Option<(i32, i32, i32, i32)> {
+    let first = Rect {
+        x: want.0,
+        y: want.1,
+        w: (wanted.width * scale).round() as i32,
+        h: height,
+    };
     let area = area_for(first, areas)?;
     let w = clamp_width(wanted.width, scale, area.w);
     let h = clamp_height(wanted.content, wanted.cap, scale, area.h);
@@ -198,8 +226,21 @@ pub struct Drag {
 impl Drag {
     pub fn begin(side: Side, window: Rect, cursor: (i32, i32)) -> Drag {
         let (left, right) = (window.x, window.x + window.w);
-        let grab = if side.left() { left - cursor.0 } else if side.right() { right - cursor.0 } else { 0 };
-        Drag { side, left, right, top: window.y, grab, grab_y: window.y + window.h - cursor.1 }
+        let grab = if side.left() {
+            left - cursor.0
+        } else if side.right() {
+            right - cursor.0
+        } else {
+            0
+        };
+        Drag {
+            side,
+            left,
+            right,
+            top: window.y,
+            grab,
+            grab_y: window.y + window.h - cursor.1,
+        }
     }
 }
 
@@ -241,8 +282,12 @@ pub fn first_position(area: Rect, size: (i32, i32), margin: i32) -> (i32, i32) {
 }
 
 /// The tray item's words, for what a press does.
-pub fn label(shown: bool) -> &'static str {
-    if shown { "Hide agents list" } else { "Show agents list" }
+pub fn label<'a>(shown: bool, show: &'a str, hide: &'a str) -> &'a str {
+    if shown {
+        hide
+    } else {
+        show
+    }
 }
 
 fn window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -250,16 +295,24 @@ fn window(app: &AppHandle) -> Option<WebviewWindow> {
 }
 
 fn enabled(app: &AppHandle) -> bool {
-    app.try_state::<Shared>().is_some_and(|shared| shared.settings.lock().unwrap().show_agents_list)
+    app.try_state::<Shared>()
+        .is_some_and(|shared| shared.settings.lock().unwrap().show_agents_list)
 }
 
 fn area_of(m: &Monitor) -> Rect {
     let work = m.work_area();
-    Rect { x: work.position.x, y: work.position.y, w: work.size.width as i32, h: work.size.height as i32 }
+    Rect {
+        x: work.position.x,
+        y: work.position.y,
+        w: work.size.width as i32,
+        h: work.size.height as i32,
+    }
 }
 
 fn work_areas(app: &AppHandle) -> Vec<Rect> {
-    app.available_monitors().map(|monitors| monitors.iter().map(area_of).collect()).unwrap_or_default()
+    app.available_monitors()
+        .map(|monitors| monitors.iter().map(area_of).collect())
+        .unwrap_or_default()
 }
 
 /// Created hidden at launch, like the settings window, and only shown and hidden
@@ -295,9 +348,13 @@ pub fn create_window(app: &AppHandle) {
                     api.prevent_close();
                     hide(&handle);
                 }
-                tauri::WindowEvent::Moved(at) if this.is_visible().unwrap_or(false) => note_moved(&handle, at.x, at.y),
+                tauri::WindowEvent::Moved(at) if this.is_visible().unwrap_or(false) => {
+                    note_moved(&handle, at.x, at.y)
+                }
                 // Another display's scale: the logical width is put back, and the place held inside the display.
-                tauri::WindowEvent::ScaleFactorChanged { .. } if this.is_visible().unwrap_or(false) => {
+                tauri::WindowEvent::ScaleFactorChanged { .. }
+                    if this.is_visible().unwrap_or(false) =>
+                {
                     let again = handle.clone();
                     let _ = handle.run_on_main_thread(move || settle(&again));
                 }
@@ -376,7 +433,9 @@ fn place_saved(app: &AppHandle, win: &WebviewWindow) {
         let s = shared.settings.lock().unwrap();
         s.agents_list_x.zip(s.agents_list_y)
     });
-    let Some(want) = saved.or_else(|| first_for(app, win)) else { return };
+    let Some(want) = saved.or_else(|| first_for(app, win)) else {
+        return;
+    };
     place(app, win, want);
 }
 
@@ -394,7 +453,11 @@ fn wanted(app: &AppHandle) -> Wanted {
         .try_state::<Shared>()
         .and_then(|shared| shared.settings.lock().unwrap().agents_list_h)
         .map_or(DEFAULT_CAP, f64::from);
-    Wanted { width: saved_width(app), content, cap }
+    Wanted {
+        width: saved_width(app),
+        content,
+        cap,
+    }
 }
 
 /// The first place: the top right of the main display.
@@ -417,7 +480,9 @@ fn place(app: &AppHandle, win: &WebviewWindow, want: (i32, i32)) {
     for _ in 0..2 {
         let Ok(size) = win.outer_size() else { return };
         let scale = win.scale_factor().unwrap_or(1.0);
-        let Some((x, y, w, h)) = layout(want, size.height as i32, wanted, scale, &areas) else { return };
+        let Some((x, y, w, h)) = layout(want, size.height as i32, wanted, scale, &areas) else {
+            return;
+        };
         if (w, h) != (size.width as i32, size.height as i32) {
             let _ = win.set_size(PhysicalSize::new(w as u32, h as u32));
         }
@@ -441,7 +506,9 @@ fn note_moved(app: &AppHandle, x: i32, y: i32) {
     if x < -30_000 || y < -30_000 {
         return;
     }
-    let Some(shared) = app.try_state::<Shared>() else { return };
+    let Some(shared) = app.try_state::<Shared>() else {
+        return;
+    };
     {
         let mut current = shared.settings.lock().unwrap();
         if (current.agents_list_x, current.agents_list_y) == (Some(x), Some(y)) {
@@ -474,8 +541,15 @@ fn save_soon(app: &AppHandle) {
 /// The island's page hands over the rows. Only the island may: it holds the
 /// sessions. Kept, and told to the list.
 #[tauri::command]
-pub fn agents_snapshot(app: AppHandle, window: tauri::Window, agents: State<Agents>, snapshot: Value) {
-    if window.label() != island::WINDOW_LABEL || serde_json::to_string(&snapshot).map_or(true, |text| text.len() > MAX_SNAPSHOT_BYTES) {
+pub fn agents_snapshot(
+    app: AppHandle,
+    window: tauri::Window,
+    agents: State<Agents>,
+    snapshot: Value,
+) {
+    if window.label() != island::WINDOW_LABEL
+        || serde_json::to_string(&snapshot).map_or(true, |text| text.len() > MAX_SNAPSHOT_BYTES)
+    {
         return;
     }
     agents.lock().latest = Some(snapshot.clone());
@@ -544,33 +618,62 @@ fn grip(app: &AppHandle, from: &tauri::Window) -> Option<(WebviewWindow, Rect, (
     let win = window(app)?;
     let (at, size) = (win.outer_position().ok()?, win.outer_size().ok()?);
     let cursor = app.cursor_position().ok()?;
-    let rect = Rect { x: at.x, y: at.y, w: size.width as i32, h: size.height as i32 };
+    let rect = Rect {
+        x: at.x,
+        y: at.y,
+        w: size.width as i32,
+        h: size.height as i32,
+    };
     let scale = win.scale_factor().ok()?;
-    Some((win, rect, (cursor.x.round() as i32, cursor.y.round() as i32), scale))
+    Some((
+        win,
+        rect,
+        (cursor.x.round() as i32, cursor.y.round() as i32),
+        scale,
+    ))
 }
 
 /// An edge was pressed.
 #[tauri::command]
-pub fn agents_resize_begin(app: AppHandle, window: tauri::Window, agents: State<Agents>, side: String) {
+pub fn agents_resize_begin(
+    app: AppHandle,
+    window: tauri::Window,
+    agents: State<Agents>,
+    side: String,
+) {
     let Some(side) = side_of(&side) else { return };
-    let Some((_, rect, cursor, _)) = grip(&app, &window) else { return };    agents.lock().drag = Some(Drag::begin(side, rect, cursor));
+    let Some((_, rect, cursor, _)) = grip(&app, &window) else {
+        return;
+    };
+    agents.lock().drag = Some(Drag::begin(side, rect, cursor));
 }
 
 /// The pointer moved with the edge held. A window that is not on show, or no
 /// edge held, is nothing to do.
 #[tauri::command]
 pub fn agents_resize_move(app: AppHandle, window: tauri::Window, agents: State<Agents>) {
-    let Some(drag) = agents.lock().drag else { return };
-    let Some((win, rect, cursor, scale)) = grip(&app, &window) else { return };
-    let Some(area) = area_for(rect, &work_areas(&app)) else { return };
+    let Some(drag) = agents.lock().drag else {
+        return;
+    };
+    let Some((win, rect, cursor, scale)) = grip(&app, &window) else {
+        return;
+    };
+    let Some(area) = area_for(rect, &work_areas(&app)) else {
+        return;
+    };
     let (x, w) = dragged(drag, cursor.0, scale, area);
     // The cap the bottom edge gives, if one is held, and the height the window has with it.
     let cap = dragged_height(drag, cursor.1, scale, area).map(|h| keep_cap(&app, h, scale));
-    let h = cap.map_or(rect.h, |cap| clamp_height(agents.lock().content, cap, scale, area.h));
+    let h = cap.map_or(rect.h, |cap| {
+        clamp_height(agents.lock().content, cap, scale, area.h)
+    });
     if (x, w, h) == (rect.x, rect.w, rect.h) {
         return;
     }
-    let (size, at) = (PhysicalSize::new(w as u32, h as u32), PhysicalPosition::new(x, rect.y));
+    let (size, at) = (
+        PhysicalSize::new(w as u32, h as u32),
+        PhysicalPosition::new(x, rect.y),
+    );
     // Whichever way keeps the window inside its place at every step: out first when it grows, in first when it shrinks.
     if w > rect.w || h > rect.h {
         let _ = win.set_position(at);
@@ -609,7 +712,9 @@ pub fn agents_resize_reset(app: AppHandle, window: tauri::Window) {
 /// Keeps the most height the bottom edge was dragged to, as logical pixels, and
 /// saves it a moment later. Gives the cap back, for the window to be sized by.
 fn keep_cap(app: &AppHandle, physical: i32, scale: f64) -> f64 {
-    let logical = (f64::from(physical) / scale).round().clamp(MIN_HEIGHT, MAX_CAP) as u32;
+    let logical = (f64::from(physical) / scale)
+        .round()
+        .clamp(MIN_HEIGHT, MAX_CAP) as u32;
     if let Some(shared) = app.try_state::<Shared>() {
         {
             let mut current = shared.settings.lock().unwrap();
@@ -625,8 +730,12 @@ fn keep_cap(app: &AppHandle, physical: i32, scale: f64) -> f64 {
 
 /// Keeps the width the window has now, as logical pixels, and saves it a moment later.
 fn keep_width(app: &AppHandle, physical: i32, scale: f64) {
-    let logical = (f64::from(physical) / scale).round().clamp(MIN_WIDTH, MAX_WIDTH) as u32;
-    let Some(shared) = app.try_state::<Shared>() else { return };
+    let logical = (f64::from(physical) / scale)
+        .round()
+        .clamp(MIN_WIDTH, MAX_WIDTH) as u32;
+    let Some(shared) = app.try_state::<Shared>() else {
+        return;
+    };
     {
         let mut current = shared.settings.lock().unwrap();
         if current.agents_list_w == Some(logical) {
@@ -647,7 +756,12 @@ pub fn agents_hide(app: AppHandle) {
 mod tests {
     use super::*;
 
-    const AREA: Rect = Rect { x: 0, y: 0, w: 1920, h: 1040 };
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 1920,
+        h: 1040,
+    };
     const SIZE: (i32, i32) = (330, 200);
 
     #[test]
@@ -661,7 +775,19 @@ mod tests {
         assert_eq!(place_in((1800, 900), SIZE, &[AREA]), Some((1590, 840)));
         assert_eq!(place_in((-50, -20), SIZE, &[AREA]), Some((0, 0)));
         // Bigger than the area: at its corner, never off it.
-        assert_eq!(place_in((300, 300), (400, 2000), &[Rect { x: 10, y: 20, w: 300, h: 500 }]), Some((10, 20)));
+        assert_eq!(
+            place_in(
+                (300, 300),
+                (400, 2000),
+                &[Rect {
+                    x: 10,
+                    y: 20,
+                    w: 300,
+                    h: 500
+                }]
+            ),
+            Some((10, 20))
+        );
     }
 
     #[test]
@@ -669,14 +795,27 @@ mod tests {
         // Saved on a second display to the left; only the main one is left.
         assert_eq!(place_in((-1500, 100), SIZE, &[AREA]), Some((0, 100)));
         // Two displays, the saved place nearer the right one.
-        let right = Rect { x: 1920, y: 0, w: 1920, h: 1040 };
-        assert_eq!(place_in((5000, 100), SIZE, &[AREA, right]), Some((3510, 100)));
+        let right = Rect {
+            x: 1920,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        };
+        assert_eq!(
+            place_in((5000, 100), SIZE, &[AREA, right]),
+            Some((3510, 100))
+        );
         assert_eq!(place_in((-4000, 100), SIZE, &[AREA, right]), Some((0, 100)));
     }
 
     #[test]
     fn a_window_across_two_displays_goes_to_the_one_it_is_mostly_on() {
-        let right = Rect { x: 1920, y: 0, w: 1920, h: 1040 };
+        let right = Rect {
+            x: 1920,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        };
         assert_eq!(place_in((1900, 50), SIZE, &[AREA, right]), Some((1920, 50)));
         assert_eq!(place_in((1700, 50), SIZE, &[AREA, right]), Some((1590, 50)));
     }
@@ -684,13 +823,30 @@ mod tests {
     #[test]
     fn with_no_display_there_is_no_place() {
         assert_eq!(place_in((0, 0), SIZE, &[]), None);
-        assert_eq!(place_in((0, 0), SIZE, &[Rect { x: 0, y: 0, w: 0, h: 0 }]), None);
+        assert_eq!(
+            place_in(
+                (0, 0),
+                SIZE,
+                &[Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0
+                }]
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_work_area_that_does_not_start_at_zero_is_respected() {
         // A taskbar on the left: the area starts at x = 48.
-        let area = Rect { x: 48, y: 0, w: 1872, h: 1080 };
+        let area = Rect {
+            x: 48,
+            y: 0,
+            w: 1872,
+            h: 1080,
+        };
         assert_eq!(place_in((0, 10), SIZE, &[area]), Some((48, 10)));
         assert_eq!(first_position(area, SIZE, 16), (48 + 1872 - 330 - 16, 16));
     }
@@ -713,23 +869,61 @@ mod tests {
 
     #[test]
     fn the_place_is_held_to_the_new_size() {
-        let want = |width: f64, content: f64, cap: f64| Wanted { width, content, cap };
+        let want = |width: f64, content: f64, cap: f64| Wanted {
+            width,
+            content,
+            cap,
+        };
         // 330 wide at the right edge, then made 500 wide: it is moved in to fit.
-        assert_eq!(layout((1590, 100), 200, want(500.0, 200.0, 520.0), 1.0, &[AREA]), Some((1420, 100, 500, 200)));
+        assert_eq!(
+            layout((1590, 100), 200, want(500.0, 200.0, 520.0), 1.0, &[AREA]),
+            Some((1420, 100, 500, 200))
+        );
         // Wider than the display allows: the width gives way first.
-        let narrow = Rect { x: 0, y: 0, w: 400, h: 600 };
-        assert_eq!(layout((50, 10), 200, want(640.0, 200.0, 520.0), 1.0, &[narrow]), Some((0, 10, 400, 200)));
+        let narrow = Rect {
+            x: 0,
+            y: 0,
+            w: 400,
+            h: 600,
+        };
+        assert_eq!(
+            layout((50, 10), 200, want(640.0, 200.0, 520.0), 1.0, &[narrow]),
+            Some((0, 10, 400, 200))
+        );
         // A display of another scale: the same logical size is more pixels.
-        let hi = Rect { x: 0, y: 0, w: 2880, h: 1560 };
-        assert_eq!(layout((2500, 0), 300, want(330.0, 200.0, 520.0), 1.5, &[hi]), Some((2385, 0, 495, 300)));
+        let hi = Rect {
+            x: 0,
+            y: 0,
+            w: 2880,
+            h: 1560,
+        };
+        assert_eq!(
+            layout((2500, 0), 300, want(330.0, 200.0, 520.0), 1.5, &[hi]),
+            Some((2385, 0, 495, 300))
+        );
         // A saved place on a display that is gone.
-        assert_eq!(layout((-1500, 100), 200, want(330.0, 200.0, 520.0), 1.0, &[AREA]), Some((0, 100, 330, 200)));
-        assert_eq!(layout((0, 0), 200, want(330.0, 200.0, 520.0), 1.0, &[]), None);
+        assert_eq!(
+            layout((-1500, 100), 200, want(330.0, 200.0, 520.0), 1.0, &[AREA]),
+            Some((0, 100, 330, 200))
+        );
+        assert_eq!(
+            layout((0, 0), 200, want(330.0, 200.0, 520.0), 1.0, &[]),
+            None
+        );
         // A cap shorter than the rows: the window is the cap; a taller one changes nothing; and a window
         // low on the display is moved up to keep all of it on.
-        assert_eq!(layout((100, 100), 200, want(330.0, 500.0, 300.0), 1.0, &[AREA]), Some((100, 100, 330, 300)));
-        assert_eq!(layout((100, 100), 200, want(330.0, 200.0, 900.0), 1.0, &[AREA]), Some((100, 100, 330, 200)));
-        assert_eq!(layout((100, 900), 200, want(330.0, 500.0, 600.0), 1.0, &[AREA]), Some((100, 540, 330, 500)));
+        assert_eq!(
+            layout((100, 100), 200, want(330.0, 500.0, 300.0), 1.0, &[AREA]),
+            Some((100, 100, 330, 300))
+        );
+        assert_eq!(
+            layout((100, 100), 200, want(330.0, 200.0, 900.0), 1.0, &[AREA]),
+            Some((100, 100, 330, 200))
+        );
+        assert_eq!(
+            layout((100, 900), 200, want(330.0, 500.0, 600.0), 1.0, &[AREA]),
+            Some((100, 540, 330, 500))
+        );
     }
 
     #[test]
@@ -756,7 +950,12 @@ mod tests {
 
     #[test]
     fn dragging_the_bottom_edge_sets_the_height_and_leaves_the_width() {
-        let window = Rect { x: 1000, y: 100, w: 330, h: 300 };
+        let window = Rect {
+            x: 1000,
+            y: 100,
+            w: 330,
+            h: 300,
+        };
         let drag = Drag::begin(Side::Bottom, window, (1100, 402));
         assert_eq!(drag.grab_y, -2);
         assert_eq!(dragged_height(drag, 402, 1.0, AREA), Some(300));
@@ -765,18 +964,47 @@ mod tests {
         // The display ends first: the window stays on it.
         assert_eq!(dragged_height(drag, 5000, 1.0, AREA), Some(940));
         // Scaled limits.
-        assert_eq!(dragged_height(drag, 0, 2.0, Rect { x: 0, y: 0, w: 3840, h: 2000 }), Some(144));
+        assert_eq!(
+            dragged_height(
+                drag,
+                0,
+                2.0,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 3840,
+                    h: 2000
+                }
+            ),
+            Some(144)
+        );
         // The width is not the bottom edge's business, at any cursor.
         assert_eq!(dragged(drag, 100, 1.0, AREA), (1000, 330));
         assert_eq!(dragged(drag, 5000, 1.0, AREA), (1000, 330));
         // The sides alone have no height.
-        assert_eq!(dragged_height(Drag::begin(Side::Left, window, (1000, 200)), 900, 1.0, AREA), None);
-        assert_eq!(dragged_height(Drag::begin(Side::Right, window, (1330, 200)), 900, 1.0, AREA), None);
+        assert_eq!(
+            dragged_height(Drag::begin(Side::Left, window, (1000, 200)), 900, 1.0, AREA),
+            None
+        );
+        assert_eq!(
+            dragged_height(
+                Drag::begin(Side::Right, window, (1330, 200)),
+                900,
+                1.0,
+                AREA
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_bottom_corner_drags_one_side_and_the_bottom_together() {
-        let window = Rect { x: 1000, y: 100, w: 330, h: 300 };
+        let window = Rect {
+            x: 1000,
+            y: 100,
+            w: 330,
+            h: 300,
+        };
         let right = Drag::begin(Side::BottomRight, window, (1332, 402));
         assert_eq!((right.grab, right.grab_y), (-2, -2));
         assert_eq!(dragged(right, 1432, 1.0, AREA), (1000, 430));
@@ -790,31 +1018,80 @@ mod tests {
 
     #[test]
     fn dragging_the_right_edge_moves_only_that_edge() {
-        let drag = Drag::begin(Side::Right, Rect { x: 1000, y: 0, w: 330, h: 200 }, (1328, 100));
+        let drag = Drag::begin(
+            Side::Right,
+            Rect {
+                x: 1000,
+                y: 0,
+                w: 330,
+                h: 200,
+            },
+            (1328, 100),
+        );
         assert_eq!(drag.grab, 2);
         assert_eq!(dragged(drag, 1328, 1.0, AREA), (1000, 330));
         assert_eq!(dragged(drag, 1428, 1.0, AREA), (1000, 430));
         assert_eq!(dragged(drag, 1100, 1.0, AREA), (1000, 280));
         assert_eq!(dragged(drag, 5000, 1.0, AREA), (1000, 640));
         // The display ends first.
-        let drag = Drag::begin(Side::Right, Rect { x: 1700, y: 0, w: 330, h: 200 }, (2028, 100));
+        let drag = Drag::begin(
+            Side::Right,
+            Rect {
+                x: 1700,
+                y: 0,
+                w: 330,
+                h: 200,
+            },
+            (2028, 100),
+        );
         // (Not even the least fits: the left edge gives way, the window stays on it.)
         assert_eq!(dragged(drag, 2500, 1.0, AREA), (1640, 280));
     }
 
     #[test]
     fn dragging_the_left_edge_keeps_the_right_one_still() {
-        let drag = Drag::begin(Side::Left, Rect { x: 1000, y: 0, w: 330, h: 200 }, (1002, 100));
+        let drag = Drag::begin(
+            Side::Left,
+            Rect {
+                x: 1000,
+                y: 0,
+                w: 330,
+                h: 200,
+            },
+            (1002, 100),
+        );
         assert_eq!(drag.grab, -2);
         assert_eq!(dragged(drag, 1002, 1.0, AREA), (1000, 330));
         assert_eq!(dragged(drag, 902, 1.0, AREA), (900, 430));
         assert_eq!(dragged(drag, 1300, 1.0, AREA), (1050, 280));
         assert_eq!(dragged(drag, -3000, 1.0, AREA), (690, 640));
         // Near the left of the display: it stops there.
-        let near = Drag::begin(Side::Left, Rect { x: 100, y: 0, w: 330, h: 200 }, (102, 100));
+        let near = Drag::begin(
+            Side::Left,
+            Rect {
+                x: 100,
+                y: 0,
+                w: 330,
+                h: 200,
+            },
+            (102, 100),
+        );
         assert_eq!(dragged(near, -500, 1.0, AREA), (0, 430));
         // Scaled limits.
-        assert_eq!(dragged(drag, 0, 2.0, Rect { x: 0, y: 0, w: 3840, h: 2000 }), (1330 - 1280, 1280));
+        assert_eq!(
+            dragged(
+                drag,
+                0,
+                2.0,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 3840,
+                    h: 2000
+                }
+            ),
+            (1330 - 1280, 1280)
+        );
     }
 
     #[test]
@@ -829,7 +1106,7 @@ mod tests {
 
     #[test]
     fn the_tray_says_what_a_press_does() {
-        assert_eq!(label(false), "Show agents list");
-        assert_eq!(label(true), "Hide agents list");
+        assert_eq!(label(false, "Show agents list", "Hide agents list"), "Show agents list");
+        assert_eq!(label(true, "Show agents list", "Hide agents list"), "Hide agents list");
     }
 }

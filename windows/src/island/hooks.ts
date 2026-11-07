@@ -10,6 +10,7 @@
 // with its question tool, answered on the island.
 
 import { Bridge, onEvent } from "../core/bridge";
+import { beginCompletionTurn, hasCompletionEvent, recordCompletionEvent } from "../core/completion-events";
 import { Reader } from "../core/reading";
 import { Reply } from "../core/reply";
 import { Sound } from "../core/sound";
@@ -23,20 +24,28 @@ import { needsDecision } from "../views/markdown";
 import { rememberProject } from "../widgets/projects";
 import type { Island } from "./island";
 
+const NOOK_DEV_BUILD = __NOOK_DEV_BUILD__;
+
 /**
- * By request: clears it if no decision was made before the hook gave up. Nook
- * answers within 108 s or not at all; after that the terminal has taken over
- * and the card would be lying. Each request has its own connection to the
- * relay and its own 108 s: one that waits behind another's card is timed from
- * the moment it came, like the one on the card.
+ * Clears a card if no decision was made before its relay gave up. Production
+ * requests use the relay's 108 s budget; isolated Dev test requests use a
+ * shorter bound. Each request has its own timeout, including one in the queue.
  */
 const pendingTimeouts = new Map<string, number>();
 const PENDING_MS = 110_000;
+const DEV_TEST_PENDING_MS = 10_000;
+// Two maximum-length auto-close intervals plus a short hands-on margin.
+const DEV_MANUAL_ALERT_PENDING_MS = 270_000;
+const CODEX_EVENT_ID_LIMIT = 256;
+const CODEX_TOMBSTONE_LIMIT = 64;
+const endedCodexSessions = new Set<string>();
 
 export interface HookPayload {
   hook_event_name?: string;
   request_id?: string;
   session_id?: string;
+  /** Codex turn identity on turn-scoped hook events. */
+  turn_id?: string;
   cwd?: string;
   message?: string;
   /** UserPromptSubmit carries `prompt`; `message` belongs to Notification/Stop. */
@@ -90,6 +99,18 @@ export interface HookPayload {
   launched_async?: boolean;
   /** On a Stop and a SubagentStop: what still runs in the background, the subagents among it. */
   background_tasks?: unknown;
+  /** Nook Dev simulator marker. Never present in an event from a real hook. */
+  nook_simulated?: boolean;
+  /** Dev-only battery fixture event, routed to the same monitor/reducer as Windows samples. */
+  nook_battery_simulator?: boolean;
+  nook_battery_action?: string;
+  battery_sample?: { percent: number | null; ac_connected: boolean | null; charging: boolean | null; battery_present: boolean | null };
+  /** Injected by the Rust Dev relay only for synthetic nook-test PermissionRequests. */
+  nook_test_deny_only?: boolean;
+  /** Injected by Rust only for the bounded TwoPendingAlerts hand-guided scenario. */
+  nook_test_manual_alert?: boolean;
+  /** A short timeout used only by the isolated Dev simulator. */
+  nook_simulated_timeout_ms?: number;
   /**
    * The model the session runs on, where an event says it (SessionStart does):
    * its id, or `{ id, display_name }`. Read with `readModel`.
@@ -465,9 +486,10 @@ const resting = (session: ClaudeSession) => AT_REST.has(session.state) && !waits
 /** The session an event comes from, told what the event says of it. A new one gets a place. */
 function sessionOf(island: Island, payload: HookPayload): ClaudeSession {
   const id = payload.session_id || ANONYMOUS;
-  let session = State.sessions.find((s) => s.id === id);
+  const agent = payload.nook_tool === "cursor" ? "cursor" : payload.nook_tool === "codex" ? "codex" : payload.nook_tool === "claude" ? "claude" : "unknown";
+  let session = State.sessions.find((s) => s.id === id && s.agent === agent);
   if (!session) {
-    session = newSession(id, payload.nook_tool === "cursor" ? "cursor" : payload.nook_tool === "codex" ? "codex" : "claude");
+    session = newSession(id, agent);
     State.sessions.push(session);
     makeRoom(island, session);
   }
@@ -486,7 +508,8 @@ function sessionOf(island: Island, payload: HookPayload): ClaudeSession {
     session.cwd = payload.cwd;
     session.project = lastPathComponent(payload.cwd) || SESSION_UNNAMED;
     // The Shelf's Projects widget keeps the folders sessions have run in (said once per folder).
-    rememberProject(payload.cwd);
+    const simulatedId = /^(?:codex:)?(?:nook-test:|nook-sim:)/i.test(session.id);
+    if (payload.nook_simulated !== true && !simulatedId) rememberProject(payload.cwd);
   }
   session.heardAt = Date.now();
   return session;
@@ -628,6 +651,70 @@ function dropRequest(island: Island, session: ClaudeSession, requestId: string) 
   nextRequest(session);
   if (!waits(session) && session.news === "approval") session.news = null;
   if (session.id === State.frontId) island.afterRequest(onCard());
+}
+
+function rememberCodexId(ids: string[], id: string) {
+  if (!id || id.length > CODEX_EVENT_ID_LIMIT || ids.includes(id)) return;
+  ids.push(id);
+  if (ids.length > CODEX_TOMBSTONE_LIMIT) ids.shift();
+}
+
+function rememberEndedCodexSession(id: string) {
+  endedCodexSessions.delete(id);
+  endedCodexSessions.add(id);
+  if (endedCodexSessions.size > CODEX_TOMBSTONE_LIMIT * 4) {
+    const oldest = endedCodexSessions.values().next().value;
+    if (oldest) endedCodexSessions.delete(oldest);
+  }
+}
+
+/** A turn that is interrupted or superseded is neutral, never a successful Stop. */
+function interruptCodexTurn(island: Island, session: ClaudeSession, turnId: string) {
+  rememberCodexId(session.closedCodexTurns ?? (session.closedCodexTurns = []), turnId);
+  const current = session.codexTurnId === turnId || session.codexTurnId == null;
+
+  for (const request of requestsOf(session)) {
+    if (request.turnId !== turnId) continue;
+    if (request.step?.permission === "asked") request.step.permission = null;
+    if (request.step?.state === "running") request.step.state = "interrupted";
+    dropRequest(island, session, request.requestId);
+  }
+  for (const step of session.steps) {
+    if (step.turnId !== turnId || step.state !== "running") continue;
+    step.state = "interrupted";
+    if (step.permission === "asked") step.permission = null;
+  }
+
+  if (current) {
+    session.codexTurnId = null;
+    session.parked = false;
+    session.state = session.question ? "question" : session.approval ? "approval" : "idle";
+    session.restedAt = Date.now();
+    session.heardAt = Date.now();
+    session.unseen = false;
+  }
+}
+
+function acceptsCodexTurn(session: ClaudeSession, payload: HookPayload, event: string, island: Island): boolean {
+  const turnId = payload.turn_id?.trim();
+  if (!turnId) return true; // Older clients retain the existing best-effort handling.
+  if (turnId.length > CODEX_EVENT_ID_LIMIT) return false;
+  const closed = session.closedCodexTurns ?? (session.closedCodexTurns = []);
+  if (closed.includes(turnId)) return false;
+
+  if (event === "UserPromptSubmit") {
+    const prompts = session.promptedCodexTurns ?? (session.promptedCodexTurns = []);
+    if (prompts.includes(turnId)) return false;
+    if (session.codexTurnId && session.codexTurnId !== turnId) interruptCodexTurn(island, session, session.codexTurnId);
+    session.codexTurnId = turnId;
+    rememberCodexId(prompts, turnId);
+    return true;
+  }
+
+  if (event === "Interrupt") return true;
+  if (session.codexTurnId && session.codexTurnId !== turnId) return false;
+  if (!session.codexTurnId) session.codexTurnId = turnId;
+  return true;
 }
 
 /** The tool a request is about. */
@@ -856,6 +943,55 @@ function handleAgent(island: Island, payload: HookPayload, agent: string) {
 
 /** Exported for the dev preview, which plays a session without Claude Code. */
 export function handleHook(island: Island, payload: HookPayload) {
+  if (NOOK_DEV_BUILD && payload.nook_battery_simulator === true) {
+    const raw = payload.battery_sample;
+    island.simulateBattery(payload.nook_battery_action ?? "", raw ? {
+      percent: raw.percent,
+      acConnected: raw.ac_connected,
+      charging: raw.charging,
+      batteryPresent: raw.battery_present,
+    } : null);
+    return;
+  }
+  // Synthetic traffic has its own namespace. Even a malformed Dev event cannot
+  // attach to a live session or create a permission request against the relay.
+  if (payload.nook_simulated === true) {
+    const id = payload.session_id ?? "";
+    const permissionId = payload.request_id ?? "";
+    if (!id.startsWith("nook-sim:") || (payload.hook_event_name === "PermissionRequest" && !permissionId.startsWith("nook-sim:req:"))) return;
+  }
+  const name = payload.hook_event_name ?? "";
+  const codex = payload.nook_tool === "codex";
+  const sessionId = payload.session_id || ANONYMOUS;
+
+  // This timestamp is deliberately written only by agent lifecycle traffic.
+  // Quota refreshes, Island renders and background polling never reset Idle.
+  if (name) State.lastAgentEventAt = Date.now();
+
+  if (codex && endedCodexSessions.has(sessionId)) return;
+  if (codex && name === "SessionEnd") {
+    rememberEndedCodexSession(sessionId);
+    const ended = State.sessions.find((session) => session.id === sessionId);
+    if (ended) forget(island, ended);
+    State.notify();
+    return;
+  }
+  if (codex && name === "Interrupt") {
+    const session = State.sessions.find((candidate) => candidate.id === sessionId);
+    const turnId = payload.turn_id?.trim();
+    if (!session || !turnId || turnId.length > CODEX_EVENT_ID_LIMIT) return;
+    if (session.closedCodexTurns?.includes(turnId)) return;
+    interruptCodexTurn(island, session, turnId);
+    State.notify();
+    return;
+  }
+  if (codex && (name === "SubagentStart" || name === "SubagentStop")) {
+    if (!payload.agent_id || payload.agent_id.length > CODEX_EVENT_ID_LIMIT) return;
+    const session = State.sessions.find((candidate) => candidate.id === sessionId);
+    // These events are attached to a main session, never standalone sessions.
+    if (!session || session.endedCodexSubagents?.includes(payload.agent_id)) return;
+  }
+
   // Route to the right pill. Valid nook_agent → dynamic "agent_<name>" pill.
   // "claude" is reserved; absent or invalid → Claude Code, as before.
   const agent = validateAgent(payload.nook_agent);
@@ -884,8 +1020,6 @@ export function handleHook(island: Island, payload: HookPayload) {
     return;
   }
 
-  const name = payload.hook_event_name ?? "";
-
   // A reply typed in the island runs in a process of its own (core/reply.ts), which
   // starts and ends like a session. Neither is the session's: the one the user
   // opened is still there when the reply's run is over, journal and all.
@@ -898,9 +1032,28 @@ export function handleHook(island: Island, payload: HookPayload) {
     return;
   }
 
+  // Compaction is an in-turn lifecycle notification, not a new session or a
+  // completed turn. It only refreshes an already-known parent session.
+  if (codex && (name === "PreCompact" || name === "PostCompact")) {
+    const existing = State.sessions.find((session) => session.id === sessionId);
+    if (!existing) return;
+    if (!acceptsCodexTurn(existing, payload, name, island)) return;
+    sessionOf(island, payload);
+    State.notify();
+    return;
+  }
+
   const session = sessionOf(island, payload);
+  // Subagent lifecycle belongs to the parent session, but can arrive after its
+  // Stop hook. Do not discard it merely because the parent turn was closed.
+  const lateCodexChildEvent = codex && payload.agent_id && payload.turn_id
+    && session.closedCodexTurns?.includes(payload.turn_id)
+    && session.subagents.some((agent) => agent.id === payload.agent_id && agent.state === "running");
+  if (codex && name !== "SubagentStart" && name !== "SubagentStop" && !lateCodexChildEvent && !acceptsCodexTurn(session, payload, name, island)) return;
+  if (codex && payload.agent_id && session.endedCodexSubagents?.includes(payload.agent_id)) return;
   // Cursor says its last words in events of their own; the turn ends on the latest.
   if (cursor && name === "Stop" && !payload.last_message && session.answer) payload.last_message = session.answer;
+  // Hook-driven focus is independent of any completion notification state.
   if (takesFront(session, name)) State.bringForward(session.id);
   /** The session the island shows; the others go on behind their tabs. */
   const front = session.id === State.frontId;
@@ -979,6 +1132,8 @@ export function handleHook(island: Island, payload: HookPayload) {
     case "UserPromptSubmit": {
       // A turn is under way again — the user's, or the one Claude Code starts
       // itself to hear what a subagent came back with.
+      session.completionPending = false;
+      beginCompletionTurn(session.agent, session.id);
       session.parked = false;
       atWork(session, "thinking");
       // The field is `prompt`; reading `message` meant this step was always blank.
@@ -993,7 +1148,8 @@ export function handleHook(island: Island, payload: HookPayload) {
         session.toldReply = null;
         // Whatever the last reply was waiting on, the user has spoken: the next turn has started.
         session.decision = false;
-        log(session.steps, newStep("Prompt", "prompt", asked));
+        const promptStep = log(session.steps, newStep("Prompt", "prompt", asked));
+        if (codex && payload.turn_id) promptStep.turnId = payload.turn_id;
         say(session, asked.slice(0, LINE_CHARS));
       }
       surface("overview", false);
@@ -1006,6 +1162,7 @@ export function handleHook(island: Island, payload: HookPayload) {
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};
       const step = startStep(journal, tool, input, cwd);
+      if (codex && payload.turn_id) step.turnId = payload.turn_id;
       if (subagent) {
         step.agentId = subagent.id;
         // One that had stopped, as far as the island knew, and runs a tool: it is at work.
@@ -1070,6 +1227,13 @@ export function handleHook(island: Island, payload: HookPayload) {
     }
 
     case "Stop": {
+      // Repeated Stop delivery for a turn whose completion is still waiting
+      // must not replay its sound or create another notification.
+      // A new prompt clears the in-memory completion key. For hosts without a
+      // turn ID, one stable key per session is enough to suppress Stop replays
+      // even after the temporary card has been dismissed.
+      const eventKey = payload.turn_id?.trim() || "turn-without-id";
+      if (!session.parked && (session.completionPending || hasCompletionEvent(session.agent, session.id, eventKey))) break;
       // What still runs in the background says whether the turn is really over.
       // Subagents launched in the background outlive the turn that launched
       // them: Claude Code fires Stop while they are still at work, and again
@@ -1087,6 +1251,10 @@ export function handleHook(island: Island, payload: HookPayload) {
         settle(session.steps);
         session.launching = [];
         session.parked = true;
+        if (codex && payload.turn_id) {
+          rememberCodexId(session.closedCodexTurns ?? (session.closedCodexTurns = []), payload.turn_id);
+          if (session.codexTurnId === payload.turn_id) session.codexTurnId = null;
+        }
         atWork(session);
         say(session, "… waiting for its subagents");
         // It said something to end its own turn: that is an answer, and the
@@ -1097,6 +1265,7 @@ export function handleHook(island: Island, payload: HookPayload) {
         if (reply) {
           log(session.steps, newStep(TURN_PARKED, "reply", reply));
           session.answer = reply;
+          session.completionPending = true;
           session.answeredAt = Date.now();
           session.decision = needsDecision(reply);
           if (reply !== session.toldReply) {
@@ -1110,8 +1279,14 @@ export function handleHook(island: Island, payload: HookPayload) {
       // Really over: nothing of it runs, nothing of it waits, and its
       // subagents leave the sidebar.
       session.parked = false;
+      if (codex && payload.turn_id) {
+        rememberCodexId(session.closedCodexTurns ?? (session.closedCodexTurns = []), payload.turn_id);
+        if (session.codexTurnId === payload.turn_id) session.codexTurnId = null;
+      }
       session.launching = [];
-      for (const request of requestsOf(session)) dropRequest(island, session, request.requestId);
+      for (const request of requestsOf(session)) {
+        if (!codex || !payload.turn_id || request.turnId === payload.turn_id) dropRequest(island, session, request.requestId);
+      }
       for (const sub of session.subagents) {
         if (sub.state === "running") closeSubagent(island, session, sub, "done", null);
         sub.past = true;
@@ -1133,9 +1308,14 @@ export function handleHook(island: Island, payload: HookPayload) {
       } else closeSteps(session, said);
       session.toldReply = null;
       session.state = "finished";
+      session.completionPending = true;
+      if (session.agent === "claude" || session.agent === "codex") {
+        recordCompletionEvent(session.agent, session.id, eventKey);
+        session.restedAt = Date.now();
+      }
       // What the home view counts from, to let it go; and its result is new
       // until its card shows it (`tell`) or the session is opened.
-      session.restedAt = Date.now();
+      if (!session.restedAt) session.restedAt = Date.now();
       session.unseen = true;
       if (payload.message) say(session, payload.message.slice(0, LINE_CHARS));
       if (!told) {
@@ -1187,7 +1367,16 @@ export function handleHook(island: Island, payload: HookPayload) {
       break;
 
     case "SubagentStart":
-      if (startSubagent(session, payload)) say(session, "+ subagent");
+      if (codex && payload.agent_id && session.subagents.some((agent) => agent.id === payload.agent_id)) break;
+      if (startSubagent(session, payload)) {
+        // Hook processes can be observed out of order. A child start after its
+        // parent's Stop means the turn is still active through that child.
+        if (codex && payload.turn_id && session.closedCodexTurns?.includes(payload.turn_id)) {
+          session.parked = true;
+          atWork(session);
+        }
+        say(session, "+ subagent");
+      }
       break;
 
     case "SubagentStop": {
@@ -1202,11 +1391,34 @@ export function handleHook(island: Island, payload: HookPayload) {
         // A second stop of one that has stopped changes nothing of how it ended.
         if (stopped.state === "running") {
           closeSubagent(island, session, stopped, "done", payload.last_message ?? null);
+          if (codex && payload.agent_id) rememberCodexId(session.endedCodexSubagents ?? (session.endedCodexSubagents = []), payload.agent_id);
           say(session, "• subagent done");
         } else if (payload.last_message) stopped.result = payload.last_message;
       }
+      if (codex && payload.agent_id) rememberCodexId(session.endedCodexSubagents ?? (session.endedCodexSubagents = []), payload.agent_id);
       const tasks = backgroundAgents(payload);
       if (tasks) heedTasks(island, session, tasks);
+      // Codex emits Stop once per turn and does not promise a second parent
+      // Stop after its subagents finish. Settle a parked parent when the last
+      // observed child ends, without manufacturing a session-end event.
+      if (codex && session.parked && !subagentsRunning(session)) {
+        session.parked = false;
+        for (const request of requestsOf(session)) dropRequest(island, session, request.requestId);
+        for (const agent of session.subagents) agent.past = true;
+        const parkedReply = [...session.steps].reverse().find((step) => step.tool === TURN_PARKED);
+        if (parkedReply) {
+          settle(session.steps);
+          parkedReply.tool = TURN_DONE;
+        } else closeSteps(session, session.answer);
+        session.toldReply = null;
+        session.state = "finished";
+        session.restedAt = Date.now();
+        session.unseen = true;
+        window.setTimeout(() => {
+          if (session.state === "finished") session.state = "idle";
+          State.present();
+        }, FINISHED_MS);
+      }
       break;
     }
 
@@ -1239,13 +1451,13 @@ export function handleHook(island: Island, payload: HookPayload) {
       let tooLong = false;
       let request: SessionRequest;
       const askedAt = Date.now();
-      if (questions) request = { requestId, sessionId: session.id, questions, agentId, step: asking, askedAt };
+      if (questions) request = { requestId, sessionId: session.id, questions, agentId, step: asking, askedAt, turnId: codex ? payload.turn_id : undefined, denyOnly: NOOK_DEV_BUILD && payload.nook_test_deny_only === true };
       else {
         const file = input.file_path;
         const proposal =
           payload.proposal && typeof file === "string" ? { path: sessionPath(file, cwd), ...payload.proposal } : null;
         tooLong = payload.target_truncated === true || proposal?.truncated === true;
-        request = { requestId, sessionId: session.id, tool, command: approvalTarget(tool, input), proposal, tooLong, agentId, step: asking, askedAt };
+        request = { requestId, sessionId: session.id, tool, command: approvalTarget(tool, input), proposal, tooLong, agentId, step: asking, askedAt, turnId: codex ? payload.turn_id : undefined, denyOnly: NOOK_DEV_BUILD && payload.nook_test_deny_only === true };
       }
       // The relay's short ack window closes in 800 ms; everything below this
       // line is synchronous, so the card really is up by the time it lands —
@@ -1256,10 +1468,17 @@ export function handleHook(island: Island, payload: HookPayload) {
       // own window, which shows all of it, and the card only says where to look.
       if (requestId) void (tooLong ? Bridge.approvalDecline(requestId) : Bridge.approvalAck(requestId));
       stopWaiting(requestId);
+      const timeoutMs = NOOK_DEV_BUILD && payload.nook_test_manual_alert === true
+        ? DEV_MANUAL_ALERT_PENDING_MS
+        : NOOK_DEV_BUILD && payload.nook_test_deny_only === true
+        ? DEV_TEST_PENDING_MS
+        : payload.nook_simulated === true && Number.isFinite(payload.nook_simulated_timeout_ms)
+        ? Math.max(250, Math.min(15_000, payload.nook_simulated_timeout_ms!))
+        : PENDING_MS;
       pendingTimeouts.set(requestId, window.setTimeout(() => {
         dropRequest(island, session, requestId);
         State.present();
-      }, PENDING_MS));
+      }, timeoutMs));
       Sound.play(questions ? "question" : "approval");
       // The island was folded with a request still waiting — the user went to
       // its window — and another one comes: it opens again, on the card of the

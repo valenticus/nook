@@ -22,7 +22,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # The TS UI test scripts use Node's native type stripping.
+          node-version: 22
           cache: npm
           cache-dependency-path: windows/package-lock.json
 
@@ -40,9 +41,40 @@ jobs:
       - run: cargo build --release -p nook-hook
 
       - run: npx tsc --noEmit
+      - run: npm run check:dev-previews
+      - run: npm run test:frontend-output-isolation
+      # This discovers and runs every tests/*.test.ts and tests/*.test.mjs
+      # using fixture-only data; it does not require agents, credentials, or Nook.
+      - run: npm run test:frontend
 
-      - run: npx vite build
+      - run: npm run build
+
+      - run: npm run test:dev-build-artifact
 
       - run: cargo test --workspace
+
+      - name: Test with Nook Dev feature
+        run: cargo test --workspace --features nook-dev
+        env:
+          # Tauri consumes this as a JSON overlay, not a path. These identity
+          # fields satisfy build.rs without weakening its isolation checks.
+          TAURI_CONFIG: '{"productName":"Nook Dev","identifier":"io.github.zubairbinshaukat.nook.dev","mainBinaryName":"nook-dev"}'
+
+      - name: Test with Nook Standalone feature
+        run: cargo test --workspace --features nook-standalone
+        env:
+          TAURI_CONFIG: '{"productName":"Nook Personal Edition","identifier":"io.github.valenticus.nook","mainBinaryName":"nook-standalone"}'
+
+      - name: npm audit (advisory)
+        run: npm audit --fetch-retries=0 --fetch-timeout=30000
+        continue-on-error: true
+
+      - run: npm run tauri:build:dev
+
+      - name: Check production and Dev frontend bundle isolation
+        run: npm run test:frontend-output-isolation
+        env:
+          NOOK_PROD_DIST: dist
+          NOOK_DEV_DIST: dist-dev
 
       - run: cargo clippy --workspace --all-targets -- -D warnings

@@ -5,6 +5,14 @@ authors = ["Louis Raille", "Edurique", "Zubair Bin Shaukat"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "nook"
+
+[features]
+default = []
+codex-quota = ["tokio/process", "windows/Win32_System_JobObjects"]
+system-battery = ["windows/Win32_System_Power"]
+nook-dev = ["codex-quota", "system-battery"]
+nook-standalone = ["codex-quota", "system-battery"]
 
 [lib]
 name = "nook_lib"
@@ -31,10 +39,9 @@ windows = { version = "0.61", features = [
   "Win32_Graphics_Gdi",
   "Win32_Security",
   "Win32_Security_Authorization",
-  # The GPU's use, from the performance counters Task Manager reads (platform/windows.rs).
-  "Win32_System_Performance",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
   # SHQueryUserNotificationState: the shell's word on a full-screen app or a presentation.
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",

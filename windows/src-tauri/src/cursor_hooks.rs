@@ -71,13 +71,20 @@ pub fn hooks_path() -> PathBuf {
 
 fn relay_path() -> String {
     let path = settings::hook_exe_path().to_string_lossy().to_string();
-    if cfg!(windows) { path.replace('\\', "/") } else { path }
+    if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path
+    }
 }
 
 /// The relay as the first word of a command that cmd, PowerShell and sh read alike:
 /// nothing but letters, digits and `_ - . / :`.
 fn relay_word(relay: &str) -> Result<String, String> {
-    let plain = !relay.is_empty() && relay.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':'));
+    let plain = !relay.is_empty()
+        && relay
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':'));
     if plain {
         Ok(relay.to_string())
     } else {
@@ -123,13 +130,21 @@ fn installed(existing: &Value, relay: &str) -> Result<Value, String> {
     let mut hooks = match root.get("hooks") {
         None => Map::new(),
         Some(Value::Object(map)) => map.clone(),
-        Some(_) => return Err("The \"hooks\" key of hooks.json isn't an object — Nook won't touch it.".into()),
+        Some(_) => {
+            return Err(
+                "The \"hooks\" key of hooks.json isn't an object — Nook won't touch it.".into(),
+            )
+        }
     };
     for (event, timeout) in EVENTS {
         let mut list = match hooks.get(*event) {
             None => Vec::new(),
             Some(Value::Array(list)) => list.clone(),
-            Some(_) => return Err(format!("The \"{event}\" hooks of hooks.json aren't a list — Nook won't touch them.")),
+            Some(_) => {
+                return Err(format!(
+                    "The \"{event}\" hooks of hooks.json aren't a list — Nook won't touch them."
+                ))
+            }
         };
         list.retain(|entry| !is_ours(entry));
         list.push(json!({ "command": command_for(&relay, event), "timeout": timeout }));
@@ -144,9 +159,13 @@ fn installed(existing: &Value, relay: &str) -> Result<Value, String> {
 /// file left with no hook of anyone's keeps its other keys (and its version).
 fn uninstalled(existing: &Value) -> Result<Value, String> {
     let mut root = existing.as_object().cloned().unwrap_or_default();
-    let Some(hooks) = root.get("hooks") else { return Ok(Value::Object(root)) };
+    let Some(hooks) = root.get("hooks") else {
+        return Ok(Value::Object(root));
+    };
     let Value::Object(hooks) = hooks else {
-        return Err("The \"hooks\" key of hooks.json isn't an object — Nook won't touch it.".into());
+        return Err(
+            "The \"hooks\" key of hooks.json isn't an object — Nook won't touch it.".into(),
+        );
     };
     let mut kept = Map::new();
     for (event, value) in hooks {
@@ -168,15 +187,23 @@ fn uninstalled(existing: &Value) -> Result<Value, String> {
 }
 
 fn status_of(existing: &Value, relay: &str) -> (bool, bool) {
-    let Some(hooks) = existing.get("hooks").and_then(Value::as_object) else { return (false, false) };
+    let Some(hooks) = existing.get("hooks").and_then(Value::as_object) else {
+        return (false, false);
+    };
     let ours = |event: &str| -> Vec<&Value> {
-        hooks.get(event).and_then(Value::as_array).map(|l| l.iter().filter(|e| is_ours(e)).collect()).unwrap_or_default()
+        hooks
+            .get(event)
+            .and_then(Value::as_array)
+            .map(|l| l.iter().filter(|e| is_ours(e)).collect())
+            .unwrap_or_default()
     };
     let installed = EVENTS.iter().all(|(event, _)| !ours(event).is_empty());
     let current = installed
         && EVENTS.iter().all(|(event, _)| {
             let want = command_for(relay, event);
-            ours(event).iter().all(|e| e.get("command").and_then(Value::as_str) == Some(want.as_str()))
+            ours(event)
+                .iter()
+                .all(|e| e.get("command").and_then(Value::as_str) == Some(want.as_str()))
         });
     (installed, current)
 }
@@ -206,18 +233,33 @@ pub fn status() -> CursorStatus {
     }
 }
 
-fn change(install: bool, relay: String) -> impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String> {
+fn change(
+    install: bool,
+    relay: String,
+) -> impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String> {
     move |path, bytes| {
         let current = match bytes {
             Some(bytes) => parse(bytes, &path.display().to_string())?,
             None => json!({}),
         };
-        let next = if install { installed(&current, &relay)? } else { uninstalled(&current)? };
+        let next = if install {
+            installed(&current, &relay)?
+        } else {
+            uninstalled(&current)?
+        };
         let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
         let after = pretty(&next);
         let mut written = after.clone().into_bytes();
         written.push(b'\n');
-        Ok(FileChange { before: if bytes.is_some() { pretty(&current) } else { String::new() }, after, bytes: written })
+        Ok(FileChange {
+            before: if bytes.is_some() {
+                pretty(&current)
+            } else {
+                String::new()
+            },
+            after,
+            bytes: written,
+        })
     }
 }
 
@@ -247,7 +289,12 @@ mod tests {
     }
 
     fn commands(v: &Value, event: &str) -> Vec<String> {
-        v["hooks"][event].as_array().unwrap().iter().map(|e| e["command"].as_str().unwrap().to_string()).collect()
+        v["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["command"].as_str().unwrap().to_string())
+            .collect()
     }
 
     #[test]
@@ -255,14 +302,24 @@ mod tests {
         let out = installed(&json!({}), RELAY).unwrap();
         assert_eq!(out["version"], 1);
         for (event, _) in EVENTS {
-            assert_eq!(commands(&out, event), vec![format!("{RELAY} --agent cursor {event}")]);
+            assert_eq!(
+                commands(&out, event),
+                vec![format!("{RELAY} --agent cursor {event}")]
+            );
         }
         assert_eq!(status_of(&out, RELAY), (true, true));
     }
 
     #[test]
     fn no_gating_event_is_ever_followed() {
-        for gate in ["beforeShellExecution", "beforeMCPExecution", "beforeReadFile", "preToolUse", "subagentStart", "beforeTabFileRead"] {
+        for gate in [
+            "beforeShellExecution",
+            "beforeMCPExecution",
+            "beforeReadFile",
+            "preToolUse",
+            "subagentStart",
+            "beforeTabFileRead",
+        ] {
             assert!(EVENTS.iter().all(|(event, _)| *event != gate), "{gate}");
         }
     }
@@ -277,7 +334,10 @@ mod tests {
     fn foreign_entries_and_unknown_keys_survive_in_place() {
         let out = installed(&foreign(), RELAY).unwrap();
         assert_eq!(out["futureKey"], foreign()["futureKey"]);
-        assert_eq!(out["hooks"]["beforeShellExecution"], foreign()["hooks"]["beforeShellExecution"]);
+        assert_eq!(
+            out["hooks"]["beforeShellExecution"],
+            foreign()["hooks"]["beforeShellExecution"]
+        );
         assert_eq!(commands(&out, "stop")[0], "./hooks/theirs.sh");
         assert_eq!(out["hooks"]["stop"][0]["timeout"], 30);
         assert_eq!(commands(&out, "stop").len(), 2);
@@ -306,14 +366,23 @@ mod tests {
 
     #[test]
     fn an_entry_that_only_mentions_nook_is_not_ours() {
-        let theirs = json!({ "hooks": { "stop": [{ "command": "nook-hook.exe --agent other stop" }] } });
+        let theirs =
+            json!({ "hooks": { "stop": [{ "command": "nook-hook.exe --agent other stop" }] } });
         assert_eq!(uninstalled(&theirs).unwrap(), theirs);
-        assert_eq!(commands(&installed(&theirs, RELAY).unwrap(), "stop").len(), 2);
+        assert_eq!(
+            commands(&installed(&theirs, RELAY).unwrap(), "stop").len(),
+            2
+        );
     }
 
     #[test]
     fn what_cannot_be_read_is_refused() {
-        for bad in ["{ // comment\n \"version\": 1 }", "{ \"version\": 1, }", "[1]", "not json"] {
+        for bad in [
+            "{ // comment\n \"version\": 1 }",
+            "{ \"version\": 1, }",
+            "[1]",
+            "not json",
+        ] {
             assert!(parse(bad.as_bytes(), "hooks.json").is_err(), "{bad}");
         }
         assert!(installed(&json!({ "hooks": [] }), RELAY).is_err());

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Nook Personal Edition",
+  "version": "0.1.0",
+  "identifier": "io.github.valenticus.nook",
+  "mainBinaryName": "nook-standalone",
+  "build": {
+    "beforeBuildCommand": "npm run build:standalone",
+    "frontendDist": "../dist-standalone"
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "resources": {
+      "../target/release/nook-hook.exe": null,
+      "../target-nook-standalone/release/nook-hook-standalone.exe": "nook-hook-standalone.exe",
+      "../../LICENSE": "LICENSE",
+      "../../NOTICE": "NOTICE"
+    },
+    "shortDescription": "Claude Code and Codex sessions at the top of your screen",
+    "longDescription": "Standalone Nook with explicit agent hook connection controls.",
+    "windows": {
+      "nsis": {
+        "installerHooks": null,
+        "installerIcon": null,
+        "uninstallerIcon": null,
+        "headerImage": null,
+        "uninstallerHeaderImage": null,
+        "sidebarImage": null
+      }
+    }
+  }
+}

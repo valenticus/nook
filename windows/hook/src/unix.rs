@@ -14,16 +14,31 @@ use std::time::{Duration, Instant};
 
 use crate::CONNECT_TIMEOUT;
 
-/// `$XDG_RUNTIME_DIR/nook.sock`, or `/run/user/<uid>/nook.sock` when the
-/// variable is missing (a hook started from a stripped-down environment). The
-/// directory must be ours and closed to everyone else, or there is no relay.
-/// Must match `platform::relay_socket_path()` in the app exactly.
+/// Production uses `nook.sock`; the separately compiled Dev relay uses
+/// `nook-dev.sock` in the same private runtime directory. The build feature
+/// fixes the name, with no runtime override or fallback between the two.
 fn socket_path() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
-    is_private_dir(&dir).then(|| dir.join("nook.sock"))
+    is_private_dir(&dir).then(|| dir.join(socket_name()))
+}
+
+/// Endpoint printed only by the compile-time Dev relay's test diagnostic.
+#[cfg(feature = "nook-dev-relay")]
+pub fn test_endpoint() -> Option<String> {
+    socket_path().map(|path| path.to_string_lossy().into_owned())
+}
+
+fn socket_name() -> &'static str {
+    if cfg!(feature = "nook-dev-relay") {
+        "nook-dev.sock"
+    } else if cfg!(feature = "standalone-relay") {
+        "nook-standalone.sock"
+    } else {
+        "nook.sock"
+    }
 }
 
 /// A real directory (not a symlink), owned by us, no access for group or others.
@@ -61,7 +76,11 @@ pub fn connect() -> Option<UnixStream> {
 /// the main thread's budget bounds every read and write.
 fn try_connect(path: &Path) -> io::Result<UnixStream> {
     let fd = unsafe {
-        libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0)
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -111,4 +130,19 @@ fn server_is_same_user(stream: &UnixStream) -> bool {
     rc == 0
         && len as usize == std::mem::size_of::<libc::ucred>()
         && cred.uid == unsafe { libc::getuid() }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn relay_socket_name_is_fixed_by_the_build_feature() {
+        let name = super::socket_name();
+        if cfg!(feature = "nook-dev-relay") {
+            assert_eq!(name, "nook-dev.sock");
+        } else if cfg!(feature = "standalone-relay") {
+            assert_eq!(name, "nook-standalone.sock");
+        } else {
+            assert_eq!(name, "nook.sock");
+        }
+    }
 }

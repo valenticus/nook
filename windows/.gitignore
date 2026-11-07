@@ -1,6 +1,12 @@
 node_modules/
 dist/
+dist-dev/
+dist-standalone/
 target/
+target-nook-dev/
+/target-nook-standalone/
+dev-release/
+standalone-release/
 release/
 *.tsbuildinfo
 

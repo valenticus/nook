@@ -16,9 +16,13 @@ import { diffLine, fileKind, plusMinus, readPatch } from "./code";
 import { COLOR } from "./palette";
 import { LUCIDE, lucide } from "./iconset";
 import { TOOL_NAME, toolMark } from "./tool";
+import { message, message as i18nMessage } from "../core/i18n";
+import { shelfTrace } from "../core/shelf-trace";
+
+const NOOK_DEV_BUILD = __NOOK_DEV_BUILD__;
 import { buildReplyBox } from "./reply-box";
 import { Update } from "../core/update";
-import { buildHeaderStats } from "./header-stats";
+import { buildClaudeHooksStatus } from "./claude-hooks-status";
 
 /** What stands for a session where there is none to go to: another agent's pill has no ↗. */
 const NO_SESSION = newSession("");
@@ -66,7 +70,7 @@ export interface ViewActions {
   /** Puts another Claude Code session in front: the island shows that one. */
   pickSession(id: string): void;
   /** Goes to where a session runs, whichever is in front, and folds the island once there. */
-  goToSession(id: string): void;
+  goToSession(session: ClaudeSession): void;
   /** From the home view: a session's panel — or, when it is waiting for an answer, the card that asks. */
   openSessionOf(id: string): void;
   /** From the home view: the card of the request a session is waiting on, that session put in front. */
@@ -83,6 +87,7 @@ export interface ViewActions {
   morph(change: () => void, names: MorphNames, open: boolean): boolean;
   /** The Shelf changed what it shows: the island takes its new size, shrinking or growing. */
   resized(shrinking: boolean): void;
+  dismissBatteryAlert(): void;
 }
 
 /** A reply's first line as plain words: what marks it as bold, a heading or code goes. */
@@ -92,7 +97,7 @@ function firstWords(text: string | null): string | null {
 
 export interface ViewHost {
   el: HTMLElement;
-  sync(): void;
+  sync(activeView?: IslandViewName): void;
   /** Called every frame while the view is on screen. */
   tick?(nowMs: number): void;
   /** How tall the island should be for what the view holds now, when that varies. */
@@ -152,7 +157,7 @@ function sessionWho(label: string): HTMLElement {
   if (task) row.append(dot(task.color, 8), ...(session.id ? [toolMark(session.agent, 11)] : []), h("span", { class: "n", text: session.id ? sessionName(session) : task.name }));
   row.append(h("span", { text: label }));
   const waiting = State.waiting.length;
-  if (waiting > 0) row.append(h("span", { class: "who-waiting", text: `+${waiting} waiting`, title: "Other sessions waiting for an answer" }));
+  if (waiting > 0) row.append(h("span", { class: "who-waiting", text: message("+{count} waiting", { count: waiting }), title: "Other sessions waiting for an answer" }));
   return row;
 }
 
@@ -187,18 +192,18 @@ function askerWho(request: SessionRequest | null, label: string, color: string):
     if (task) {
       row.append(
         h("span", { class: "n", text: task, title: task }),
-        h("span", { class: "who-of", text: `(${kind}) of` }), project, h("span", { class: "who-of", text: label }),
+        h("span", { class: "who-of", text: message("({kind}) of", { kind }) }), project, h("span", { class: "who-of", text: label }),
       );
     } else {
-      row.append(h("span", { text: `A ${kind} of` }), project, h("span", { text: label }));
+      row.append(h("span", { text: message("A {kind} of", { kind }) }), project, h("span", { text: label }));
     }
     const waiting = State.waiting.length;
-    if (waiting > 0) row.append(h("span", { class: "who-waiting", text: `+${waiting} waiting`, title: "Other sessions waiting for an answer" }));
+    if (waiting > 0) row.append(h("span", { class: "who-waiting", text: message("+{count} waiting", { count: waiting }), title: "Other sessions waiting for an answer" }));
   }
   // Two of the session's subagents can ask at once: one card at a time, the oldest first.
   const queued = requestsOf(session).length;
   if (queued > 1) {
-    row.append(h("span", { class: "who-waiting", text: `1 of ${queued}`, title: `${queued} requests are waiting: the oldest first` }));
+    row.append(h("span", { class: "who-waiting", text: message("1 of {count}", { count: queued }), title: message("{count} requests are waiting: the oldest first", { count: queued }) }));
   }
   return row;
 }
@@ -209,7 +214,7 @@ function nextWords(session: ClaudeSession): string {
   if (!next) return "";
   const agent = next.agentId ? session.subagents.find((a) => a.id === next.agentId) : null;
   const who = agent ? (agent.description ? `${agent.description} (${agent.type ? `${agent.type} ` : ""}subagent)` : `${subagentName(agent)} (subagent)`) : "another request";
-  return `Next: ${who} · ${isQuestion(next) ? (next.questions[0]?.question ?? "a question") : next.command}`;
+  return message("Next: {who} · {what}", { who, what: isQuestion(next) ? (next.questions[0]?.question ?? "a question") : next.command });
 }
 
 function stack(padLeft: number, padRight: number, ...children: Node[]): HTMLElement {
@@ -251,8 +256,8 @@ function airy(lines: HTMLElement, onResize: () => void): { fit(): void; readonly
 export function buildHeader(actions: ViewActions): ViewHost {
   // The two tabs: Home, the agents; the Shelf, the widgets. A click on one
   // never leaves it with the focus (island.ts stops that for every button).
-  const tabHome = h("button", { class: "tab named", title: "Home: your sessions", onclick: () => go("overview") }, svg(ICONS.house, 13), "Home");
-  const tabShelf = h("button", { class: "tab named", title: "Shelf: your widgets", onclick: () => go("shelf") }, svg(ICONS.shelf, 13), "Shelf");
+  const tabHome = h("button", { class: "tab named", title: "Home: your sessions", "data-nook-action": "home-tab", onclick: () => go("overview") }, svg(ICONS.house, 13), "Home");
+  const tabShelf = h("button", { class: "tab named", title: "Shelf: your widgets", "data-nook-action": "shelf-tab", onclick: () => go("shelf") }, svg(ICONS.shelf, 13), "Shelf");
 
   // The session panel's own button: its normal size, or as large as the display has room for.
   const expandBtn = h("button", { class: "expand ha", onclick: () => actions.setLarge(!State.large) });
@@ -260,8 +265,8 @@ export function buildHeader(actions: ViewActions): ViewHost {
   // large panel takes, is for the sidebar and for Escape — Enter must not shrink the panel back.
   expandBtn.addEventListener("mousedown", (e) => e.preventDefault());
   let expandKey = "";
-  const gearBtn = h("button", { class: "ha", title: "Settings", "aria-label": "Settings", onclick: () => go("settings") }, lucide(LUCIDE.slidersHorizontal, 15, 1.75));
-  const soundBtn = h("button", { class: "ha", title: "Mute", "aria-label": "Mute", onclick: () => actions.toggleSound() });
+  const gearBtn = h("button", { class: "ha", title: "Settings", "aria-label": "Settings", "data-nook-action": "settings-entry", onclick: () => go("settings") }, lucide(LUCIDE.slidersHorizontal, 15, 1.75));
+  const soundBtn = h("button", { class: "ha", title: "Mute", "aria-label": "Mute", "data-nook-action": "audio-toggle", onclick: () => actions.toggleSound() });
   let soundKey = "";
   // A newer Nook is out, and the user asked to be told (core/update.ts): the way to its release page.
   const updateBtn = h("button", { class: "ha ha-update", onclick: () => {
@@ -270,28 +275,28 @@ export function buildHeader(actions: ViewActions): ViewHost {
   } }, lucide(LUCIDE.download, 15, 1.75), h("i"));
   updateBtn.style.display = "none";
   let updateKey = "";
-  // The machine and Claude's usage: written when a sample or a usage comes, never on a timer.
-  const stats = buildHeaderStats();
-  State.onGauges(stats.draw);
-  stats.draw();
-
   function go(v: IslandViewName) {
+    const before = `${State.mode}:${State.view}`;
     actions.blip();
     actions.setView(v);
+    if (NOOK_DEV_BUILD) shelfTrace("ui-handler", {
+      source: `header-tab-${v}:${before}:${State.mode}:${State.view}`,
+      mutationType: "click-handler",
+      changed: before !== `${State.mode}:${State.view}`,
+    });
   }
 
   const el = h(
     "div",
     { id: "header" },
     h("div", { class: "tabs" }, tabHome, tabShelf),
-    stats.el,
     h("div", { class: "header-actions" }, updateBtn, expandBtn, gearBtn, soundBtn),
   );
 
   return {
     el,
-    sync() {
-      const v = State.view;
+    sync(activeView = State.view) {
+      const v = activeView;
       // The session panel is reached from the overview and goes back to it.
       tabHome.classList.toggle("on", v === "overview" || v === "empty" || v === "session");
       tabShelf.classList.toggle("on", v === "shelf");
@@ -321,7 +326,6 @@ export function buildHeader(actions: ViewActions): ViewHost {
         updateBtn.style.display = offered ? "" : "none";
         updateBtn.title = updateBtn.ariaLabel = offered ? `Nook ${offered.latest} is out. Opens its download page.` : "";
       }
-      stats.draw();
       el.style.opacity = v === "confused" ? "0" : "1";
     },
   };
@@ -406,7 +410,11 @@ function buildApproval(actions: ViewActions, onResize: () => void): ViewHost {
       // is the command, the file path or the URL being authorised, not just the
       // name of the tool asking.
       code.textContent = proposal
-        ? `${approval?.tool} · ${proposal.path}${proposal.created ? " · new file" : ""}`
+        ? message("{tool} · {path}{created}", {
+            tool: approval?.tool ?? "",
+            path: proposal.path,
+            created: proposal.created ? message(" · new file") : "",
+          })
         : approval?.command || approval?.tool || "…";
       // What that edit would do, line by line, before it is allowed. Drawn once
       // per request: a list redrawn under the mouse would lose its scroll.
@@ -438,12 +446,14 @@ function buildApproval(actions: ViewActions, onResize: () => void): ViewHost {
       // Two buttons, built once per kind of request. Rebuilding them between a
       // mouse-down and a mouse-up would swallow the click. A request too long
       // to show whole has none: it is answered in Claude Code, which shows it all.
-      const nextRow = approval?.tooLong ? "too-long" : "buttons";
+      const nextRow = approval?.tooLong ? "too-long" : approval?.denyOnly ? "deny-only" : "buttons";
       if (rowKey !== nextRow) {
         rowKey = nextRow;
         clear(row);
         if (approval?.tooLong) {
-          row.append(h("span", { class: "too-long", text: `Too long to review here. Answer it in ${State.clientName}.` }));
+          row.append(h("span", { class: "too-long", text: message("Too long to review here. Answer it in {agent}.", { agent: State.clientName }) }));
+        } else if (NOOK_DEV_BUILD && approval?.denyOnly) {
+          row.append(btn("Deny", "secondary", () => decide("deny")), h("span", { class: "too-long", text: "Dev test request · deny only" }));
         } else {
           row.append(
             btn("Deny", "secondary", () => decide("deny")),
@@ -581,7 +591,7 @@ function buildQuestion(actions: ViewActions, onResize: () => void): ViewHost {
     // swallow the click, so only rebuild when what they show has changed.
     const asker = info?.agentId ? State.session.subagents.find((a) => a.id === info.agentId) : null;
     const next = [
-      request, at, typing, [...picked].join("|"), State.clientName, State.waiting.length,
+      request, at, typing, info?.denyOnly === true, [...picked].join("|"), State.clientName, State.waiting.length,
       requestsOf(State.session).length, asker?.type, asker?.description,
     ].join("~");
     if (next === key) return;
@@ -592,7 +602,7 @@ function buildQuestion(actions: ViewActions, onResize: () => void): ViewHost {
     clear(who);
     clear(row);
     clear(tail);
-    pass.textContent = `Answer in ${State.clientName}`;
+    pass.textContent = message("Answer in {agent}", { agent: State.clientName });
     back.style.display = at > 0 ? "" : "none";
     if (!info || !q) {
       who.append(askerWho(info, "is asking a question", COLOR.cyan));
@@ -602,6 +612,18 @@ function buildQuestion(actions: ViewActions, onResize: () => void): ViewHost {
       skip.style.display = "none";
       return;
     }
+    if (NOOK_DEV_BUILD && info.denyOnly) {
+      who.append(askerWho(info, "is asking a test question", COLOR.cyan));
+      title.textContent = q.question;
+      title.title = q.question;
+      hint.textContent = "Dev test request · deny only";
+      pass.style.display = "none";
+      skip.textContent = "Deny";
+      skip.style.display = "";
+      row.append(h("span", { class: "too-long", text: "This synthetic request cannot be allowed or answered." }));
+      return;
+    }
+    skip.textContent = "Skip";
     pass.style.display = "";
     skip.style.display = "";
 
@@ -798,6 +820,25 @@ function buildConfused(): ViewHost {
   return { el: h("div", { class: "view" }, card("pink", body)), sync() {} };
 }
 
+function buildBatteryAlert(actions: ViewActions): ViewHost {
+  const title = h("div", { class: "title" });
+  const message = h("div", { class: "sub" });
+  const row = h("div", { class: "actions" }, btn("Зрозуміло", "secondary", () => actions.dismissBatteryAlert()));
+  const lines = stack(116, 16, title, message, row);
+  const alertCard = card("amber", lines);
+  const el = h("div", { class: "view" }, alertCard);
+  return {
+    el,
+    sync() {
+      const alert = State.batteryAlert;
+      const critical = alert?.level === "critical";
+      alertCard.style.setProperty("--wash", washRGBA(critical ? "red" : "amber"));
+      title.textContent = critical ? "Критично низький заряд" : "Низький заряд батареї";
+      message.textContent = i18nMessage("{percent}%. Підключіть зарядний пристрій.", { percent: alert?.percent ?? "—" });
+    },
+  };
+}
+
 // ── In-island settings ────────────────────────────────────────────────────────
 
 function buildSettings(actions: ViewActions): ViewHost {
@@ -810,7 +851,7 @@ function buildSettings(actions: ViewActions): ViewHost {
   const segButtons = [10, 15, 30].map((s) =>
     h("button", { onclick: () => actions.setAutoClose(s) }, `${s}s`),
   );
-  const claudeBadge = h("span", { class: "status-badge" });
+  const claudeHooksStatus = buildClaudeHooksStatus();
 
   const rows = h(
     "div",
@@ -825,12 +866,13 @@ function buildSettings(actions: ViewActions): ViewHost {
     ),
     h(
       "div",
-      { class: "settings-row", style: "gap:14px" },
-      claudeBadge,
+      { class: "settings-row agent-status-row" },
+      claudeHooksStatus.el,
       h("div", { class: "grow" }),
       h("button", {
         class: "link-btn",
-        style: "color:#8e939c;font-size:11.5px",
+        "data-nook-action": "settings-window-entry",
+        style: "flex-shrink:0;color:#8e939c;font-size:11.5px",
         text: "Settings…",
         onclick: () => actions.openSettingsWindow(),
       }),
@@ -849,11 +891,7 @@ function buildSettings(actions: ViewActions): ViewHost {
       volume.style.opacity = s.soundEnabled ? "1" : "0.4";
       autoLabel.textContent = `Auto-close · ${Math.round(s.autoCloseInterval)}s`;
       segButtons.forEach((b, i) => b.classList.toggle("on", s.autoCloseInterval === [10, 15, 30][i]));
-      clear(claudeBadge);
-      claudeBadge.append(
-        dot(s.hooksInstalled ? "#22C55E" : "#FF6B7A", 6),
-        h("span", { text: "Claude Code" }),
-      );
+      claudeHooksStatus.sync();
     },
   };
 }
@@ -872,6 +910,7 @@ export function buildViews(
   map.set("error", buildError(actions, onResize));
   map.set("finished", buildFinished(actions, onResize));
   map.set("confused", buildConfused());
+  if (NOOK_DEV_BUILD) map.set("battery", buildBatteryAlert(actions));
   map.set("settings", buildSettings(actions));
   map.set("session", buildSession(actions));
   map.set("shelf", buildShelf(actions));

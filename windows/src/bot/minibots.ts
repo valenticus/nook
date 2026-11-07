@@ -37,6 +37,8 @@ interface MiniBot {
   beatUntil: number;
   /** Drawn until then whatever else: its state has changed, and the change has to play out. */
   drawUntil: number;
+  /** The plush chosen in Settings has changed since it was last drawn: drawn once more as soon as it is on show, however long ago. */
+  themeStale: boolean;
 }
 
 /** How long a lively mini's beat is drawn, and how far apart two of its beats are (ms). */
@@ -73,6 +75,7 @@ const isClose = (zone: GulluZone) => zone === "on" || zone === "near";
  */
 export function createMiniBot(task: AgentTask, bodySize: number): HTMLElement {
   const { slot, engine } = mount(bodySize, task.id);
+  engine.tintYieldsToTheme = true;
   engine.bodyColor = hexToRGB(task.color);
   engine.setState(task.state, true);
   if (task.emote) engine.setPermanentEmote(task.emote);
@@ -106,7 +109,7 @@ function mount(bodySize: number, taskId: string): { slot: HTMLElement; engine: B
     canvas, engine, cssSize: engineSize, taskId, stillAt: Number.POSITIVE_INFINITY,
     reacts: false, ctl: null, status: null, wakeUntil: 0, attended: false,
     // Staggered: each starts its first beat at its own time.
-    beatDue: performance.now() + 400 + Math.random() * 3_000, beatUntil: 0, drawUntil: 0,
+    beatDue: performance.now() + 400 + Math.random() * 3_000, beatUntil: 0, drawUntil: 0, themeStale: false,
   });
   return { slot, engine };
 }
@@ -142,6 +145,7 @@ export function createFreeBot(
  */
 export function createStateBot(state: BotStateName, bodySize: number): { el: HTMLElement; engine: BotEngine } {
   const { slot, engine } = mount(bodySize, "");
+  engine.tintYieldsToTheme = true;
   engine.adopt(state);
   // Drawn once now: one made at rest, on an island at rest, is ticked by nothing.
   const canvas = slot.querySelector("canvas");
@@ -197,8 +201,19 @@ export function miniBotsLively(): boolean {
     if (!mb.canvas.isConnected) continue;
     if (now < mb.stillAt && mb.stillAt !== Number.POSITIVE_INFINITY) return true;
     if (now < mb.wakeUntil || now < mb.drawUntil || now < mb.beatUntil) return true;
+    if (mb.themeStale && shown(mb)) return true;
   }
   return false;
+}
+
+/**
+ * The plush chosen in Settings has changed: every mini already made — a
+ * resting one, one in a view that is not on show — is drawn once more in it,
+ * as soon as it is on show. Nothing else about it is touched: its state, its
+ * animation and its cursor reactions go on as they were.
+ */
+export function refreshMiniBotThemes() {
+  for (const mb of live.values()) mb.themeStale = true;
 }
 
 /**
@@ -384,8 +399,10 @@ export function tickMiniBots(dt: number) {
       mb.engine.beat(BEAT_MS / 1000);
     }
     const attended = attend(mb, now);
+    const recoloured = mb.themeStale && shown(mb);
     const drawn = now < mb.beatUntil || now < mb.drawUntil || (now < mb.stillAt && mb.stillAt !== Number.POSITIVE_INFINITY);
-    if (drawn || attended) paint(mb, dt, attended);
+    if (recoloured) mb.themeStale = false;
+    if (drawn || attended || recoloured) paint(mb, dt, attended);
   }
 }
 

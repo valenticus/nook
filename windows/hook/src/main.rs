@@ -29,6 +29,38 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const FIRE_AND_FORGET_BUDGET: Duration = Duration::from_secs(2);
 /// How long a permission prompt may stay on screen before the terminal takes over.
 const DECISION_BUDGET: Duration = Duration::from_secs(110);
+#[cfg(feature = "nook-dev-relay")]
+const MANUAL_ALERT_DECISION_BUDGET: Duration = Duration::from_secs(290);
+
+#[cfg(feature = "nook-dev-relay")]
+fn manual_two_pending_alert(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|id| {
+            id.starts_with("nook-test:two-pending-alerts:")
+                || id.starts_with("codex:nook-test:two-pending-alerts:")
+        })
+}
+
+#[cfg(feature = "nook-dev-relay")]
+fn decision_budget(payload: &str) -> Duration {
+    if manual_two_pending_alert(payload) {
+        MANUAL_ALERT_DECISION_BUDGET
+    } else {
+        DECISION_BUDGET
+    }
+}
+
+#[cfg(not(feature = "nook-dev-relay"))]
+fn decision_budget(_payload: &str) -> Duration {
+    DECISION_BUDGET
+}
 
 /// Fields that are pointless to forward and can be enormous (a whole file read,
 /// a full command output). The island shows a few lines of them at most, and
@@ -64,7 +96,12 @@ const CONTEXT_LINES: usize = 3;
 /// for what Claude said last — and the events worth reading it on: a turn's
 /// ends, not each of its tools.
 const TRANSCRIPT_TAIL: u64 = 256 * 1024;
-const TRANSCRIPT_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest"];
+const TRANSCRIPT_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "PermissionRequest",
+];
 const MAX_TITLE: usize = 80;
 /// Longest piece of Claude's last message forwarded with a Stop, in characters.
 const MAX_LAST_MESSAGE: usize = 6_000;
@@ -83,7 +120,15 @@ const MAX_APPROVAL_TARGET: usize = 16_000;
 /// The fields of a tool's input that say what it would do, the most telling
 /// first. The island's APPROVAL_FIELDS (island/hooks.ts) is the same list in
 /// the same order: the first of them a request carries is what its card shows.
-const APPROVAL_FIELDS: &[&str] = &["command", "file_path", "path", "url", "query", "pattern", "prompt"];
+const APPROVAL_FIELDS: &[&str] = &[
+    "command",
+    "file_path",
+    "path",
+    "url",
+    "query",
+    "pattern",
+    "prompt",
+];
 /// What names the terminal a session runs in: the key it goes under, and the
 /// environment variable it is read from. Context only — never a filter.
 const ENV_CONTEXT: &[(&str, &str)] = &[
@@ -111,9 +156,17 @@ const HOST_BUDGET: Duration = Duration::from_millis(250);
 /// starts from. Any other ancestor — a script runner, a wrapper — is left out:
 /// what leaves the relay is a pid and one of these names, nothing else.
 const HOST_NAMES: &[&str] = &[
-    "windowsterminal.exe", "code.exe", "code - insiders.exe", "cursor.exe",
-    "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "openconsole.exe",
-    "claude.exe", "explorer.exe",
+    "windowsterminal.exe",
+    "code.exe",
+    "code - insiders.exe",
+    "cursor.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "cmd.exe",
+    "conhost.exe",
+    "openconsole.exe",
+    "claude.exe",
+    "explorer.exe",
 ];
 /// Where the chain ends: everything started from the desktop has it above.
 const DESKTOP: &str = "explorer.exe";
@@ -130,20 +183,34 @@ const WHERE_FLAG: &str = "--where";
 mod win;
 #[cfg(windows)]
 use win::connect;
+#[cfg(all(windows, feature = "nook-dev-relay"))]
+use win::test_endpoint;
 
 #[cfg(target_os = "linux")]
 mod unix;
 #[cfg(target_os = "linux")]
 use unix::connect;
+#[cfg(all(target_os = "linux", feature = "nook-dev-relay"))]
+use unix::test_endpoint;
 
 mod codex;
 mod cursor;
+#[cfg(not(feature = "nook-dev-relay"))]
 mod statusline;
+
+#[cfg(all(feature = "production-relay", feature = "nook-dev-relay"))]
+compile_error!("production-relay and nook-dev-relay are mutually exclusive");
+#[cfg(any(
+    all(feature = "production-relay", feature = "standalone-relay"),
+    all(feature = "nook-dev-relay", feature = "standalone-relay")
+))]
+compile_error!("standalone-relay must be built by itself");
 
 fn main() {
     // Claude Code's status line command, not a hook: a mode of its own, which
     // has its own rules about what is sent and what is printed.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(not(feature = "nook-dev-relay"))]
     if args.first().is_some_and(|arg| arg == statusline::MODE) {
         statusline::run(&args[1..]);
     }
@@ -151,11 +218,29 @@ fn main() {
         println!("{}", where_json());
         return;
     }
-    let Some(Event { line: payload, name: event, tool_input }) = read_event() else { std::process::exit(0) };
+    #[cfg(feature = "nook-dev-relay")]
+    if args.iter().any(|arg| arg == "--test-endpoint") {
+        if let Some(endpoint) = test_endpoint() {
+            println!("{endpoint}");
+        }
+        return;
+    }
+    let Some(Event {
+        line: payload,
+        name: event,
+        tool_input,
+    }) = read_event()
+    else {
+        std::process::exit(0)
+    };
 
     // Only a permission request waits for a human, so only it gets the long budget.
     let waits_for_answer = event == "PermissionRequest";
-    let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
+    let budget = if waits_for_answer {
+        decision_budget(&payload)
+    } else {
+        FIRE_AND_FORGET_BUDGET
+    };
 
     // The worker owns every blocking call. If it overruns the budget we simply
     // stop listening and exit: the process dying takes the pipe handle with it.
@@ -168,7 +253,9 @@ fn main() {
 
     if let Ok(Some(answer)) = rx.recv_timeout(budget) {
         // Cursor's events are never answered: whatever the app said, Cursor gets silence.
-        if std::env::args().any(|arg| arg == cursor::TOOL) { std::process::exit(0); }
+        if std::env::args().any(|arg| arg == cursor::TOOL) {
+            std::process::exit(0);
+        }
         if let Some(json) = reply_json(&answer, tool_input.as_ref()) {
             let mut out = std::io::stdout();
             let _ = writeln!(out, "{json}");
@@ -234,7 +321,9 @@ struct Patch {
 
 impl Patch {
     fn hunk(&mut self, old_start: usize, old_lines: usize, new_start: usize, new_lines: usize) {
-        self.text.push_str(&format!("@@ -{old_start},{old_lines} +{new_start},{new_lines} @@\n"));
+        self.text.push_str(&format!(
+            "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@\n"
+        ));
     }
 
     /// One line with its sign. Past the cap it is still counted, no longer kept.
@@ -277,7 +366,12 @@ fn change_of(response: &serde_json::Value) -> Option<serde_json::Value> {
             for hunk in hunks {
                 let n = |key: &str| hunk.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 patch.hunk(n("oldStart"), n("oldLines"), n("newStart"), n("newLines"));
-                for line in hunk.get("lines").and_then(|v| v.as_array()).into_iter().flatten() {
+                for line in hunk
+                    .get("lines")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
                     let line = line.as_str().unwrap_or_default();
                     let mut chars = line.chars();
                     patch.push(chars.next().unwrap_or(' '), chars.as_str());
@@ -300,14 +394,29 @@ fn change_of(response: &serde_json::Value) -> Option<serde_json::Value> {
 /// step: the end of what a command printed, the start of a file that was read,
 /// what a search found. Nothing else of a tool's response leaves the relay.
 fn result_of(tool: &str, response: &serde_json::Value) -> Option<serde_json::Value> {
-    let text = |key: &str| response.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+    let text = |key: &str| {
+        response
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    };
     let names = || {
         let files = response.get("filenames").and_then(|v| v.as_array());
-        files.into_iter().flatten().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n")
+        files
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     match tool {
         _ if COMMAND_TOOLS.contains(&tool) => {
-            let printed = [text("stdout"), text("stderr")].iter().filter(|s| !s.trim().is_empty()).cloned().collect::<Vec<_>>().join("\n");
+            let printed = [text("stdout"), text("stderr")]
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
             excerpt(&plain(&printed), None, true)
         }
         "Read" => {
@@ -329,9 +438,18 @@ fn excerpt(text: &str, start: Option<u64>, tail: bool) -> Option<serde_json::Val
         return None;
     }
     let truncated = lines.len() > MAX_RESULT_LINES;
-    let kept = if tail { &lines[lines.len().saturating_sub(MAX_RESULT_LINES)..] } else { &lines[..lines.len().min(MAX_RESULT_LINES)] };
-    let kept: Vec<String> = kept.iter().map(|line| clip(line.trim_end(), MAX_RESULT_LINE)).collect();
-    Some(serde_json::json!({ "text": kept.join("\n"), "start": start, "truncated": truncated, "tail": tail }))
+    let kept = if tail {
+        &lines[lines.len().saturating_sub(MAX_RESULT_LINES)..]
+    } else {
+        &lines[..lines.len().min(MAX_RESULT_LINES)]
+    };
+    let kept: Vec<String> = kept
+        .iter()
+        .map(|line| clip(line.trim_end(), MAX_RESULT_LINE))
+        .collect();
+    Some(
+        serde_json::json!({ "text": kept.join("\n"), "start": start, "truncated": truncated, "tail": tail }),
+    )
 }
 
 /// What a command printed without the escape sequences that colour it in a terminal.
@@ -369,7 +487,9 @@ fn launched_agent_of(response: &serde_json::Value) -> Option<String> {
 /// short — anything else is not one, and is not sent.
 fn launched_model_of(response: &serde_json::Value) -> Option<String> {
     let model = response.get("resolvedModel")?.as_str()?.trim();
-    let plain = model.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '[' | ']' | '@' | '/'));
+    let plain = model.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '[' | ']' | '@' | '/')
+    });
     (!model.is_empty() && model.len() <= MAX_MODEL_ID && plain).then(|| model.to_string())
 }
 
@@ -399,8 +519,15 @@ fn apply(text: &str, edit: &serde_json::Value) -> Option<String> {
     if old.is_empty() || !text.contains(old) {
         return None;
     }
-    let all = edit.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-    Some(if all { text.replace(old, new) } else { text.replacen(old, new, 1) })
+    let all = edit
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(if all {
+        text.replace(old, new)
+    } else {
+        text.replacen(old, new, 1)
+    })
 }
 
 /// What changes between two texts, as one hunk: the lines they share at both
@@ -414,7 +541,10 @@ fn diff_of(before: &str, after: &str, created: bool) -> Option<serde_json::Value
         head += 1;
     }
     let mut tail = 0;
-    while tail < a.len() - head && tail < b.len() - head && a[a.len() - 1 - tail] == b[b.len() - 1 - tail] {
+    while tail < a.len() - head
+        && tail < b.len() - head
+        && a[a.len() - 1 - tail] == b[b.len() - 1 - tail]
+    {
         tail += 1;
     }
     let (a_end, b_end) = (a.len() - tail, b.len() - tail);
@@ -426,11 +556,18 @@ fn diff_of(before: &str, after: &str, created: bool) -> Option<serde_json::Value
     let (old_lines, new_lines) = (a_end - from + after_lines, b_end - from + after_lines);
     let mut patch = Patch::default();
     // A side with no line starts at 0, as `diff` writes it.
-    patch.hunk(if old_lines == 0 { 0 } else { from + 1 }, old_lines, if new_lines == 0 { 0 } else { from + 1 }, new_lines);
+    patch.hunk(
+        if old_lines == 0 { 0 } else { from + 1 },
+        old_lines,
+        if new_lines == 0 { 0 } else { from + 1 },
+        new_lines,
+    );
     a[from..head].iter().for_each(|l| patch.push(' ', l));
     a[head..a_end].iter().for_each(|l| patch.push('-', l));
     b[head..b_end].iter().for_each(|l| patch.push('+', l));
-    a[a_end..a_end + after_lines].iter().for_each(|l| patch.push(' ', l));
+    a[a_end..a_end + after_lines]
+        .iter()
+        .for_each(|l| patch.push(' ', l));
     Some(patch.json(created))
 }
 
@@ -441,7 +578,9 @@ fn proposal_of(tool: &str, input: &serde_json::Value) -> Option<serde_json::Valu
     let before = read_text(path);
     let exists = std::path::Path::new(path).exists();
     let after = match tool {
-        "Write" if before.is_some() || !exists => input.get("content")?.as_str()?.replace("\r\n", "\n"),
+        "Write" if before.is_some() || !exists => {
+            input.get("content")?.as_str()?.replace("\r\n", "\n")
+        }
         "Edit" => apply(before.as_deref()?, input)?,
         "MultiEdit" => input
             .get("edits")?
@@ -466,7 +605,8 @@ fn tail_of(transcript: &str) -> Option<String> {
     use std::io::{Seek, SeekFrom};
     let mut file = std::fs::File::open(transcript).ok()?;
     let size = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(size.saturating_sub(TRANSCRIPT_TAIL))).ok()?;
+    file.seek(SeekFrom::Start(size.saturating_sub(TRANSCRIPT_TAIL)))
+        .ok()?;
     let mut tail = Vec::new();
     file.read_to_end(&mut tail).ok()?;
     Some(String::from_utf8_lossy(&tail).into_owned())
@@ -505,7 +645,11 @@ fn context_in(line: &str) -> Option<u64> {
     {
         return None;
     }
-    if entry.pointer("/message/model").and_then(|v| v.as_str()).is_some_and(|model| model.starts_with('<')) {
+    if entry
+        .pointer("/message/model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|model| model.starts_with('<'))
+    {
         return None;
     }
     let usage = entry.pointer("/message/usage")?;
@@ -601,11 +745,19 @@ fn read_event() -> Option<Event> {
     // Cursor's own hooks: translated into the event they stand for. Status
     // only, so nothing here ever waits for an answer or prints one.
     if agent == cursor::TOOL {
-        return event_of(cursor::translate(&payload, &arg_event)?, String::new(), String::new());
+        return event_of(
+            cursor::translate(&payload, &arg_event)?,
+            String::new(),
+            String::new(),
+        );
     }
     // Codex's hooks are shaped as Claude Code's: tagged, and answered the same way.
     if agent == codex::TOOL {
-        return event_of(codex::translate(&payload, &arg_event)?, String::new(), String::new());
+        return event_of(
+            codex::translate(&payload, &arg_event)?,
+            String::new(),
+            String::new(),
+        );
     }
     // A Claude Code hook that Cursor ran: Cursor's session, or nothing at all.
     if agent.is_empty() && cursor::runs_in_cursor() && !cursor::from_claude_hooks(&mut payload) {
@@ -622,6 +774,13 @@ fn event_of(mut payload: serde_json::Value, agent: String, arg_event: String) ->
     // so existing hook commands keep working unchanged.
     if !agent.is_empty() {
         map.insert("nook_agent".into(), serde_json::Value::String(agent));
+    } else if !map.contains_key("nook_tool") {
+        // The Claude relay is the default hook command. Make its identity
+        // explicit so the UI can reserve a missing tool identity for Unknown.
+        map.insert(
+            "nook_tool".into(),
+            serde_json::Value::String("claude".into()),
+        );
     }
     let event = map
         .get("hook_event_name")
@@ -629,22 +788,39 @@ fn event_of(mut payload: serde_json::Value, agent: String, arg_event: String) ->
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
-    map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
+    map.insert(
+        "hook_event_name".into(),
+        serde_json::Value::String(event.clone()),
+    );
 
-    let tool = map.get("tool_name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let tool = map
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     // Before anything is cut or dropped: what an edit did, and a question whole.
     let change = (event == "PostToolUse" && EDIT_TOOLS.contains(&tool.as_str()))
         .then(|| map.get("tool_response").and_then(change_of))
         .flatten();
     // A few lines of what the tool gave back, to show under its step.
     let result = (event == "PostToolUse")
-        .then(|| map.get("tool_response").and_then(|response| result_of(&tool, response)))
+        .then(|| {
+            map.get("tool_response")
+                .and_then(|response| result_of(&tool, response))
+        })
         .flatten();
-    let tool_input = (tool == QUESTION_TOOL).then(|| map.get("tool_input").cloned()).flatten();
+    let tool_input = (tool == QUESTION_TOOL)
+        .then(|| map.get("tool_input").cloned())
+        .flatten();
     // A question that got its answers, wherever they were picked: the island's
     // journal shows them under the question.
     let answers = (event == "PostToolUse" && tool == QUESTION_TOOL)
-        .then(|| map.get("tool_response").and_then(|response| response.get("answers")).filter(|v| v.is_object()).cloned())
+        .then(|| {
+            map.get("tool_response")
+                .and_then(|response| response.get("answers"))
+                .filter(|v| v.is_object())
+                .cloned()
+        })
         .flatten();
     if let Some(answers) = answers {
         map.insert("answers".into(), answers);
@@ -653,17 +829,27 @@ fn event_of(mut payload: serde_json::Value, agent: String, arg_event: String) ->
     let launched = (event == "PostToolUse" && AGENT_TOOLS.contains(&tool.as_str()))
         .then(|| map.get("tool_response").and_then(launched_agent_of))
         .flatten();
-    let launched_async = launched.is_some() && map.get("tool_response").is_some_and(launched_in_background);
+    let launched_async =
+        launched.is_some() && map.get("tool_response").is_some_and(launched_in_background);
     // And the model it runs on, which the island shows next to it.
-    let launched_model = launched.as_ref().and_then(|_| map.get("tool_response").and_then(launched_model_of));
+    let launched_model = launched
+        .as_ref()
+        .and_then(|_| map.get("tool_response").and_then(launched_model_of));
     // An edit asking for permission: what it would do, to look at before allowing.
     let proposal = (event == "PermissionRequest" && EDIT_TOOLS.contains(&tool.as_str()))
-        .then(|| map.get("tool_input").and_then(|input| proposal_of(&tool, input)))
+        .then(|| {
+            map.get("tool_input")
+                .and_then(|input| proposal_of(&tool, input))
+        })
         .flatten();
 
     let tail = TRANSCRIPT_EVENTS
         .contains(&event.as_str())
-        .then(|| map.get("transcript_path").and_then(|v| v.as_str()).and_then(tail_of))
+        .then(|| {
+            map.get("transcript_path")
+                .and_then(|v| v.as_str())
+                .and_then(tail_of)
+        })
         .flatten();
     let title = tail.as_deref().and_then(title_of);
     let context_tokens = tail.as_deref().and_then(context_of);
@@ -713,13 +899,18 @@ fn event_of(mut payload: serde_json::Value, agent: String, arg_event: String) ->
     // Where the session runs, when this is an event that says so. Whatever is
     // on the wire under that name is ours or nothing: Claude Code sends none.
     map.remove("ancestors");
-    let host = HOST_EVENTS.contains(&event.as_str()).then(chain_within_budget).and_then(|chain| reported(&chain));
+    let host = HOST_EVENTS
+        .contains(&event.as_str())
+        .then(chain_within_budget)
+        .and_then(|chain| reported(&chain));
     if let Some(host) = host {
         map.insert("ancestors".into(), host);
     }
 
     // What the card of a permission request shows, kept from the cut below.
-    let target = (event == "PermissionRequest").then(|| approval_target(map)).flatten();
+    let target = (event == "PermissionRequest")
+        .then(|| approval_target(map))
+        .flatten();
 
     truncate_strings(&mut payload);
     if let Some((field, value)) = target {
@@ -754,7 +945,11 @@ fn event_of(mut payload: serde_json::Value, agent: String, arg_event: String) ->
 
     let mut line = payload.to_string();
     line.push('\n');
-    Some(Event { line, name: event, tool_input })
+    Some(Event {
+        line,
+        name: event,
+        tool_input,
+    })
 }
 
 /// A process above the relay: its id, and the name of its image — never a path.
@@ -810,9 +1005,17 @@ fn where_json() -> String {
     let chain = chain_within_budget();
     let env: serde_json::Map<String, serde_json::Value> = ENV_CONTEXT
         .iter()
-        .map(|(key, var)| ((*key).to_string(), serde_json::Value::String(std::env::var(var).unwrap_or_default())))
+        .map(|(key, var)| {
+            (
+                (*key).to_string(),
+                serde_json::Value::String(std::env::var(var).unwrap_or_default()),
+            )
+        })
         .collect();
-    let all: Vec<serde_json::Value> = chain.iter().map(|p| serde_json::json!({ "pid": p.pid, "name": p.name })).collect();
+    let all: Vec<serde_json::Value> = chain
+        .iter()
+        .map(|p| serde_json::json!({ "pid": p.pid, "name": p.name }))
+        .collect();
     let out = serde_json::json!({
         "env": env,
         "ancestors": reported(&chain).unwrap_or_else(|| serde_json::json!([])),
@@ -823,11 +1026,19 @@ fn where_json() -> String {
 
 /// What a permission request asks to do, when it is too long to survive the
 /// cut every field gets: the field it is in, and its text as it came.
-fn approval_target(map: &serde_json::Map<String, serde_json::Value>) -> Option<(&'static str, String)> {
+fn approval_target(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(&'static str, String)> {
     let input = map.get("tool_input")?.as_object()?;
-    let (field, value) = APPROVAL_FIELDS
-        .iter()
-        .find_map(|field| Some((*field, input.get(*field)?.as_str().filter(|s| !s.trim().is_empty())?)))?;
+    let (field, value) = APPROVAL_FIELDS.iter().find_map(|field| {
+        Some((
+            *field,
+            input
+                .get(*field)?
+                .as_str()
+                .filter(|s| !s.trim().is_empty())?,
+        ))
+    })?;
     (value.len() > MAX_FIELD_LEN).then(|| (field, value.to_string()))
 }
 
@@ -896,6 +1107,27 @@ fn talk(payload: &str, waits_for_answer: bool) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "nook-dev-relay")]
+    #[test]
+    fn only_the_manual_alert_fixture_gets_the_long_bounded_dev_budget() {
+        assert_eq!(
+            decision_budget(r#"{"session_id":"nook-test:two-pending-alerts:claude:run"}"#),
+            Duration::from_secs(290)
+        );
+        assert_eq!(
+            decision_budget(r#"{"session_id":"codex:nook-test:two-pending-alerts:codex:run"}"#),
+            Duration::from_secs(290)
+        );
+        assert_eq!(
+            decision_budget(r#"{"session_id":"nook-test:other:run"}"#),
+            DECISION_BUDGET
+        );
+        assert_eq!(
+            decision_budget(r#"{"session_id":"real-session"}"#),
+            DECISION_BUDGET
+        );
+    }
+
     #[test]
     fn decision_json_matches_the_documented_shape() {
         assert_eq!(
@@ -910,7 +1142,9 @@ mod tests {
         assert!(decision_json("always").is_none());
         // A skipped question is a denial that says what it is.
         let skipped = decision_json("skip").unwrap();
-        assert!(skipped.contains(r#""behavior":"deny""#) && skipped.contains("skipped this question"));
+        assert!(
+            skipped.contains(r#""behavior":"deny""#) && skipped.contains("skipped this question")
+        );
     }
 
     #[test]
@@ -927,10 +1161,19 @@ mod tests {
         let out = reply_json(r#"answer {"Which engine?":"Postgres"}"#, Some(&input)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let decision = &v["hookSpecificOutput"]["decision"];
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(
+            v["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
         assert_eq!(decision["behavior"], "allow");
-        assert_eq!(decision["updatedInput"]["questions"][0]["question"], "Which engine?");
-        assert_eq!(decision["updatedInput"]["answers"]["Which engine?"], "Postgres");
+        assert_eq!(
+            decision["updatedInput"]["questions"][0]["question"],
+            "Which engine?"
+        );
+        assert_eq!(
+            decision["updatedInput"]["answers"]["Which engine?"],
+            "Postgres"
+        );
         // Without the question there is nothing to answer; a plain word still works.
         assert!(reply_json(r#"answer {"a":"b"}"#, None).is_none());
         assert!(reply_json("answer nonsense", Some(&input)).is_none());
@@ -959,7 +1202,8 @@ mod tests {
 
     #[test]
     fn a_new_file_is_all_additions_and_a_long_one_is_cut() {
-        let created = serde_json::json!({ "type": "create", "content": "one\ntwo\n", "structuredPatch": [] });
+        let created =
+            serde_json::json!({ "type": "create", "content": "one\ntwo\n", "structuredPatch": [] });
         let change = change_of(&created).unwrap();
         assert_eq!(change["patch"], "@@ -0,0 +1,2 @@\n+one\n+two\n");
         assert_eq!(change["created"], true);
@@ -989,7 +1233,11 @@ mod tests {
         assert_eq!(diff["additions"], 2);
         assert_eq!(diff["deletions"], 1);
         // Text that is not in the file cannot be replaced: no proposal, the card stays plain.
-        assert!(apply(before, &serde_json::json!({ "old_string": "nine", "new_string": "9" })).is_none());
+        assert!(apply(
+            before,
+            &serde_json::json!({ "old_string": "nine", "new_string": "9" })
+        )
+        .is_none());
         // Nothing changed is nothing to show.
         assert!(diff_of(before, before, false).is_none());
     }
@@ -1000,20 +1248,34 @@ mod tests {
         std::fs::write(&path, "alpha\r\nbeta\r\ngamma\r\n").unwrap();
         let file = path.to_string_lossy().to_string();
 
-        let edit = serde_json::json!({ "file_path": file, "old_string": "beta", "new_string": "BETA" });
+        let edit =
+            serde_json::json!({ "file_path": file, "old_string": "beta", "new_string": "BETA" });
         let proposal = proposal_of("Edit", &edit).unwrap();
-        assert_eq!(proposal["patch"], "@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n");
+        assert_eq!(
+            proposal["patch"],
+            "@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n"
+        );
         assert_eq!(proposal["created"], false);
 
-        let write = serde_json::json!({ "file_path": file, "content": "alpha\nbeta\ngamma\ndelta\n" });
-        assert_eq!(proposal_of("Write", &write).unwrap()["patch"], "@@ -1,3 +1,4 @@\n alpha\n beta\n gamma\n+delta\n");
+        let write =
+            serde_json::json!({ "file_path": file, "content": "alpha\nbeta\ngamma\ndelta\n" });
+        assert_eq!(
+            proposal_of("Write", &write).unwrap()["patch"],
+            "@@ -1,3 +1,4 @@\n alpha\n beta\n gamma\n+delta\n"
+        );
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\r\nbeta\r\ngamma\r\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\r\nbeta\r\ngamma\r\n"
+        );
         std::fs::remove_file(&path).unwrap();
 
         // The file is gone now: writing it is creating it.
         let created = proposal_of("Write", &write).unwrap();
-        assert_eq!(created["patch"], "@@ -0,0 +1,4 @@\n+alpha\n+beta\n+gamma\n+delta\n");
+        assert_eq!(
+            created["patch"],
+            "@@ -0,0 +1,4 @@\n+alpha\n+beta\n+gamma\n+delta\n"
+        );
         assert_eq!(created["created"], true);
         assert!(proposal_of("Edit", &edit).is_none());
     }
@@ -1021,15 +1283,23 @@ mod tests {
     #[test]
     fn the_title_is_the_last_one_the_transcript_names() {
         assert_eq!(
-            title_in(r#"{"type":"custom-title","customTitle":" Panneau GitHub ","sessionId":"x"}"#).as_deref(),
+            title_in(r#"{"type":"custom-title","customTitle":" Panneau GitHub ","sessionId":"x"}"#)
+                .as_deref(),
             Some("Panneau GitHub")
         );
-        assert_eq!(title_in(r#"{"type":"summary","summary":"Fix the hook","leafUuid":"y"}"#).as_deref(), Some("Fix the hook"));
+        assert_eq!(
+            title_in(r#"{"type":"summary","summary":"Fix the hook","leafUuid":"y"}"#).as_deref(),
+            Some("Fix the hook")
+        );
         // A message that merely talks about titles is not one.
-        assert!(title_in(r#"{"type":"user","message":{"content":"the custom-title\" line"}}"#).is_none());
+        assert!(
+            title_in(r#"{"type":"user","message":{"content":"the custom-title\" line"}}"#)
+                .is_none()
+        );
         assert!(title_in("not json -title\"").is_none());
 
-        let path = std::env::temp_dir().join(format!("nook-hook-title-{}.jsonl", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("nook-hook-title-{}.jsonl", std::process::id()));
         std::fs::write(
             &path,
             "{\"type\":\"custom-title\",\"customTitle\":\"First\"}\n{\"type\":\"user\"}\n{\"type\":\"custom-title\",\"customTitle\":\"Second\"}\n{\"type\":\"assistant\"}\n",
@@ -1051,7 +1321,10 @@ mod tests {
             r#"{"type":"custom-title","customTitle":"A title"}"#,
         ]
         .join("\n");
-        assert_eq!(last_message_of(&tail).as_deref(), Some("Done.\n\nTwo files changed."));
+        assert_eq!(
+            last_message_of(&tail).as_deref(),
+            Some("Done.\n\nTwo files changed.")
+        );
         assert!(last_message_of(r#"{"type":"user","message":{"content":"hello"}}"#).is_none());
         assert_eq!(clip("héllo", 3), "hél…");
         assert_eq!(clip("hey", 3), "hey");
@@ -1067,7 +1340,10 @@ mod tests {
     #[test]
     fn the_context_is_what_the_last_real_answer_was_given_to_read() {
         // Input of every kind added up; the output is not part of it.
-        assert_eq!(context_of(&answer("claude-opus-5", 10, 2_000, 40_000, "")), Some(42_010));
+        assert_eq!(
+            context_of(&answer("claude-opus-5", 10, 2_000, 40_000, "")),
+            Some(42_010)
+        );
         // The last answer wins, never the largest: /compact made the number fall.
         let compacted = [answer("m", 1, 0, 150_000, ""), answer("m", 1, 0, 9_000, "")].join("\n");
         assert_eq!(context_of(&compacted), Some(9_001));
@@ -1091,7 +1367,10 @@ mod tests {
         // Above 200k is passed on as it is: the window is the app's to infer.
         assert_eq!(context_of(&answer("m", 1, 0, 450_000, "")), Some(450_001));
         // No answer yet, or nothing at all: no number, not zero.
-        assert_eq!(context_of(r#"{"type":"user","message":{"content":"hello"}}"#), None);
+        assert_eq!(
+            context_of(r#"{"type":"user","message":{"content":"hello"}}"#),
+            None
+        );
         assert_eq!(context_of(""), None);
     }
 
@@ -1103,8 +1382,12 @@ mod tests {
         assert_eq!(context_of(&format!("{line}\n{cut}\n")), Some(80_003));
         assert_eq!(context_of(cut), None);
 
-        let path = std::env::temp_dir().join(format!("nook-hook-context-{}.jsonl", std::process::id()));
-        let filler = format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n", "x".repeat(1_000));
+        let path =
+            std::env::temp_dir().join(format!("nook-hook-context-{}.jsonl", std::process::id()));
+        let filler = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(1_000)
+        );
         let mut text = answer("m", 1, 0, 11_111, "") + "\n";
         text.push_str(&filler.repeat(300));
         text.push_str(&answer("m", 1, 0, 22_222, ""));
@@ -1114,7 +1397,9 @@ mod tests {
 
         // Only the end of the file is read, so the first line is gone, and the last one counts.
         let event = |name: &str| {
-            forwarded(serde_json::json!({ "hook_event_name": name, "session_id": "s", "transcript_path": file }))
+            forwarded(
+                serde_json::json!({ "hook_event_name": name, "session_id": "s", "transcript_path": file }),
+            )
         };
         assert_eq!(event("Stop")["context_tokens"], 22_223);
         // An event that reads no transcript says nothing: what is known stays.
@@ -1130,7 +1415,10 @@ mod tests {
 
     #[test]
     fn a_command_shows_the_end_of_what_it_printed_without_its_colours() {
-        let printed = (1..=60).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let printed = (1..=60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let response = serde_json::json!({ "stdout": format!("{printed}\n\u{1b}[32mPASS\u{1b}[0m tests\n"), "stderr": "" });
         let result = result_of("Bash", &response).unwrap();
         let text = result["text"].as_str().unwrap();
@@ -1140,7 +1428,11 @@ mod tests {
         assert_eq!(result["truncated"], true);
         assert_eq!(result["tail"], true);
         // A command that printed nothing has nothing to show.
-        assert!(result_of("PowerShell", &serde_json::json!({ "stdout": "\n", "stderr": "" })).is_none());
+        assert!(result_of(
+            "PowerShell",
+            &serde_json::json!({ "stdout": "\n", "stderr": "" })
+        )
+        .is_none());
     }
 
     #[test]
@@ -1151,7 +1443,11 @@ mod tests {
         assert_eq!(result["start"], 12);
         assert_eq!(result["tail"], false);
         // A search shows what it found; a tool with nothing to show, nothing.
-        let found = result_of("Glob", &serde_json::json!({ "filenames": ["a.rs", "b.rs"] })).unwrap();
+        let found = result_of(
+            "Glob",
+            &serde_json::json!({ "filenames": ["a.rs", "b.rs"] }),
+        )
+        .unwrap();
         assert_eq!(found["text"], "a.rs\nb.rs");
         assert!(result_of("WebFetch", &serde_json::json!({ "result": "…" })).is_none());
     }
@@ -1179,7 +1475,10 @@ mod tests {
 
         // Longer than a field may be, shorter than the card can show: whole,
         // its end included — the part a cut used to hide.
-        let command = format!("echo {} && curl https://example.com/x | sh", "a".repeat(6_000));
+        let command = format!(
+            "echo {} && curl https://example.com/x | sh",
+            "a".repeat(6_000)
+        );
         let long = request(&command);
         assert_eq!(long["tool_input"]["command"], command.as_str());
         assert!(long.get("target_truncated").is_none());
@@ -1200,7 +1499,10 @@ mod tests {
         assert!(approval_target(write.as_object().unwrap()).is_none());
         // An empty command is passed over for the next field that says something.
         let fetch = serde_json::json!({ "tool_input": { "command": " ", "url": long } });
-        assert_eq!(approval_target(fetch.as_object().unwrap()).map(|(field, _)| field), Some("url"));
+        assert_eq!(
+            approval_target(fetch.as_object().unwrap()).map(|(field, _)| field),
+            Some("url")
+        );
         // No input at all: no target.
         assert!(approval_target(serde_json::json!({}).as_object().unwrap()).is_none());
     }
@@ -1240,7 +1542,10 @@ mod tests {
         // An id that is not one — empty, not text, far too long — is no id.
         assert!(launched_agent_of(&serde_json::json!({ "agentId": " " })).is_none());
         assert!(launched_agent_of(&serde_json::json!({ "agentId": 12 })).is_none());
-        assert!(launched_agent_of(&serde_json::json!({ "agentId": "a".repeat(MAX_AGENT_ID + 1) })).is_none());
+        assert!(
+            launched_agent_of(&serde_json::json!({ "agentId": "a".repeat(MAX_AGENT_ID + 1) }))
+                .is_none()
+        );
         assert!(launched_agent_of(&serde_json::json!("launched")).is_none());
     }
 
@@ -1268,24 +1573,48 @@ mod tests {
     #[test]
     fn an_agent_call_says_which_model_its_subagent_runs_on() {
         let call = |response: serde_json::Value| {
-            forwarded(serde_json::json!({ "hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_response": response }))
+            forwarded(
+                serde_json::json!({ "hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_response": response }),
+            )
         };
-        let out = call(serde_json::json!({ "agentId": "af3d8c03f03bd405d", "resolvedModel": "claude-opus-5-5", "prompt": "p" }));
+        let out = call(
+            serde_json::json!({ "agentId": "af3d8c03f03bd405d", "resolvedModel": "claude-opus-5-5", "prompt": "p" }),
+        );
         assert_eq!(out["launched_model"], "claude-opus-5-5");
         assert!(out.get("tool_response").is_none());
         // No model named, or no subagent to say it of: nothing.
-        assert!(call(serde_json::json!({ "agentId": "af3d8c03f03bd405d" })).get("launched_model").is_none());
-        assert!(call(serde_json::json!({ "resolvedModel": "claude-opus-5-5" })).get("launched_model").is_none());
+        assert!(call(serde_json::json!({ "agentId": "af3d8c03f03bd405d" }))
+            .get("launched_model")
+            .is_none());
+        assert!(
+            call(serde_json::json!({ "resolvedModel": "claude-opus-5-5" }))
+                .get("launched_model")
+                .is_none()
+        );
         // Another tool's response is not looked at.
         let read = forwarded(serde_json::json!({
             "hook_event_name": "PostToolUse", "tool_name": "Read", "tool_response": { "agentId": "a", "resolvedModel": "claude-opus-5-5" },
         }));
         assert!(read.get("launched_model").is_none());
         // A model's id as a provider writes one is still one; free text is not.
-        let model = |name: serde_json::Value| launched_model_of(&serde_json::json!({ "resolvedModel": name }));
-        assert_eq!(model(serde_json::json!(" us.anthropic.claude-sonnet-5-v1:0 ")).as_deref(), Some("us.anthropic.claude-sonnet-5-v1:0"));
-        assert_eq!(model(serde_json::json!("claude-opus-5-5[1m]")).as_deref(), Some("claude-opus-5-5[1m]"));
-        for not_one in [serde_json::json!(""), serde_json::json!(12), serde_json::json!("the best\none"), serde_json::json!("a model"), serde_json::json!("m".repeat(MAX_MODEL_ID + 1))] {
+        let model = |name: serde_json::Value| {
+            launched_model_of(&serde_json::json!({ "resolvedModel": name }))
+        };
+        assert_eq!(
+            model(serde_json::json!(" us.anthropic.claude-sonnet-5-v1:0 ")).as_deref(),
+            Some("us.anthropic.claude-sonnet-5-v1:0")
+        );
+        assert_eq!(
+            model(serde_json::json!("claude-opus-5-5[1m]")).as_deref(),
+            Some("claude-opus-5-5[1m]")
+        );
+        for not_one in [
+            serde_json::json!(""),
+            serde_json::json!(12),
+            serde_json::json!("the best\none"),
+            serde_json::json!("a model"),
+            serde_json::json!("m".repeat(MAX_MODEL_ID + 1)),
+        ] {
             assert!(model(not_one).is_none());
         }
     }
@@ -1293,12 +1622,23 @@ mod tests {
     #[test]
     fn the_model_a_session_names_goes_through_as_it_came() {
         // SessionStart names the session's model: a plain id, left as it is.
-        let start = forwarded(serde_json::json!({ "hook_event_name": "SessionStart", "session_id": "s", "cwd": "C:\\work", "source": "startup", "model": "claude-opus-5-5" }));
+        let start = forwarded(
+            serde_json::json!({ "hook_event_name": "SessionStart", "session_id": "s", "cwd": "C:\\work", "source": "startup", "model": "claude-opus-5-5" }),
+        );
         assert_eq!(start["model"], "claude-opus-5-5");
         // Were it ever an object, it would go through whole too, each string capped like any other.
-        let object = forwarded(serde_json::json!({ "hook_event_name": "SessionStart", "model": { "id": "claude-opus-5-5", "display_name": "x".repeat(MAX_FIELD_LEN + 50) } }));
+        let object = forwarded(
+            serde_json::json!({ "hook_event_name": "SessionStart", "model": { "id": "claude-opus-5-5", "display_name": "x".repeat(MAX_FIELD_LEN + 50) } }),
+        );
         assert_eq!(object["model"]["id"], "claude-opus-5-5");
-        assert_eq!(object["model"]["display_name"].as_str().unwrap().chars().count(), MAX_FIELD_LEN + 1);
+        assert_eq!(
+            object["model"]["display_name"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_FIELD_LEN + 1
+        );
     }
 
     #[test]
@@ -1319,10 +1659,14 @@ mod tests {
         assert!(out.get("transcript_path").is_none());
 
         // A subagent that said nothing has no last message: the session's transcript is not read for it.
-        let silent = forwarded(serde_json::json!({ "hook_event_name": "SubagentStop", "agent_id": "a", "last_assistant_message": " " }));
+        let silent = forwarded(
+            serde_json::json!({ "hook_event_name": "SubagentStop", "agent_id": "a", "last_assistant_message": " " }),
+        );
         assert!(silent.get("last_message").is_none());
         // An event that is no turn's end lifts nothing.
-        let tool = forwarded(serde_json::json!({ "hook_event_name": "PreToolUse", "last_assistant_message": "hello" }));
+        let tool = forwarded(
+            serde_json::json!({ "hook_event_name": "PreToolUse", "last_assistant_message": "hello" }),
+        );
         assert!(tool.get("last_message").is_none());
         assert!(tool.get("last_assistant_message").is_none());
     }
@@ -1340,11 +1684,18 @@ mod tests {
         assert_eq!(stop["background_tasks"], tasks);
         assert_eq!(stop["last_message"], "Two agents are at work.");
         // A turn that ends with nothing in the background says so with an empty list, not with none.
-        let ended = forwarded(serde_json::json!({ "hook_event_name": "Stop", "cwd": "C:\\work", "background_tasks": [] }));
+        let ended = forwarded(
+            serde_json::json!({ "hook_event_name": "Stop", "cwd": "C:\\work", "background_tasks": [] }),
+        );
         assert_eq!(ended["background_tasks"], serde_json::json!([]));
 
         // A tool event from inside a subagent, a permission request included, says whose it is.
-        for event in ["PreToolUse", "PostToolUse", "PermissionRequest", "SubagentStart"] {
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "SubagentStart",
+        ] {
             let out = forwarded(serde_json::json!({
                 "hook_event_name": event, "session_id": "s", "cwd": "C:\\work",
                 "agent_id": "a1d6303f7f7626095", "agent_type": "general-purpose",
@@ -1357,43 +1708,83 @@ mod tests {
 
     #[test]
     fn nothing_of_the_environment_goes_but_what_names_the_terminal() {
-        let sent = ["hook_event_name", "session_id", "cwd", "agent_id"];
+        let sent = [
+            "hook_event_name",
+            "session_id",
+            "cwd",
+            "agent_id",
+            "nook_tool",
+        ];
         let added: Vec<&str> = ENV_CONTEXT.iter().map(|(key, _)| *key).collect();
-        let out = forwarded(serde_json::json!({ "hook_event_name": "SubagentStart", "session_id": "s", "cwd": "C:\\work", "agent_id": "a" }));
+        let out = forwarded(
+            serde_json::json!({ "hook_event_name": "SubagentStart", "session_id": "s", "cwd": "C:\\work", "agent_id": "a" }),
+        );
+        assert_eq!(out["nook_tool"], "claude");
         for key in out.as_object().unwrap().keys() {
-            assert!(sent.contains(&key.as_str()) || added.contains(&key.as_str()), "{key} must not be forwarded");
+            assert!(
+                sent.contains(&key.as_str()) || added.contains(&key.as_str()),
+                "{key} must not be forwarded"
+            );
         }
     }
 
     #[test]
     fn where_a_session_runs_is_said_when_it_starts_and_when_it_is_spoken_to() {
-        for event in ["PreToolUse", "PostToolUse", "PermissionRequest", "Stop", "SubagentStart", "Notification"] {
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "Stop",
+            "SubagentStart",
+            "Notification",
+        ] {
             // Not on a tool's event — and never what somebody else put there.
-            let out = forwarded(serde_json::json!({ "hook_event_name": event, "cwd": "C:\\work", "ancestors": [{ "pid": 4, "name": "Code.exe" }] }));
-            assert!(out.get("ancestors").is_none(), "{event} must not carry the ancestors");
+            let out = forwarded(
+                serde_json::json!({ "hook_event_name": event, "cwd": "C:\\work", "ancestors": [{ "pid": 4, "name": "Code.exe" }] }),
+            );
+            assert!(
+                out.get("ancestors").is_none(),
+                "{event} must not carry the ancestors"
+            );
         }
         for event in HOST_EVENTS {
-            let out = forwarded(serde_json::json!({ "hook_event_name": event, "cwd": "C:\\work", "ancestors": [{ "pid": 4, "name": "Code.exe" }] }));
+            let out = forwarded(
+                serde_json::json!({ "hook_event_name": event, "cwd": "C:\\work", "ancestors": [{ "pid": 4, "name": "Code.exe" }] }),
+            );
             // Linux reports none. On Windows the test runs under cargo, in
             // whatever started it: only the shape can be told.
-            let Some(named) = out.get("ancestors") else { continue };
-            assert_ne!(named[0]["pid"], 4, "what came on the wire is not what goes out");
+            let Some(named) = out.get("ancestors") else {
+                continue;
+            };
+            assert_ne!(
+                named[0]["pid"], 4,
+                "what came on the wire is not what goes out"
+            );
             for ancestor in named.as_array().unwrap() {
                 let mut fields: Vec<&String> = ancestor.as_object().unwrap().keys().collect();
                 fields.sort();
                 assert_eq!(fields, ["name", "pid"], "a pid and a name, nothing else");
                 assert!(ancestor["pid"].as_u64().unwrap() > 0);
-                assert!(HOST_NAMES.contains(&ancestor["name"].as_str().unwrap().to_lowercase().as_str()));
+                assert!(HOST_NAMES
+                    .contains(&ancestor["name"].as_str().unwrap().to_lowercase().as_str()));
             }
         }
     }
 
     #[test]
     fn only_the_ancestors_worth_naming_are_named_and_none_past_the_desktop() {
-        let p = |pid: u32, name: &str| Proc { pid, name: name.to_string() };
+        let p = |pid: u32, name: &str| Proc {
+            pid,
+            name: name.to_string(),
+        };
         let chain = [
-            p(10, "claude.exe"), p(11, "node.exe"), p(12, "pwsh.exe"), p(13, "WindowsTerminal.exe"),
-            p(14, "explorer.exe"), p(15, "userinit.exe"), p(16, "cmd.exe"),
+            p(10, "claude.exe"),
+            p(11, "node.exe"),
+            p(12, "pwsh.exe"),
+            p(13, "WindowsTerminal.exe"),
+            p(14, "explorer.exe"),
+            p(15, "userinit.exe"),
+            p(16, "cmd.exe"),
         ];
         assert_eq!(
             reported(&chain).unwrap(),
@@ -1408,7 +1799,10 @@ mod tests {
         // A pid that is none names nobody, and a chain is never longer than its cap.
         assert!(reported(&[p(0, "cmd.exe")]).is_none());
         let long: Vec<Proc> = (1..=40).map(|pid| p(pid, "cmd.exe")).collect();
-        assert_eq!(reported(&long).unwrap().as_array().unwrap().len(), MAX_ANCESTORS);
+        assert_eq!(
+            reported(&long).unwrap().as_array().unwrap().len(),
+            MAX_ANCESTORS
+        );
     }
 
     #[test]
@@ -1418,7 +1812,9 @@ mod tests {
             assert!(out["env"][*key].is_string(), "{key} is part of the context");
         }
         assert!(out["ancestors"].is_array() && out["chain"].is_array());
-        assert!(out["ancestors"].as_array().unwrap().len() <= out["chain"].as_array().unwrap().len());
+        assert!(
+            out["ancestors"].as_array().unwrap().len() <= out["chain"].as_array().unwrap().len()
+        );
     }
 
     #[test]

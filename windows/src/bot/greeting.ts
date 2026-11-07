@@ -379,6 +379,7 @@ export class Greeting {
   private timers: number[] = [];
 
   onComplete: (() => void) | null = null;
+  onSound: ((name: "greet" | "blip", queued: boolean) => void) | null = null;
 
   start() {
     this.startMs = performance.now();
@@ -386,8 +387,8 @@ export class Greeting {
     this.fired = false;
     this.cancelTimers();
     this.timers.push(
-      window.setTimeout(() => Sound.play("greet"), (T.pop0 / GREETING_SPEED) * 1000),
-      window.setTimeout(() => Sound.play("blip"), (T.badge / GREETING_SPEED) * 1000),
+      window.setTimeout(() => this.play("greet"), (T.pop0 / GREETING_SPEED) * 1000),
+      window.setTimeout(() => this.play("blip"), (T.badge / GREETING_SPEED) * 1000),
       window.setTimeout(() => this.fire(), (T.end / GREETING_SPEED + 0.05) * 1000),
     );
   }
@@ -422,6 +423,10 @@ export class Greeting {
   private cancelTimers() {
     this.timers.forEach((id) => window.clearTimeout(id));
     this.timers = [];
+  }
+
+  private play(name: "greet" | "blip") {
+    this.onSound?.(name, Sound.play(name));
   }
 
   draw(x: CanvasRenderingContext2D) {

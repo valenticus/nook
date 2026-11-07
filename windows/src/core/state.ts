@@ -2,6 +2,7 @@
 
 import type { BotEmoteName, BotStateName, Dock, IslandMode, IslandViewName } from "./layout";
 import type { EyeShape } from "../bot/engine";
+import type { CodexQuotaSnapshot, DevBatteryStatus } from "./bridge";
 
 export type AgentSource = "claudeCode" | "agent";
 export type PillBadge = "approval" | "finished" | "error";
@@ -39,6 +40,8 @@ export interface ApprovalInfo {
   step: SessionStep | null;
   /** When it was asked: among several sessions waiting, the one that has waited longest is gone to first. */
   askedAt?: number;
+  /** Dev relay marks synthetic nook-test requests; Rust enforces deny-only independently. */
+  denyOnly?: boolean;
 }
 
 /** An edit that has not happened yet, as the diff it would make. */
@@ -72,10 +75,15 @@ export interface QuestionInfo {
   step: SessionStep | null;
   /** When it was asked. */
   askedAt?: number;
+  /** Dev relay marks synthetic nook-test requests; Rust enforces deny-only independently. */
+  denyOnly?: boolean;
 }
 
 /** What a session waits on a human for: a permission, or a question. */
-export type SessionRequest = ApprovalInfo | QuestionInfo;
+export type SessionRequest = (ApprovalInfo | QuestionInfo) & {
+  /** Codex turn this request belongs to; used to release only its own pending request on Interrupt. */
+  turnId?: string;
+};
 
 export const isQuestion = (request: SessionRequest): request is QuestionInfo => "questions" in request;
 
@@ -222,7 +230,7 @@ export const isTool = (step: SessionStep) => !SAID.has(step.kind);
 export interface SessionStep {
   tool: string;
   kind: StepKind;
-  state: "running" | "done" | "failed";
+  state: "running" | "done" | "failed" | "interrupted";
   /**
    * What a tool is at: a file by its path in the session's folder, a command,
    * what is looked for. For something said: the words.
@@ -244,6 +252,8 @@ export interface SessionStep {
   agentId?: string;
   /** When it started; once it has ended, when it ended. */
   at: number;
+  /** Codex turn attribution for late-event and interruption handling. */
+  turnId?: string;
 }
 
 /** A step with nothing in it yet but what it is. */
@@ -500,6 +510,8 @@ export interface ClaudeSession {
   restedAt: number;
   /** That turn's result has not been looked at yet: it keeps a green mark on the home view, and stays there longer. */
   unseen: boolean;
+  /** Completion card remains available after folding until opened or dismissed. */
+  completionPending: boolean;
   /**
    * A turn of its ended while the panel was being read (`core/reading.ts`), and
    * it was left alone: its line of the sidebar wears a mark until it is opened.
@@ -525,6 +537,14 @@ export interface ClaudeSession {
   contextTokens: number | null;
   /** The size of its context window, when its status line said it. */
   contextWindow: number | null;
+  /** Current Codex turn, if its hooks carry a turn_id. */
+  codexTurnId?: string | null;
+  /** Bounded IDs prevent delayed events from reopening completed/interrupted Codex turns. */
+  closedCodexTurns?: string[];
+  /** Bounded IDs prevent duplicate UserPromptSubmit hooks from duplicating a turn. */
+  promptedCodexTurns?: string[];
+  /** Codex subagent IDs whose stop event arrived; later starts/tools for them are stale. */
+  endedCodexSubagents?: string[];
 }
 
 /** What the mark of a reply that waits on a decision says. */
@@ -534,15 +554,16 @@ export const DECISION_WORDS = "Needs your decision";
 export const SESSION_UNNAMED = "Session";
 
 /** The tool a session runs in: its id, for Cursor, is `cursor:<conversation>` (set by the relay). */
-export type SessionAgent = "claude" | "cursor" | "codex";
+export type SessionAgent = "claude" | "cursor" | "codex" | "unknown";
 
 export function newSession(id: string, agent: SessionAgent = "claude"): ClaudeSession {
   return {
     id, agent, target: NO_TARGET, title: null, project: SESSION_UNNAMED, cwd: null, state: "idle",
     lines: [], steps: [], asked: null, answer: null, answeredAt: 0,
     approval: null, question: null, queued: [], subagents: [], launching: [], parked: false, toldReply: null, attributed: null,
-    news: null, heardAt: 0, restedAt: 0, unseen: false, attention: false, nudges: 0, decision: false, model: null,
+    news: null, heardAt: 0, restedAt: 0, unseen: false, completionPending: false, attention: false, nudges: 0, decision: false, model: null,
     contextTokens: null, contextWindow: null,
+    codexTurnId: null, closedCodexTurns: [], promptedCodexTurns: [], endedCodexSubagents: [],
   };
 }
 
@@ -561,6 +582,8 @@ export const INTEGRATION_AGENTS: AgentTask[] = [
 ];
 
 export interface Settings {
+  /** User-facing language choice; auto resolves from the Windows/WebView locale. */
+  language: "auto" | "uk" | "en";
   soundEnabled: boolean;
   soundVolume: number;
   autoCloseInterval: number;
@@ -628,6 +651,8 @@ export interface Settings {
   showCursorSessions: boolean;
   /** Settings → Codex: Codex's sessions are shown beside Claude Code's. */
   showCodexSessions: boolean;
+  /** Nook Dev only: explicit opt-in to the existing Codex Desktop profile. */
+  codexQuotaEnabled: boolean;
   /** Settings → About: once a day, ask GitHub whether a newer Nook is out. Off unless the user switches it on. */
   checkUpdates: boolean;
 }
@@ -643,32 +668,31 @@ export function foldedAutoHide(settings: Pick<Settings, "foldedAutoHide">): numb
 }
 
 /** What a cell of the folded island can show. */
-export const COMPACT_METRICS = ["cpu", "gpu", "ram", "usage5h", "usage7d", "waiting"] as const;
+export const COMPACT_METRICS = ["usage5h", "usage7d", "waiting"] as const;
 export type CompactMetric = (typeof COMPACT_METRICS)[number];
-/** Cells the folded island has room for. */
+/** Compact cells the folded island has room for. */
 export const MAX_COMPACT_METRICS = 3;
 
 /** The cells picked, as far as they are ones the island knows: each once, three at most. */
 export function compactMetrics(settings: Pick<Settings, "compactMetrics">): CompactMetric[] {
   const picked = Array.isArray(settings.compactMetrics) ? settings.compactMetrics : [];
   const known = picked.filter((m): m is CompactMetric => (COMPACT_METRICS as readonly string[]).includes(m));
-  return [...new Set(known)].slice(0, MAX_COMPACT_METRICS);
-}
-
-/**
- * The machine, as Rust samples it every 2.5 s while the island is on show (the
- * `metrics` event). `cpu` is a percentage, and null until the first real sample
- * after each wake: it takes two readings to make one. `gpu` is one too — the
- * busiest graphics adapter's — and null as well on a machine that does not
- * report it. RAM is in bytes.
- */
-export interface Metrics {
-  cpu: number | null;
-  gpu: number | null;
-  ramUsed: number;
-  ramTotal: number;
-  /** Which of the two is the sample before's, kept because this one could not say (`keepKnown`). */
-  kept?: { cpu: boolean; gpu: boolean };
+  const kept = [...new Set(known)].slice(0, MAX_COMPACT_METRICS);
+  if (picked.length > 0 && kept.length === 0) return ["usage5h", "usage7d", "waiting"];
+  if (!kept.some((metric) => metric === "usage5h" || metric === "usage7d")) return kept;
+  // The usage cells are one pair: an older saved choice of just 5h (or 7d)
+  // now displays both windows without requiring the user to reset settings.
+  const paired: CompactMetric[] = [];
+  let insertedQuotaPair = false;
+  for (const metric of kept) {
+    if (metric === "usage5h" || metric === "usage7d") {
+      if (!insertedQuotaPair) paired.push("usage5h", "usage7d");
+      insertedQuotaPair = true;
+    } else {
+      paired.push(metric);
+    }
+  }
+  return paired.slice(0, MAX_COMPACT_METRICS);
 }
 
 /** One window of Claude's usage limits: how much of it is used, and when it starts again (Unix ms). */
@@ -742,44 +766,6 @@ export function nextUsageReset(usage: Usage | null, now: number): number | null 
 
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 
-/** A `metrics` payload, if it is one. */
-export function readMetrics(value: unknown): Metrics | null {
-  if (!value || typeof value !== "object") return null;
-  const { cpu, gpu, ramUsed, ramTotal } = value as Record<string, unknown>;
-  if (!finite(ramUsed) || !finite(ramTotal)) return null;
-  const percent = (v: unknown) => (finite(v) ? Math.max(0, Math.min(100, v)) : null);
-  return { cpu: percent(cpu), gpu: percent(gpu), ramUsed: Math.max(0, ramUsed), ramTotal: Math.max(0, ramTotal) };
-}
-
-/**
- * A new sample, with what the one before knew and this one cannot say yet.
- * Processor and graphics use take two readings, so the first sample after
- * every wake of the island has neither: the last numbers known stay in their
- * cells for those 2.5 s rather than going blank, and "—" is only ever shown
- * before the very first reading. The memory is always the new sample's.
- */
-export function keepKnown(before: Metrics | null, next: Metrics): Metrics {
-  if (!before) return next;
-  // Once only: a number that is still missing on the sample after is not known any more.
-  const cpu = next.cpu == null && before.cpu != null && !before.kept?.cpu;
-  const gpu = next.gpu == null && before.gpu != null && !before.kept?.gpu;
-  if (!cpu && !gpu) return next;
-  return { ...next, cpu: cpu ? before.cpu : next.cpu, gpu: gpu ? before.gpu : next.gpu, kept: { cpu, gpu } };
-}
-
-/** Memory in use as a share of what is installed, 0–100; null while nothing is known. */
-export function ramPercent(m: Metrics | null): number | null {
-  return m && m.ramTotal > 0 ? Math.min(100, (m.ramUsed / m.ramTotal) * 100) : null;
-}
-
-/** "11.2 of 16.0 GB": the figures behind the percentage, for a tooltip. Whole numbers past 100 GB. */
-export function ramWords(m: Metrics | null): string {
-  if (!m || m.ramTotal <= 0) return "";
-  const GB = 1024 ** 3;
-  const digits = m.ramTotal / GB >= 100 ? 0 : 1;
-  return `${(m.ramUsed / GB).toFixed(digits)} of ${(m.ramTotal / GB).toFixed(digits)} GB`;
-}
-
 /** How much of a usage window is gone, as it is coloured: calm under 60 %, warm to 85 %, hot past it. */
 export type UsageLevel = "calm" | "warm" | "hot";
 export const usageLevel = (percent: number): UsageLevel => (percent > 85 ? "hot" : percent >= 60 ? "warm" : "calm");
@@ -813,6 +799,7 @@ export const DEFAULT_HIDE_SHORTCUT = "Ctrl+Alt+N";
 export const DEFAULT_AGENTS_SHORTCUT = "Ctrl+Shift+L";
 
 export const DEFAULT_SETTINGS: Settings = {
+  language: "auto",
   soundEnabled: true,
   soundVolume: 0.12,
   autoCloseInterval: 15,
@@ -838,7 +825,7 @@ export const DEFAULT_SETTINGS: Settings = {
   agentsListH: null,
   agentsListFade: true,
   agentsListFadeOpacity: 50,
-  compactMetrics: ["cpu", "ram", "usage5h"],
+  compactMetrics: ["usage5h", "usage7d", "waiting"],
   theme: "system",
   reduceMotion: "system",
   botTheme: "cream",
@@ -850,6 +837,7 @@ export const DEFAULT_SETTINGS: Settings = {
   hideInFullscreen: true,
   showCursorSessions: true,
   showCodexSessions: true,
+  codexQuotaEnabled: false,
   checkUpdates: false,
 };
 
@@ -884,13 +872,23 @@ class AppState {
   changes = new Map<string, ChangedFile[]>();
 
   lastActivity = performance.now();
+  /** Last agent lifecycle hook (never quota/UI polling); starts when this page boots. */
+  lastAgentEventAt = Date.now();
 
   settings: Settings = { ...DEFAULT_SETTINGS };
+  /** Set from the authenticated build's boot payload; Dev state must not infer global setup. */
+  nookDev = false;
+  /** Set by the authenticated boot payload for the Standalone build. */
+  nookStandalone = false;
 
-  /** The machine's last sample; null until one has come. */
-  metrics: Metrics | null = null;
   /** Claude's usage limits; null while none has ever arrived. */
   usage: Usage | null = null;
+  /** Codex quota snapshot is supplied by the opt-in Dev or Standalone provider. */
+  codexQuota: CodexQuotaSnapshot | null = null;
+  /** Read-only Windows power sample, supplied by the Dev or Standalone monitor. */
+  batteryStatus: DevBatteryStatus | null = null;
+  /** A latched Dev-only battery card; it is independent of agent sessions and permission decisions. */
+  batteryAlert: { level: "low" | "critical"; percent: number } | null = null;
   /**
    * Whether usage limits are switched on in Settings (Claude Code's status
    * line relays them): null while nothing has said. Only words the reason
@@ -906,25 +904,41 @@ class AppState {
     return () => this.listeners.delete(fn);
   }
 
-  /**
-   * Told of a new sample of the machine, or of new usage — and of nothing
-   * else. Apart from `subscribe` on purpose: a number that changes every 2.5 s
-   * is written where it shows, and must not wake the island's frame loop.
-   */
+  /** Usage numbers update only where shown and do not wake the island's frame loop. */
   onGauges(fn: Listener): () => void {
     this.gaugeListeners.add(fn);
     return () => this.gaugeListeners.delete(fn);
   }
 
-  /** A sample of the machine came. */
-  setMetrics(metrics: Metrics) {
-    this.metrics = keepKnown(this.metrics, metrics);
-    for (const fn of this.gaugeListeners) fn();
-  }
-
   /** Claude's usage limits came, or — null — none is known. */
   setUsage(usage: Usage | null) {
     this.usage = usage;
+    for (const fn of this.gaugeListeners) fn();
+  }
+
+  setCodexQuota(snapshot: CodexQuotaSnapshot | null) {
+    this.codexQuota = snapshot;
+    for (const fn of this.gaugeListeners) fn();
+  }
+
+  setBatteryStatus(status: DevBatteryStatus | null) {
+    const old = this.batteryStatus;
+    if (old?.percent === status?.percent && old?.acConnected === status?.acConnected
+      && old?.charging === status?.charging && old?.batteryPresent === status?.batteryPresent) return;
+    this.batteryStatus = status;
+    this.notify();
+  }
+
+  setBatteryAlert(alert: { level: "low" | "critical"; percent: number } | null) {
+    const old = this.batteryAlert;
+    if (old?.level === alert?.level && old?.percent === alert?.percent) return;
+    this.batteryAlert = alert;
+    this.notify();
+  }
+
+  clearCodexQuota() {
+    if (!this.codexQuota) return;
+    this.codexQuota = null;
     for (const fn of this.gaugeListeners) fn();
   }
 
@@ -1063,6 +1077,7 @@ class AppState {
   }
 
   defaultView(): IslandViewName {
+    if (this.focusId === CLAUDE_ID && this.session.completionPending) return "finished";
     return this.tasks.length === 0 ? "empty" : "overview";
   }
 }

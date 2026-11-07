@@ -60,13 +60,15 @@ export function mountBot(diameter: number): Bot {
 
 export const isBotTheme = (name: string): name is BotTheme => name in BOT_THEMES;
 
-/** Every bot of this window in `name`'s colours; a name the engine does not know leaves them as they are. */
+/**
+ * Every bot of this window in `name`'s colours, the ones mounted later too
+ * (the window puts its colours on before it mounts its bots); a name the
+ * engine does not know leaves them as they are.
+ */
 export function wearBotTheme(name: string) {
   if (!isBotTheme(name)) return;
-  for (const bot of bots) {
-    bot.engine.theme = name;
-    bot.owed = SETTLE_FRAMES;
-  }
+  BotEngine.setDefaultTheme(name);
+  for (const bot of bots) bot.owed = SETTLE_FRAMES;
   wakeBots();
 }
 

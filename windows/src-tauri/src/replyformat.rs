@@ -139,8 +139,12 @@ fn lines_of(text: &str) -> Vec<Line<'_>> {
     let mut out = Vec::new();
     let mut start = 0;
     while start < text.len() {
-        let next = text[start..].find('\n').map_or(text.len(), |at| start + at + 1);
-        let words = text[start..next].trim_end_matches('\n').trim_end_matches('\r');
+        let next = text[start..]
+            .find('\n')
+            .map_or(text.len(), |at| start + at + 1);
+        let words = text[start..next]
+            .trim_end_matches('\n')
+            .trim_end_matches('\r');
         out.push(Line { start, next, words });
         start = next;
     }
@@ -158,8 +162,14 @@ struct Pair<'a> {
 /// not alone on its line. Nook then cannot tell what is its own.
 fn markers(text: &str) -> Result<Option<Pair<'_>>, String> {
     let lines = lines_of(text);
-    let starts: Vec<&Line> = lines.iter().filter(|line| line.words.trim() == START).collect();
-    let ends: Vec<&Line> = lines.iter().filter(|line| line.words.trim() == END).collect();
+    let starts: Vec<&Line> = lines
+        .iter()
+        .filter(|line| line.words.trim() == START)
+        .collect();
+    let ends: Vec<&Line> = lines
+        .iter()
+        .filter(|line| line.words.trim() == END)
+        .collect();
     let said = text.matches(START).count() + text.matches(END).count();
     if said == 0 {
         return Ok(None);
@@ -175,7 +185,10 @@ fn markers(text: &str) -> Result<Option<Pair<'_>>, String> {
     } else if ends[0].start < starts[0].start {
         "the end marker comes before the start marker"
     } else {
-        return Ok(Some(Pair { start: *starts[0], end: *ends[0] }));
+        return Ok(Some(Pair {
+            start: *starts[0],
+            end: *ends[0],
+        }));
     };
     Err(format!(
         "Nook's reply-format markers in CLAUDE.md are broken: {why}. Nook won't change the file — fix or remove the marker lines by hand ({START} … {END})."
@@ -190,7 +203,9 @@ fn lookalike(text: &str) -> Vec<String> {
     let heading = |words: &str| {
         let trimmed = words.trim();
         let title = trimmed.trim_start_matches('#');
-        title.len() < trimmed.len() && trimmed.len() - title.len() <= 6 && title.trim().eq_ignore_ascii_case(HEADING)
+        title.len() < trimmed.len()
+            && trimmed.len() - title.len() <= 6
+            && title.trim().eq_ignore_ascii_case(HEADING)
     };
     let distinctive = |words: &str| {
         let lower = words.to_lowercase();
@@ -213,7 +228,11 @@ fn lookalike(text: &str) -> Vec<String> {
     }
     found.sort_unstable();
     found.dedup();
-    found.into_iter().take(FOUND_LINES).map(|i| lines[i].words.to_string()).collect()
+    found
+        .into_iter()
+        .take(FOUND_LINES)
+        .map(|i| lines[i].words.to_string())
+        .collect()
 }
 
 /// Where the block stands in a file's bytes (None: no file).
@@ -221,12 +240,23 @@ pub fn state_of(bytes: Option<&[u8]>) -> Result<State, String> {
     let (_, text) = text_of(bytes.unwrap_or_default())?;
     match markers(text)? {
         Some(pair) => {
-            let between: Vec<&str> = lines_of(&text[pair.start.next..pair.end.start]).iter().map(|line| line.words).collect();
-            Ok(if between == BODY { State::Installed } else { State::Outdated })
+            let between: Vec<&str> = lines_of(&text[pair.start.next..pair.end.start])
+                .iter()
+                .map(|line| line.words)
+                .collect();
+            Ok(if between == BODY {
+                State::Installed
+            } else {
+                State::Outdated
+            })
         }
         None => {
             let found = lookalike(text);
-            Ok(if found.is_empty() { State::NotInstalled } else { State::Unmarked(found) })
+            Ok(if found.is_empty() {
+                State::NotInstalled
+            } else {
+                State::Unmarked(found)
+            })
         }
     }
 }
@@ -257,7 +287,12 @@ fn appended(text: &str) -> String {
 
 /// A file with what is between its markers replaced by the current text. The marker lines stay as they are.
 fn updated(text: &str, pair: &Pair) -> String {
-    format!("{}{}{}", &text[..pair.start.next], body(newline_of(text)), &text[pair.end.start..])
+    format!(
+        "{}{}{}",
+        &text[..pair.start.next],
+        body(newline_of(text)),
+        &text[pair.end.start..]
+    )
 }
 
 /// A file with the markers and what is between them gone — and the one blank
@@ -275,7 +310,10 @@ fn removed(text: &str, pair: &Pair) -> String {
     // The block ran to the end of a file whose last line had no newline: as
     // installing found it, the text before had none either.
     if after.is_empty() && !text.ends_with('\n') {
-        before = before.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(before);
+        before = before
+            .strip_suffix('\n')
+            .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
+            .unwrap_or(before);
     }
     format!("{before}{after}")
 }
@@ -296,7 +334,9 @@ pub fn changed(bytes: Option<&[u8]>, action: Action) -> Result<Vec<u8>, String> 
         (Action::Install | Action::Update, Some(pair)) => updated(text, pair),
         (Action::Remove, Some(pair)) => removed(text, pair),
         (Action::Update | Action::Remove, None) => {
-            return Err("Nook's reply format isn't in CLAUDE.md: there is nothing to change.".into());
+            return Err(
+                "Nook's reply format isn't in CLAUDE.md: there is nothing to change.".into(),
+            );
         }
     };
     let mut out = if bom { BOM.to_vec() } else { Vec::new() };
@@ -309,7 +349,11 @@ fn change(action: Action) -> impl Fn(&Path, Option<&[u8]>) -> Result<FileChange,
     move |_, bytes| {
         let next = changed(bytes, action)?;
         let shown = |bytes: &[u8]| text_of(bytes).map(|(_, text)| text.to_string());
-        Ok(FileChange { before: shown(bytes.unwrap_or_default())?, after: shown(&next)?, bytes: next })
+        Ok(FileChange {
+            before: shown(bytes.unwrap_or_default())?,
+            after: shown(&next)?,
+            bytes: next,
+        })
     }
 }
 
@@ -326,7 +370,13 @@ fn status_at(path: &Path) -> ReplyFormatStatus {
         Ok(State::Unmarked(found)) => ("unmarked", found, None),
         Err(why) => ("error", Vec::new(), Some(why)),
     };
-    ReplyFormatStatus { state, found, error, path: path.to_string_lossy().to_string(), exists }
+    ReplyFormatStatus {
+        state,
+        found,
+        error,
+        path: path.to_string_lossy().to_string(),
+        exists,
+    }
 }
 
 pub fn status() -> ReplyFormatStatus {
@@ -381,18 +431,38 @@ mod tests {
     #[test]
     fn installing_appends_after_one_blank_line_and_keeps_the_files_own_endings() {
         // LF, with a newline at the end: one blank line, the block, a newline at the end.
-        assert_eq!(install("# Mine\n\nBe brief.\n"), format!("# Mine\n\nBe brief.\n\n{LF_BLOCK}\n"));
+        assert_eq!(
+            install("# Mine\n\nBe brief.\n"),
+            format!("# Mine\n\nBe brief.\n\n{LF_BLOCK}\n")
+        );
         // LF, with none: the file still ends without one.
-        assert_eq!(install("# Mine\n\nBe brief."), format!("# Mine\n\nBe brief.\n\n{LF_BLOCK}"));
+        assert_eq!(
+            install("# Mine\n\nBe brief."),
+            format!("# Mine\n\nBe brief.\n\n{LF_BLOCK}")
+        );
         // CRLF: every line of the block ends as the file's lines do.
         let crlf_block = LF_BLOCK.replace('\n', "\r\n");
-        assert_eq!(install("# Mine\r\n\r\nBe brief.\r\n"), format!("# Mine\r\n\r\nBe brief.\r\n\r\n{crlf_block}\r\n"));
-        assert_eq!(install("# Mine\r\nBe brief."), format!("# Mine\r\nBe brief.\r\n\r\n{crlf_block}"));
-        assert!(!install("# Mine\r\nBe brief.\r\n").replace("\r\n", "").contains('\n'), "no bare LF in a CRLF file");
+        assert_eq!(
+            install("# Mine\r\n\r\nBe brief.\r\n"),
+            format!("# Mine\r\n\r\nBe brief.\r\n\r\n{crlf_block}\r\n")
+        );
+        assert_eq!(
+            install("# Mine\r\nBe brief."),
+            format!("# Mine\r\nBe brief.\r\n\r\n{crlf_block}")
+        );
+        assert!(
+            !install("# Mine\r\nBe brief.\r\n")
+                .replace("\r\n", "")
+                .contains('\n'),
+            "no bare LF in a CRLF file"
+        );
         // A single line with no newline at all: LF, as a new file gets.
         assert_eq!(install("Be brief."), format!("Be brief.\n\n{LF_BLOCK}"));
         // Trailing spaces, tabs and blank lines of the user's stay exactly where they were.
-        assert_eq!(install("Be brief.  \n\t\n\n"), format!("Be brief.  \n\t\n\n\n{LF_BLOCK}\n"));
+        assert_eq!(
+            install("Be brief.  \n\t\n\n"),
+            format!("Be brief.  \n\t\n\n\n{LF_BLOCK}\n")
+        );
     }
 
     #[test]
@@ -411,7 +481,9 @@ mod tests {
         // UTF-16, or anything that is not UTF-8: nothing is guessed.
         let utf16: Vec<u8> = vec![0xFF, 0xFE, b'#', 0, b' ', 0, 0xD8, 0xD8];
         for action in [Action::Install, Action::Update, Action::Remove] {
-            assert!(changed(Some(&utf16), action).unwrap_err().contains("won't touch"));
+            assert!(changed(Some(&utf16), action)
+                .unwrap_err()
+                .contains("won't touch"));
         }
         assert!(state_of(Some(&utf16)).is_err());
     }
@@ -442,7 +514,11 @@ mod tests {
             // With a BOM too.
             let with_bom = [BOM, original.as_bytes()].concat();
             let there = changed(Some(&with_bom), Action::Install).unwrap();
-            assert_eq!(changed(Some(&there), Action::Remove).unwrap(), with_bom, "BOM + {original:?}");
+            assert_eq!(
+                changed(Some(&there), Action::Remove).unwrap(),
+                with_bom,
+                "BOM + {original:?}"
+            );
         }
         // A file Nook created is left empty, not deleted: there is nothing of anybody's in it.
         assert_eq!(act(&install(""), Action::Remove), "");
@@ -472,13 +548,22 @@ mod tests {
         let before = "# Mine\r\n\r\nBe brief.  \r\n\r\n";
         let after = "\r\n## After\r\nKept too.";
         // An older text of Nook's, and marker lines with spaces after them: both pairs stay as they are.
-        let old = format!("{before}{START}  \r\n## Reply format\r\n- An older line.\r\n{END}\t{after}");
+        let old =
+            format!("{before}{START}  \r\n## Reply format\r\n- An older line.\r\n{END}\t{after}");
         assert_eq!(state(&old), State::Outdated);
         let new = act(&old, Action::Update);
         assert_eq!(state(&new), State::Installed);
-        assert!(new.starts_with(&format!("{before}{START}  \r\n")) && new.ends_with(&format!("{END}\t{after}")));
+        assert!(
+            new.starts_with(&format!("{before}{START}  \r\n"))
+                && new.ends_with(&format!("{END}\t{after}"))
+        );
         let between = &new[before.len() + START.len() + 4..new.len() - after.len() - END.len() - 1];
-        assert_eq!(between, BODY.iter().map(|line| format!("{line}\r\n")).collect::<String>());
+        assert_eq!(
+            between,
+            BODY.iter()
+                .map(|line| format!("{line}\r\n"))
+                .collect::<String>()
+        );
         // Install on an outdated block is the same update: never a second block.
         assert_eq!(act(&old, Action::Install), new);
         // Nothing between the markers at all is outdated too.
@@ -486,10 +571,15 @@ mod tests {
         assert_eq!(state(&hollow), State::Outdated);
         assert_eq!(act(&hollow, Action::Update), format!("x\n{LF_BLOCK}\n"));
         // And removing an outdated block removes it, whatever it holds.
-        assert_eq!(act(&old, Action::Remove), "# Mine\r\n\r\nBe brief.  \r\n## After\r\nKept too.");
+        assert_eq!(
+            act(&old, Action::Remove),
+            "# Mine\r\n\r\nBe brief.  \r\n## After\r\nKept too."
+        );
         // Nothing to update or remove where there is no block.
         for action in [Action::Update, Action::Remove] {
-            assert!(changed(Some(b"# Mine\n"), action).unwrap_err().contains("nothing to change"));
+            assert!(changed(Some(b"# Mine\n"), action)
+                .unwrap_err()
+                .contains("nothing to change"));
             assert!(changed(None, action).is_err());
         }
     }
@@ -498,18 +588,38 @@ mod tests {
     fn a_reply_format_without_markers_is_found_shown_and_not_duplicated() {
         // A section of the user's own, under any level of heading, in any case.
         let own = "# Mine\n\n### reply FORMAT\n- Lead with the answer.\n- Then the detail.\n\n## Other\nKept.\n";
-        assert_eq!(state(own), State::Unmarked(vec!["### reply FORMAT".into(), "- Lead with the answer.".into(), "- Then the detail.".into()]));
-        assert!(changed(Some(own.as_bytes()), Action::Install).unwrap_err().contains("won't add a second one"));
+        assert_eq!(
+            state(own),
+            State::Unmarked(vec![
+                "### reply FORMAT".into(),
+                "- Lead with the answer.".into(),
+                "- Then the detail.".into()
+            ])
+        );
+        assert!(changed(Some(own.as_bytes()), Action::Install)
+            .unwrap_err()
+            .contains("won't add a second one"));
         // Nook's own lines pasted by hand, with no heading and no markers.
         let pasted = "Notes.\n* Put risks and unverified things in > [!WARNING].\nMore.\n";
-        assert_eq!(state(pasted), State::Unmarked(vec!["* Put risks and unverified things in > [!WARNING].".into()]));
+        assert_eq!(
+            state(pasted),
+            State::Unmarked(vec![
+                "* Put risks and unverified things in > [!WARNING].".into()
+            ])
+        );
         assert!(changed(Some(pasted.as_bytes()), Action::Install).is_err());
         // Nothing destructive is on offer for it.
         for action in [Action::Update, Action::Remove] {
             assert!(changed(Some(own.as_bytes()), action).is_err());
         }
         // Words that only mention it are not it.
-        for plain in ["# Formatting replies\nBe brief.\n", "Use the reply format you like.\n", "## Reply formatting\n", "####### Reply format\n", "Reply format\n"] {
+        for plain in [
+            "# Formatting replies\nBe brief.\n",
+            "Use the reply format you like.\n",
+            "## Reply formatting\n",
+            "####### Reply format\n",
+            "Reply format\n",
+        ] {
             assert_eq!(state(plain), State::NotInstalled, "{plain:?}");
         }
         // A long section is shown in part.
@@ -533,13 +643,23 @@ mod tests {
         ];
         for text in &broken {
             let why = state_of(Some(text.as_bytes())).unwrap_err();
-            assert!(why.contains("markers") && why.contains("won't change"), "{text:?}: {why}");
+            assert!(
+                why.contains("markers") && why.contains("won't change"),
+                "{text:?}: {why}"
+            );
             for action in [Action::Install, Action::Update, Action::Remove] {
-                assert_eq!(changed(Some(text.as_bytes()), action).unwrap_err(), why, "{text:?}");
+                assert_eq!(
+                    changed(Some(text.as_bytes()), action).unwrap_err(),
+                    why,
+                    "{text:?}"
+                );
             }
         }
         // Indented, or with spaces after it, a marker is still alone on its line.
-        assert_eq!(state(&format!("  {START}\n{}\n{END}  \n", BODY.join("\n"))), State::Installed);
+        assert_eq!(
+            state(&format!("  {START}\n{}\n{END}  \n", BODY.join("\n"))),
+            State::Installed
+        );
     }
 
     /// A folder of its own for one test, gone when the test is.
@@ -547,7 +667,11 @@ mod tests {
     static COUNT: AtomicU32 = AtomicU32::new(0);
     impl Sandbox {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("nook-replyformat-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
+            let dir = std::env::temp_dir().join(format!(
+                "nook-replyformat-{}-{}",
+                std::process::id(),
+                COUNT.fetch_add(1, Ordering::Relaxed)
+            ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Sandbox(dir)
@@ -557,7 +681,10 @@ mod tests {
         }
         fn others(&self) -> Vec<String> {
             let mut names: Vec<String> = fs::read_dir(self.0.join(".claude"))
-                .map(|dir| dir.filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned())).collect())
+                .map(|dir| {
+                    dir.filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+                        .collect()
+                })
                 .unwrap_or_default();
             names.retain(|name| name != "CLAUDE.md");
             names
@@ -577,7 +704,11 @@ mod tests {
         assert!(!status_at(&path).exists);
 
         let plan = hooks::preview_file(&path, change(Action::Install)).unwrap();
-        assert!(plan.diff.lines().all(|line| line.starts_with('+')), "every line is new: {}", plan.diff);
+        assert!(
+            plan.diff.lines().all(|line| line.starts_with('+')),
+            "every line is new: {}",
+            plan.diff
+        );
         assert!(plan.diff.contains(START) && plan.diff.contains("[!IMPORTANT]"));
         assert!(!path.exists(), "a preview writes nothing");
 
@@ -592,7 +723,10 @@ mod tests {
         let plan = hooks::preview_file(&path, change(Action::Remove)).unwrap();
         let backup = hooks::write_file(&path, &plan.fingerprint, change(Action::Remove)).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"");
-        assert_eq!(fs::read_to_string(&backup).unwrap(), format!("{LF_BLOCK}\n"));
+        assert_eq!(
+            fs::read_to_string(&backup).unwrap(),
+            format!("{LF_BLOCK}\n")
+        );
         assert_eq!(status_at(&path).state, "notInstalled");
     }
 
@@ -602,11 +736,20 @@ mod tests {
         let path = sandbox.file();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         // The user's own file: a BOM, CRLF, trailing spaces, no newline at the end.
-        let original = [BOM, "# Mine\r\n\r\nBe brief.  \r\nNo newline at the end".as_bytes()].concat();
+        let original = [
+            BOM,
+            "# Mine\r\n\r\nBe brief.  \r\nNo newline at the end".as_bytes(),
+        ]
+        .concat();
         fs::write(&path, &original).unwrap();
 
         let plan = hooks::preview_file(&path, change(Action::Install)).unwrap();
-        assert!(plan.diff.contains("+ <!-- nook:reply-format:start -->") && !plan.diff.lines().any(|line| line.starts_with('-')), "only additions: {}", plan.diff);
+        assert!(
+            plan.diff.contains("+ <!-- nook:reply-format:start -->")
+                && !plan.diff.lines().any(|line| line.starts_with('-')),
+            "only additions: {}",
+            plan.diff
+        );
         assert!(plan.backup.contains("CLAUDE.md.bak-"), "{}", plan.backup);
         assert_eq!(fs::read(&path).unwrap(), original);
 
@@ -620,9 +763,20 @@ mod tests {
 
         // Install: the backup is the original, and the file starts with it, to the byte.
         let backup = hooks::write_file(&path, &plan.fingerprint, change(Action::Install)).unwrap();
-        let name = Path::new(&backup).file_name().unwrap().to_string_lossy().into_owned();
-        let stamp = name.strip_prefix("CLAUDE.md.bak-").expect("named after the file and the time");
-        assert!(stamp.len() == 15 && stamp.as_bytes()[8] == b'-' && stamp.bytes().filter(u8::is_ascii_digit).count() == 14, "{name}");
+        let name = Path::new(&backup)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let stamp = name
+            .strip_prefix("CLAUDE.md.bak-")
+            .expect("named after the file and the time");
+        assert!(
+            stamp.len() == 15
+                && stamp.as_bytes()[8] == b'-'
+                && stamp.bytes().filter(u8::is_ascii_digit).count() == 14,
+            "{name}"
+        );
         assert_eq!(fs::read(&backup).unwrap(), original);
         let installed = fs::read(&path).unwrap();
         assert!(installed.starts_with(&original) && !installed.ends_with(b"\n"));
@@ -633,12 +787,21 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), installed);
 
         // An outdated block is updated in place; removing then gives the original back, exactly.
-        let outdated = String::from_utf8_lossy(&installed).replace("- End with the next step.", "- An older last line.").into_bytes();
+        let outdated = String::from_utf8_lossy(&installed)
+            .replace("- End with the next step.", "- An older last line.")
+            .into_bytes();
         fs::write(&path, &outdated).unwrap();
         assert_eq!(status_at(&path).state, "outdated");
         let plan = hooks::preview_file(&path, change(Action::Update)).unwrap();
-        let changed_lines: Vec<&str> = plan.diff.lines().filter(|line| line.starts_with('+') || line.starts_with('-')).collect();
-        assert_eq!(changed_lines, ["- - An older last line.", "+ - End with the next step."]);
+        let changed_lines: Vec<&str> = plan
+            .diff
+            .lines()
+            .filter(|line| line.starts_with('+') || line.starts_with('-'))
+            .collect();
+        assert_eq!(
+            changed_lines,
+            ["- - An older last line.", "+ - End with the next step."]
+        );
         hooks::write_file(&path, &plan.fingerprint, change(Action::Update)).unwrap();
         assert_eq!(fs::read(&path).unwrap(), installed);
 
@@ -648,14 +811,29 @@ mod tests {
 
         // What cannot be changed leaves no trace: a look-alike, broken markers.
         let before = sandbox.others().len();
-        for bad in ["## Reply format\n- mine\n".to_string(), format!("{START}\nno end\n")] {
+        for bad in [
+            "## Reply format\n- mine\n".to_string(),
+            format!("{START}\nno end\n"),
+        ] {
             fs::write(&path, &bad).unwrap();
             assert!(hooks::preview_file(&path, change(Action::Install)).is_err());
-            let print = hooks::preview_file(&path, |_, bytes| Ok(FileChange { before: String::new(), after: String::new(), bytes: bytes.unwrap_or_default().to_vec() })).unwrap().fingerprint;
+            let print = hooks::preview_file(&path, |_, bytes| {
+                Ok(FileChange {
+                    before: String::new(),
+                    after: String::new(),
+                    bytes: bytes.unwrap_or_default().to_vec(),
+                })
+            })
+            .unwrap()
+            .fingerprint;
             assert!(hooks::write_file(&path, &print, change(Action::Install)).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), bad);
         }
-        assert_eq!(sandbox.others().len(), before, "a refused change takes no backup");
+        assert_eq!(
+            sandbox.others().len(),
+            before,
+            "a refused change takes no backup"
+        );
         fs::write(&path, format!("{START}\nno end\n")).unwrap();
         let broken = status_at(&path);
         assert_eq!(broken.state, "error");

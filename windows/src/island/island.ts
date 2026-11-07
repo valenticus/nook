@@ -2,19 +2,23 @@
 // Mirrors IslandRootView.swift + IslandWindowController.swift.
 
 import { Tracked, Spring, clamp, mixColor } from "../core/anim";
-import { Bridge, IS_TAURI } from "../core/bridge";
+import { Bridge, IS_TAURI, type DevBatteryStatus } from "../core/bridge";
+import { navigateToSessionTarget } from "../core/session-navigation";
+import { isShelfTraceSourceRecording, shelfTrace } from "../core/shelf-trace";
+import { currentLanguage, localizeSubtree } from "../core/i18n";
 import { wipe } from "../core/canvas";
 import {
-  type Dock, Display, EAR_COMPACT, EAR_EXPANDED, EXPANDED_CORNER, EXPANDED_W, LARGE_H, LARGE_W, NOTCH_H, NOTCH_W, OVERSHOOT_H, OVERSHOOT_W, PANEL_H, PANEL_W,
+  type Dock, Display, EAR_COMPACT, EAR_EXPANDED, EXPANDED_CORNER, EXPANDED_W, homeContentSize, LARGE_H, LARGE_W, NOTCH_H, NOTCH_W, OVERSHOOT_H, OVERSHOOT_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, Room, botGlowColor, botGlowOpacity, botPosition, islandOrigin, sideDock, viewLayout,
   islandSize, shelfWidth,
   type BotStateName, type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound, type SoundName } from "../core/sound";
+import { reduceMotionEnabled } from "../core/motion";
 import { CLAUDE_ID, State, foldedAutoHide, nextRequest, nextUsageReset, quietAt, type ClaudeSession, type SessionRequest, type SessionStep } from "../core/state";
 import { BOT_THEMES, BotEngine, hexToRGB, type BotTheme, type RGB } from "../bot/engine";
 import { Greeting } from "../bot/greeting";
-import { leaveMiniBots, miniBotManners, miniBotsLively, miniBotsNextDue, pointMiniBots, tickMiniBots } from "../bot/minibots";
+import { leaveMiniBots, miniBotManners, miniBotsLively, miniBotsNextDue, pointMiniBots, refreshMiniBotThemes, tickMiniBots } from "../bot/minibots";
 import { GulluReactions, type GulluCue } from "../bot/reactions";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
 import { enterSessionPanel, leaveSubagent } from "../views/session";
@@ -23,9 +27,11 @@ import { widgetsSettingsChanged } from "../widgets";
 import { ShelfHooks } from "../widgets/core";
 import { widgetOn, type ShelfWidgetId } from "../widgets/defs";
 import { h } from "../views/dom";
-import { isActive, overallState, roster } from "../views/roster";
+import { isActive, overallState, roster, waitingCount } from "../views/roster";
 import { buildCompact, compactPlan, type CompactStrip } from "./compact";
-import { IslandStateMachine } from "./fsm";
+
+const NOOK_DEV_BUILD = __NOOK_DEV_BUILD__;
+import { IslandStateMachine, shouldArmHomeCollapse } from "./fsm";
 import { createNotch, type NotchShape } from "./notch";
 import { PagePan, ROW_SETTLE_MS, TailGuard, canScroll, type PanEnd } from "./swipe";
 
@@ -84,9 +90,9 @@ const PINCH_COOLDOWN_MS = 600;
 /** Settings can turn reduced motion on or off; left on "system", the OS decides. */
 const reducedMotion = () => {
   const wanted = State.settings.reduceMotion;
-  if (wanted === "on") return true;
-  if (wanted === "off") return false;
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const systemReduced = typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  return reduceMotionEnabled(wanted, systemReduced);
 };
 
 /**
@@ -169,7 +175,7 @@ const SPEAKS_FOR_ALL: ReadonlySet<IslandViewName> = new Set(["overview", "empty"
 const TAB_VIEWS: ReadonlySet<IslandViewName> = new Set(["overview", "empty", "shelf"]);
 
 /** The cards: views that come up over whatever was on show, and are done with once answered or read. */
-const CARD_VIEWS: ReadonlySet<IslandViewName> = new Set(["approval", "question", "finished", "error", "confused"]);
+const CARD_VIEWS: ReadonlySet<IslandViewName> = new Set(["approval", "question", "finished", "error", "confused", "battery"]);
 
 /** The views Backspace leaves for the home view: every one but Home itself, a card that asks, and what plays by itself. */
 const BACK_HOME: ReadonlySet<IslandViewName> = new Set(["session", "shelf", "settings", "finished", "error"]);
@@ -178,7 +184,7 @@ const BACK_HOME: ReadonlySet<IslandViewName> = new Set(["session", "shelf", "set
  * The cards that only tell something: with a full-screen app in front they wait, where a request never does.
  * The Shelf, opened on a timer that ran out or a reminder that is due, is one of them.
  */
-const NOTICE_VIEWS: ReadonlySet<IslandViewName> = new Set(["finished", "error", "shelf"]);
+const NOTICE_VIEWS: ReadonlySet<IslandViewName> = new Set(["finished", "error", "shelf", "battery"]);
 
 /** A page this close to where it is going is there, for a swipe that comes now. */
 const PAGE_NEAR_PX = 16;
@@ -210,6 +216,8 @@ export class Island {
   private botCanvas!: HTMLCanvasElement;
   private botGlow!: HTMLElement;
   private greetingCanvas!: HTMLCanvasElement;
+  private greetingFirstFrameTraced = false;
+  private greetingFullyVisibleTraced = false;
   private shape!: NotchShape;
   private compact!: CompactStrip;
   private countdown!: HTMLElement;
@@ -260,6 +268,9 @@ export class Island {
   private running = false;
   private lastFrame = 0;
   private dirty = true;
+  private homeWasVisible = false;
+  private homeSyncSource = "initial";
+  private homeResizeObserver: ResizeObserver | null = null;
   private canvasPx = 0;
 
   // Rust starts the window at full size so the launch greeting has room.
@@ -271,6 +282,7 @@ export class Island {
   /** Rust has said once what the window is and which edge it is on (`setRoom`). */
   private roomKnown = false;
   private homeCollapseAt: number | null = null;
+  /** A short Dev-only fold timer for the manual two-alert relay scenario. */
 
   /**
    * Why the island has the keyboard, while it has it. Its window never
@@ -340,6 +352,7 @@ export class Island {
 
   /** The one timer of the dizzy face worn after three slaps (Playful reactions off): it ends it. */
   private dizzyRecovery: number | null = null;
+  private batteryAlertSoundTimer: number | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -360,12 +373,38 @@ export class Island {
     };
     this.seatBot();
     this.greeting.onComplete = () => this.fsm.greetComplete();
+    this.greeting.onSound = (name, played) => {
+      if (NOOK_DEV_BUILD) shelfTrace("greeting-audio", { source: name, changed: played });
+    };
+    let lastShelfHidden = JSON.stringify(State.settings.shelfHidden);
     State.subscribe(() => {
+      let sourceLabel = "state-notify";
+      if (__NOOK_DEV_BUILD__ && isShelfTraceSourceRecording()) {
+        const caller = new Error().stack?.split("\n").slice(3).find((line) => /[a-zA-Z0-9._-]+\.ts:\d+:\d+/.test(line)) ?? "";
+        const source = caller.match(/([a-zA-Z0-9._-]+\.ts):(\d+):\d+/);
+        sourceLabel = source ? `${source[1]}:${source[2]}` : "state-notify";
+        this.homeSyncSource = sourceLabel;
+        if (State.mode === "expanded" && State.view === "overview") {
+          shelfTrace("home-sync-request", { source: `${sourceLabel}:${this.dirty ? "already-dirty" : "new-render"}` });
+        }
+      }
+      const shelfHidden = JSON.stringify(State.settings.shelfHidden);
+      if (__NOOK_DEV_BUILD__ && shelfHidden !== lastShelfHidden) {
+        shelfTrace("state-dirty", { previousHidden: JSON.parse(lastShelfHidden), nextHidden: State.settings.shelfHidden });
+        lastShelfHidden = shelfHidden;
+      }
       this.dirty = true;
       this.ensureRunning();
     });
     // New usage has other reset times.
     State.onGauges(() => this.watchUsageReset());
+    window.addEventListener("pagehide", () => {
+      if (this.batteryAlertSoundTimer != null) window.clearTimeout(this.batteryAlertSoundTimer);
+      this.batteryAlertSoundTimer = null;
+      this.homeResizeObserver?.disconnect();
+      this.homeResizeObserver = null;
+    }, { once: true });
+    this.compact.startBatteryMonitor();
   }
 
   // ── DOM ─────────────────────────────────────────────────────────────────────
@@ -375,6 +414,7 @@ export class Island {
       setView: (v) => this.setView(v),
       collapse: () => this.collapse(),
       leaveCard: (fold) => {
+        if (State.focusId === CLAUDE_ID) State.session.completionPending = false;
         if (this.overShelf) this.setView("shelf");
         else if (fold) this.collapse();
         else this.setView(State.defaultView());
@@ -390,7 +430,10 @@ export class Island {
         // No card for the session in front, but one behind it is waiting: its turn.
         else if (State.waiting.length > 0) this.afterRequest(true);
       },
-      openTerminal: () => this.openClient(),
+      openTerminal: () => {
+        if (State.view === "finished" && State.focusId === CLAUDE_ID) State.session.completionPending = false;
+        this.openClient();
+      },
       // The ↗ button: where the Claude pill's session runs. Another agent's pill has nowhere to go.
       openTarget: () => {
         if (State.focusTask?.id === CLAUDE_ID) this.openClient();
@@ -399,6 +442,7 @@ export class Island {
         const req = State.pendingApproval;
         void Bridge.log(`decide ${d} req=${req?.requestId ?? "none"}`);
         if (!req) return;
+        if (NOOK_DEV_BUILD && req.denyOnly && d === "allow") return;
         Sound.play(d === "deny" ? "blip" : "approve");
         void Bridge.approvalDecision(req.requestId, d);
         this.noteOutcome(req, (step) => (step.permission = d === "deny" ? "denied" : "allowed"));
@@ -436,16 +480,21 @@ export class Island {
       reducedMotion: () => reducedMotion(),
       morph: (change, names, open) => this.morph(change, names, open),
       resized: (shrinking) => {
+        if (__NOOK_DEV_BUILD__) shelfTrace("actions-resized", { shrinking, focused: this.shelf.focused, width: this.shelf.width });
         this.syncBare();
         this.wantKeyboard("panel", this.shelf.focused != null);
-        if (reducedMotion()) this.jumpGeometry();
-        else this.animateGeometry(shrinking);
+        // A live Shelf resize follows the same geometry spring as closing the
+        // Island; reduced motion still governs the page and morph transitions.
+        this.animateGeometry(shrinking, "view-resized");
         State.notify();
       },
       setLarge: (on) => this.setLarge(on),
       showRequest: () => this.showRequest(),
       openSession: (changes) => {
         State.session.unseen = false;
+        State.session.completionPending = false;
+        // Read reply is an explicit read action; opening the changes view alone is not.
+        if (!changes) State.bringForward(State.session.id);
         // "Read reply": what Claude said, whole — a very long reply is not cut for whoever asked to read it.
         enterSessionPanel(changes ? "changes" : "journal", !changes);
         this.setView("session");
@@ -455,14 +504,15 @@ export class Island {
         this.setView("session");
       },
       pickSession: (id) => this.pickSession(id),
-      goToSession: (id) => {
-        const session = State.sessions.find((s) => s.id === id);
-        if (session) this.openClient(session);
+      goToSession: (session) => {
+        this.openClient(session);
       },
       openSessionOf: (id) => this.openSessionOf(id),
       reviewRequest: (id) => this.openSessionOf(id),
       toggleSound: () => {
+        const before = State.settings.soundEnabled;
         State.settings.soundEnabled = !State.settings.soundEnabled;
+        if (NOOK_DEV_BUILD) shelfTrace("ui-state", { source: "audio-toggle", mutationType: "sound-enabled", changed: State.settings.soundEnabled !== before });
         Sound.setEnabled(State.settings.soundEnabled);
         void Bridge.saveSettings(State.settings);
         State.notify();
@@ -474,13 +524,24 @@ export class Island {
         State.notify();
       },
       setAutoClose: (s) => {
+        const restartClose = this.homeCollapseAt != null && s !== this.fsm.homeToPetitDelay;
         State.settings.autoCloseInterval = s;
         this.fsm.homeToPetitDelay = s;
+        if (restartClose) this.homeCollapseAt = performance.now() + s * 1000;
+        this.fsm.refresh(restartClose);
         void Bridge.saveSettings(State.settings);
         State.notify();
       },
-      openSettingsWindow: () => void Bridge.openSettingsWindow(),
+      openSettingsWindow: () => {
+        if (NOOK_DEV_BUILD) shelfTrace("ui-state", { source: "settings-window-request", mutationType: "open" });
+        void Bridge.openSettingsWindow().then(() => {
+          if (NOOK_DEV_BUILD) shelfTrace("ui-state", { source: "settings-window-command-complete", mutationType: "open", changed: true });
+        });
+      },
       blip: () => Sound.play("blip"),
+      dismissBatteryAlert: () => {
+        this.compact.dismissBatteryAlert();
+      },
     };
 
     this.wakeStrip = h("div", { id: "wake-strip" });
@@ -488,11 +549,28 @@ export class Island {
     this.botCanvas = h("canvas", { id: "bot-canvas" });
     this.greetingCanvas = h("canvas", { id: "greeting-canvas" });
     this.shape = createNotch();
-    this.compact = buildCompact();
+    this.compact = buildCompact(undefined, {
+      present: () => {
+        if (waitingCount() === 0) this.alert("battery");
+      },
+      alertChanged: (alert) => {
+        const sound: SoundName = alert.level === "critical" ? "pop" : "tick";
+        const gap = alert.level === "critical" ? 90 : 120;
+        Sound.play(sound);
+        if (this.batteryAlertSoundTimer != null) window.clearTimeout(this.batteryAlertSoundTimer);
+        this.batteryAlertSoundTimer = window.setTimeout(() => {
+          this.batteryAlertSoundTimer = null;
+          Sound.play(sound);
+        }, gap);
+      },
+      cleared: () => {
+        if (State.mode === "expanded" && State.view === "battery") this.collapse();
+      },
+    });
     this.countdown = h("div", { id: "countdown" });
 
     this.header = buildHeader(actions);
-    this.views = buildViews(actions, () => this.animateGeometry(false));
+    this.views = buildViews(actions, () => this.animateGeometry(false, "view-fit"));
     this.shelf = this.views.get("shelf") as ShelfHost;
     this.viewsEl = h("div", { id: "views" });
     for (const v of this.views.values()) this.viewsEl.append(v.el);
@@ -523,6 +601,89 @@ export class Island {
     this.greetingCanvas.style.height = "150px";
 
     this.root.append(this.wakeStrip, this.islandEl);
+    if (NOOK_DEV_BUILD) {
+      const captures = new Map<number, string>();
+      const describe = (el: Element | null) => {
+        if (!el) return "none";
+        const classes = [...el.classList].slice(0, 3).map((name) => name.replace(/[^a-zA-Z0-9_-]/g, "")).filter(Boolean).join(".");
+        const id = /^[a-zA-Z0-9_-]+$/.test(el.id) ? `#${el.id}` : "";
+        return `${el.tagName.toLowerCase()}${id}${classes ? `.${classes}` : ""}`.slice(0, 100);
+      };
+      const captureName = (event: Event) => {
+        const pointerId = "pointerId" in event ? Number((event as PointerEvent).pointerId) : -1;
+        return captures.get(pointerId) ?? "none";
+      };
+      const traceHeaderControl = (action: "settings-entry" | "audio-toggle", part: "button" | "icon", element: Element | null, button: HTMLButtonElement) => {
+        if (!element) return;
+        const rect = element.getBoundingClientRect();
+        const x = rect.x + rect.width / 2;
+        const y = rect.y + rect.height / 2;
+        const centerHit = document.elementFromPoint(x, y);
+        const style = getComputedStyle(element);
+        shelfTrace("ui-control-layout", {
+          source: `${action}.${part}`,
+          domX: x,
+          domY: y,
+          actualTarget: describe(button),
+          hitTestTarget: describe(centerHit),
+          interactiveTarget: describe(button),
+          expectedTarget: action,
+          rectX: rect.x,
+          rectY: rect.y,
+          rectW: rect.width,
+          rectH: rect.height,
+          pointerEvents: style.pointerEvents,
+          visibility: `${style.display}:${style.visibility}`,
+          opacity: Number(style.opacity),
+          disabled: button.disabled,
+        });
+      };
+      this.islandEl.addEventListener("gotpointercapture", (event) => {
+        const e = event as PointerEvent;
+        captures.set(e.pointerId, describe(event.target instanceof Element ? event.target : null));
+      }, true);
+      this.islandEl.addEventListener("lostpointercapture", (event) => captures.delete((event as PointerEvent).pointerId), true);
+      const tracePointer = (kind: "pointerdown" | "click", event: Event) => {
+        const deliveredTarget = event.target instanceof Element ? event.target : null;
+        const pointX = "clientX" in event ? Number((event as MouseEvent).clientX) : 0;
+        const pointY = "clientY" in event ? Number((event as MouseEvent).clientY) : 0;
+        const pointTarget = document.elementFromPoint(pointX, pointY);
+        const control = deliveredTarget?.closest("button,a,input,select,textarea,[role=button]") ?? deliveredTarget;
+        const expected = pointTarget?.closest("[data-nook-action]") ?? control;
+        const rect = expected?.getBoundingClientRect();
+        const style = expected ? getComputedStyle(expected) : null;
+        const tag = control?.tagName.toLowerCase() ?? "none";
+        const pointer = style?.pointerEvents ?? "none";
+        const botHit = this.gullu.visible && this.gullu.hit(pointX / Display.zoom, pointY / Display.zoom);
+        shelfTrace("pointer-dom-event", { source: `${kind}.${State.mode}.${State.view}.${tag}.${pointer}` });
+        shelfTrace("pointer-dom-detail", {
+          source: kind,
+          domX: pointX,
+          domY: pointY,
+          actualTarget: describe(deliveredTarget),
+          hitTestTarget: describe(pointTarget),
+          interactiveTarget: describe(control),
+          expectedTarget: botHit ? "gullu" : expected?.getAttribute("data-nook-action") ?? describe(expected),
+          rectX: rect?.x,
+          rectY: rect?.y,
+          rectW: rect?.width,
+          rectH: rect?.height,
+          pointerEvents: pointer,
+          visibility: style ? `${style.display}:${style.visibility}` : "none",
+          opacity: style ? Number(style.opacity) : 0,
+          disabled: expected instanceof HTMLButtonElement || expected instanceof HTMLInputElement ? expected.disabled : false,
+          captureTarget: captureName(event),
+        });
+        for (const action of ["settings-entry", "audio-toggle"] as const) {
+          const button = this.islandEl.querySelector<HTMLButtonElement>(`button[data-nook-action="${action}"]`);
+          if (!button) continue;
+          traceHeaderControl(action, "button", button, button);
+          traceHeaderControl(action, "icon", button.querySelector("svg"), button);
+        }
+      };
+      this.islandEl.addEventListener("pointerdown", (event) => tracePointer("pointerdown", event), true);
+      this.islandEl.addEventListener("click", (event) => tracePointer("click", event), true);
+    }
     this.applyGeometry();
   }
 
@@ -534,7 +695,15 @@ export class Island {
     this.fsm.greetAutoCollapseDelay = 0.1;
     this.fsm.petitToHiddenDelay = foldedAutoHide(State.settings);
     this.fsm.holds = () => State.settings.hideOnlyWhenIdle && this.active;
+    this.fsm.holdsHomeCollapse = () => this.typingPin || this.summoned || this.keyboard.size > 0;
     this.fsm.onTransition = (from, to) => {
+      if (to === "greeting") {
+        this.greetingFirstFrameTraced = false;
+        this.greetingFullyVisibleTraced = false;
+      }
+      if (from === "greeting" && to !== "greeting" && NOOK_DEV_BUILD) {
+        shelfTrace("greeting-interrupted", { source: to });
+      }
       switch (to) {
         case "hidden": {
           // Why, in the log (Settings → About → Open log folder): the next time
@@ -575,11 +744,18 @@ export class Island {
 
   launch() {
     // Motion reduced: no greeting — the island simply appears folded.
-    if (reducedMotion()) {
+    const choice = State.settings.reduceMotion;
+    const systemReduced = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const skipGreeting = reduceMotionEnabled(choice, systemReduced);
+    const source = choice === "system" ? (systemReduced ? "system-reduced" : "system-full") : `setting-${choice}`;
+    if (skipGreeting) {
       this.fsm.forcePetit();
+      if (NOOK_DEV_BUILD) shelfTrace("startup-greeting-skipped", { source });
       return;
     }
     this.fsm.launch();
+    if (NOOK_DEV_BUILD) shelfTrace("startup-greeting-started", { source });
   }
 
   // ── Mode / view ─────────────────────────────────────────────────────────────
@@ -589,7 +765,11 @@ export class Island {
     if (mode === prev) return;
     this.abortPaging();
     State.mode = mode;
-    if (mode === "expanded") Sound.play("open");
+    if (prev === "expanded") this.homeCollapseAt = null;
+    if (mode === "expanded") {
+      const played = Sound.play("open");
+      if (NOOK_DEV_BUILD && State.view === "greeting") shelfTrace("greeting-audio", { source: "open", changed: played });
+    }
     if (prev === "expanded") {
       Sound.play("close");
       State.isPinned = false;
@@ -609,13 +789,11 @@ export class Island {
     // quiet, and not the bot's own either.
     this.watchQuiet();
     this.seatBot();
-    this.animateGeometry(modeOrder(mode) < modeOrder(prev));
-    // Back from hidden: what the island holds — the folded slots, the state the
-    // bot wears — is drawn now, with the mode, and not left to the first frame
-    // after it. A hidden island draws nothing, so nothing of it is assumed to
-    // be up to date.
+    this.animateGeometry(modeOrder(mode) < modeOrder(prev), "mode-change");
+    // Back from hidden, the transition's State.notify schedules the first frame.
+    // Drawing here as well would sync the same final state twice: once now and
+    // once again in that frame. The frame updates the DOM before painting.
     if (prev === "hidden") {
-      this.syncDom();
       this.logWake();
     }
     State.notify();
@@ -643,6 +821,17 @@ export class Island {
   }
 
   expand(view: IslandViewName) {
+    if (__NOOK_DEV_BUILD__ && isShelfTraceSourceRecording() && view === "overview" && (State.mode !== "expanded" || State.view !== "overview")) {
+      shelfTrace("home-open", { locale: currentLanguage(), source: "Island.expand" });
+      shelfTrace("locale-before-home-open", { locale: currentLanguage(), languagePreference: State.settings.language, source: "Island.expand" });
+      const home = this.views.get("overview")?.el.querySelector(".home");
+      shelfTrace("home-dom-present", {
+        source: home ? "reused" : "missing",
+        changed: !!home?.isConnected,
+        count: home?.childElementCount ?? 0,
+      });
+      shelfTrace("home-dom-attached", { source: home?.isConnected ? "attached" : "detached", changed: !!home?.isConnected });
+    }
     const wasLarge = State.large;
     // A request (or anything else that is shown) in the middle of a swipe: the swipe is dropped, the view is shown.
     this.abortPaging();
@@ -651,9 +840,14 @@ export class Island {
     this.leaveSessions(view);
     if (view !== "session") this.leavePanel();
     if (State.mode !== "expanded") this.setMode("expanded");
-    else this.animateGeometry(wasLarge && !State.large);
+    else this.animateGeometry(wasLarge && !State.large, "expand-view");
     State.lastActivity = performance.now();
     this.homeCollapseAt = null;
+    const beginAutoClose = NOOK_DEV_BUILD
+      ? shouldArmHomeCollapse(this.fsm.state, this.wasInIsland)
+      : !this.wasInIsland;
+    // Keep the production behavior unchanged; Dev greeting uses its own FSM end.
+    if (beginAutoClose) this.beginHomeAutoClose();
     State.notify();
   }
 
@@ -663,7 +857,7 @@ export class Island {
       this.fsm.forceHome();
       this.views.get(view)?.arm?.();
       this.show(view);
-      this.animateGeometry(false);
+      this.animateGeometry(false, "view-while-folded");
       State.notify();
       return;
     }
@@ -692,7 +886,7 @@ export class Island {
     State.lastActivity = performance.now();
     // From one tab to the other with motion reduced: the island is at its new height at once.
     if (tabbed && reducedMotion()) this.jumpGeometry();
-    else this.animateGeometry(!grew);
+    else this.animateGeometry(!grew, "view-change");
     State.notify();
   }
 
@@ -951,10 +1145,23 @@ export class Island {
     if (on === this.typingPin) return;
     this.typingPin = on;
     const holds = State.pendingApproval != null || State.pendingQuestion != null || this.summoned;
-    if (holds) return;
+    if (holds) {
+      if (!on && !this.wasInIsland && State.mode === "expanded") this.beginHomeAutoClose();
+      return;
+    }
     State.isPinned = on;
     this.fsm.pinned = on;
-    if (!on && !this.wasInIsland && State.mode === "expanded") this.fsm.mouseLeft();
+    if (!on && !this.wasInIsland && State.mode === "expanded") this.beginHomeAutoClose();
+  }
+
+  /** Start the FSM's shared idle timer when the pointer and keyboard have let the panel go. */
+  private beginHomeAutoClose() {
+    if (State.mode !== "expanded" || this.wasInIsland || this.fsm.holdsHomeCollapse()) {
+      this.homeCollapseAt = null;
+      return;
+    }
+    this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
+    this.fsm.mouseLeft();
   }
 
   /**
@@ -1026,7 +1233,7 @@ export class Island {
 
   /** How far the page travels between the tabs, px: the Shelf's width, so that it follows the fingers 1:1. */
   private pageW(): number {
-    return shelfWidth();
+    return this.shelf.width ?? shelfWidth(this.shelf.visibleCards);
   }
 
   /** Both tabs on the stage, side by side, at `pos`: what the page follows the fingers with. */
@@ -1058,12 +1265,14 @@ export class Island {
     this.pan.cancel();
     if (this.panTimer != null) window.clearTimeout(this.panTimer);
     this.panTimer = null;
+    if (NOOK_DEV_BUILD) shelfTrace("page-transition-start", { source: `${State.view === "shelf" ? "shelf" : "home"}-to-${target === 1 ? "shelf" : "home"}` });
     this.beginPaging(this.pagePos());
     this.settleTo(target, 0);
   }
 
   private settleTo(target: 0 | 1, velocity: number) {
     this.pageTarget = target;
+    if (NOOK_DEV_BUILD) this.header.sync(target === 1 ? "shelf" : State.defaultView());
     this.pageSpring.configure(0.5, 0.72);
     this.pageSpring.value = this.pos;
     this.pageSpring.velocity = velocity;
@@ -1119,12 +1328,13 @@ export class Island {
   /** The page has come to rest on `page`: that tab is the view, the stage is cleared, and Rust is told the shape. */
   private commitPaging(page: 0 | 1) {
     const view = page === 1 ? "shelf" : State.defaultView();
+    if (NOOK_DEV_BUILD) shelfTrace("page-transition-commit", { source: view === "shelf" ? "shelf" : "home" });
     this.endStage();
     if (view !== State.view) {
       this.views.get(view)?.arm?.();
       this.show(view);
     }
-    this.animateGeometry(false);
+    this.animateGeometry(false, "page-commit");
     // The shape may be as it was (a snap back) or taller or shorter: Rust decides click-through again either way.
     this.forceRect = true;
     State.lastActivity = performance.now();
@@ -1177,7 +1387,7 @@ export class Island {
     this.wantKeyboard("panel", large);
     // With motion reduced, the panel is at its new size at once.
     if (reducedMotion()) this.jumpGeometry();
-    else this.animateGeometry(!large);
+    else this.animateGeometry(!large, "large-toggle");
     if (!large) this.releaseSummon();
     State.notify();
   }
@@ -1306,7 +1516,7 @@ export class Island {
     const waits = State.pendingApproval != null || State.pendingQuestion != null;
     State.isPinned = waits;
     this.fsm.pinned = waits;
-    if (!waits && !this.wasInIsland) this.fsm.mouseLeft();
+    if (!this.wasInIsland && State.mode === "expanded") this.beginHomeAutoClose();
   }
 
   /** A view that is about no session comes on show: what Tab held from one session to the next is let go. */
@@ -1330,6 +1540,11 @@ export class Island {
     else this.keyboard.delete(why);
     const has = this.keyboard.size > 0;
     if (has !== had) void Bridge.focusWindow(has);
+    if (!had && has && State.mode === "expanded") {
+      this.homeCollapseAt = null;
+      this.fsm.mouseEntered();
+    }
+    if (had && !has && State.mode === "expanded" && !this.wasInIsland) this.beginHomeAutoClose();
   }
 
   /** The island folds, or the user went to another window: whatever wanted the keyboard, it is given back. */
@@ -1338,6 +1553,7 @@ export class Island {
     this.keyboard.clear();
     // Told even when nothing was held: it only makes sure the window does not activate.
     if (had || State.mode !== "expanded") void Bridge.focusWindow(false);
+    if (State.mode === "expanded" && !this.wasInIsland) this.beginHomeAutoClose();
   }
 
   /** From the session panel, back to the card of the request its session is waiting on. */
@@ -1379,6 +1595,7 @@ export class Island {
     State.present();
     // With no request left, back to where the user was: the Shelf, when the card came up over it.
     if (show) this.setView(next ? (next.question ? "question" : "approval") : this.restView());
+    if (State.mode === "expanded" && !this.wasInIsland) this.beginHomeAutoClose();
   }
 
   /**
@@ -1469,7 +1686,7 @@ export class Island {
     // Once the window is in front the user is there, not here: the island
     // folds at once. With no window to go to, it stays, so that nothing
     // having happened can be seen.
-    void Bridge.focusSession(session.id).then((went) => {
+    void navigateToSessionTarget(session, (id) => Bridge.focusSession(id)).then((went) => {
       if (went) this.stepAside();
       else this.nowhere();
     });
@@ -1530,12 +1747,14 @@ export class Island {
   }
 
   /**
-   * Alert from the hook server: open on this view. Pinned alerts never auto-close.
+   * Alert from the hook server: show this view immediately; pending requests
+   * remain answerable after their card visually folds.
    * A request — a permission, a question — always shows, whatever is in front:
    * it must be answerable. A card that only tells something (a turn's end, an
    * error) does not bring a hidden island up over a full-screen app.
    */
   alert(view: IslandViewName) {
+    if ((view === "approval" || view === "question") && State.mode === "expanded" && State.view === "battery") this.compact.deferBatteryAlert();
     const open = () => {
       this.fsm.pinned = State.isPinned;
       this.fsm.forceHome();
@@ -1543,6 +1762,11 @@ export class Island {
     };
     if (State.mode === "hidden" && NOTICE_VIEWS.has(view)) this.wake(open);
     else open();
+  }
+
+  /** Routes a validated synthetic battery sample to the Dev monitor, never to agent session state. */
+  simulateBattery(action: string, sample: DevBatteryStatus | null) {
+    if (__NOOK_DEV_BUILD__) this.compact.simulateBattery(action, sample);
   }
 
   /** A work event: the hidden island shows folded — unless a full-screen app is in front. */
@@ -1599,7 +1823,7 @@ export class Island {
     const proposal = State.pendingApproval?.proposal != null;
     const fitted = this.views?.get(view)?.height ?? null;
     const fittedW = this.views?.get(view)?.width ?? null;
-    return islandSize("expanded", view, proposal, fitted, State.large, this.compactSize, fittedW);
+    return islandSize("expanded", view, proposal, fitted, State.large, this.compactSize, fittedW, this.shelf.visibleCards);
   }
 
   private targetSize(): { w: number; h: number; r: number; ear: number } {
@@ -1613,7 +1837,7 @@ export class Island {
       const plan = compactPlan();
       this.compactSize = { w: plan.width, h: plan.height };
     }
-    const { w, h } = islandSize(State.mode, State.view, proposal, fitted, State.large, this.compactSize, fittedW);
+    const { w, h } = islandSize(State.mode, State.view, proposal, fitted, State.large, this.compactSize, fittedW, this.shelf.visibleCards);
     const expanded = State.mode === "expanded";
     const r = expanded ? EXPANDED_CORNER : ROUNDED_CORNER;
     // Retracted, there is no island to flare into the edge.
@@ -1621,9 +1845,22 @@ export class Island {
     return { w, h, r, ear };
   }
 
-  private animateGeometry(shrinking: boolean) {
+  private animateGeometry(shrinking: boolean, source = "unspecified") {
     const { w, h, r, ear } = this.targetSize();
-    if (shrinking) {
+    const motion = shrinking ? "curve" : "spring";
+    let changed = true;
+    if (__NOOK_DEV_BUILD__) {
+      changed = [
+        this.width.retarget(w, motion),
+        this.height.retarget(h, motion),
+        this.radius.retarget(r, motion),
+        this.ear.retarget(ear, motion),
+      ].some(Boolean);
+      if (!changed) {
+        shelfTrace("geometry-request-skipped", { source, width: w, height: h, springState: shrinking ? "close-curve" : "spring" });
+        return;
+      }
+    } else if (shrinking) {
       this.width.curveTowards(w);
       this.height.curveTowards(h);
       this.radius.curveTowards(r);
@@ -1633,6 +1870,10 @@ export class Island {
       this.height.springTo(h);
       this.radius.springTo(r);
       this.ear.springTo(ear);
+    }
+    if (__NOOK_DEV_BUILD__) {
+      shelfTrace("target-size", { mode: State.mode, view: State.view, shelfCards: this.shelf.visibleCards, width: w, height: h, source });
+      shelfTrace("animate-geometry", { source, shrinking, widthFrom: this.width.value, widthTo: w, heightFrom: this.height.value, heightTo: h });
     }
     this.ensureRunning();
   }
@@ -1767,10 +2008,14 @@ export class Island {
     // The edge the island hangs from: the stylesheet puts it, its wake strip and the tabs' layout there.
     Room.dock = dock;
     document.documentElement.dataset.dock = dock;
+    const homeFrame = homeContentSize(dock);
+    const homeView = this.views.get("overview")?.el;
+    homeView?.style.setProperty("--home-frame-width", `${homeFrame.width}px`);
+    homeView?.style.setProperty("--home-frame-height", `${homeFrame.height}px`);
     // Whatever was pushed was placed in the window as it was.
     this.pushedRect = { x: -1, y: -1, w: -1, h: -1 };
     if (moved) this.redock();
-    else if (State.large) this.animateGeometry(false);
+    else if (State.large) this.animateGeometry(false, "room-change");
     this.dirty = true;
     this.ensureRunning();
   }
@@ -2066,6 +2311,12 @@ export class Island {
       x >= rect.x - HIT_MARGIN && x <= rect.x + rect.w + HIT_MARGIN &&
       y >= rect.y - HIT_MARGIN && y <= rect.y + rect.h + HIT_MARGIN;
 
+    if (NOOK_DEV_BUILD && this.wasInIsland !== inIsland) {
+      shelfTrace("pointer-region", { source: `${inIsland ? "enter" : "leave"}.${State.mode}.${State.view}` });
+    }
+
+    this.compact.setHovered(!gone && inIsland);
+
     if (inIsland && !this.wasInIsland) {
       if (this.fsm.state === "greeting") this.greeting.hover();
       // Hidden, the pointer at the top edge is a wake like the strip's: asked of Rust first.
@@ -2074,10 +2325,9 @@ export class Island {
       this.homeCollapseAt = null;
     }
     if (!inIsland && this.wasInIsland) {
-      this.fsm.mouseLeft();
-      if (this.fsm.state === "home" && !State.isPinned) {
-        this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
-      }
+      this.wasInIsland = false;
+      if (this.fsm.state === "home") this.beginHomeAutoClose();
+      else this.fsm.mouseLeft();
     }
     this.wasInIsland = inIsland;
 
@@ -2177,7 +2427,11 @@ export class Island {
 
     // The page first: its geometry (and, once settled, the shape to report) is this frame's.
     this.stepPaging(dt);
+    const widthWasAnimating = this.width.animating;
     this.width.step(dt, nowMs);
+    if (widthWasAnimating && !this.width.animating) {
+      if (__NOOK_DEV_BUILD__) shelfTrace("width-settled", { width: this.width.value, view: State.view, shelfCards: this.shelf.visibleCards });
+    }
     this.height.step(dt, nowMs);
     this.radius.step(dt, nowMs);
     this.ear.step(dt, nowMs);
@@ -2197,6 +2451,25 @@ export class Island {
     const greetingActive = State.mode === "expanded" && State.view === "greeting";
     if (greetingActive) {
       const gctx = this.greetingCanvas.getContext("2d");
+      const rect = this.greetingCanvas.getBoundingClientRect();
+      const clip = this.clipEl.getBoundingClientRect();
+      const visibleWidth = Math.max(0, Math.min(rect.right, clip.right) - Math.max(rect.left, clip.left));
+      const visibleHeight = Math.max(0, Math.min(rect.bottom, clip.bottom) - Math.max(rect.top, clip.top));
+      const style = getComputedStyle(this.greetingCanvas);
+      const visible = !!gctx && this.greetingCanvas.isConnected && style.display !== "none" && style.visibility !== "hidden"
+        && Number(style.opacity) > 0 && visibleWidth > 0 && visibleHeight > 0;
+      if (!this.greetingFirstFrameTraced) {
+        this.greetingFirstFrameTraced = true;
+        if (NOOK_DEV_BUILD) {
+          const source = !gctx ? "context-unavailable" : visible ? "canvas-partial-or-visible" : style.display === "none" ? "canvas-hidden" : "canvas-clipped";
+          shelfTrace("greeting-first-frame", { source, changed: visible, widthTo: visibleWidth, height: visibleHeight });
+        }
+      }
+      const fullyVisible = visible && rect.left >= clip.left && rect.right <= clip.right && rect.top >= clip.top && rect.bottom <= clip.bottom;
+      if (fullyVisible && !this.greetingFullyVisibleTraced) {
+        this.greetingFullyVisibleTraced = true;
+        if (NOOK_DEV_BUILD) shelfTrace("greeting-canvas-revealed", { source: "full-canvas", changed: true, widthTo: rect.width, height: rect.height });
+      }
       if (gctx) {
         const dpr = Math.min(2, window.devicePixelRatio || 1);
         gctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -2322,7 +2595,7 @@ export class Island {
     this.engine.draw(ctx, w, hCss);
   }
 
-  /** The colour the bot's shell should be: its pill's colour. */
+  /** The colour the bot's shell should be: its pill's colour. (Whether it is worn is the engine's call: a theme chosen in Settings wins.) */
   private targetBodyColor(): RGB | null {
     const focus = State.focusTask;
     return focus?.isIntegration ? hexToRGB(focus.color) : null;
@@ -2353,7 +2626,7 @@ export class Island {
   }
 
   private updateCountdown(nowMs: number) {
-    if (State.mode !== "expanded" || State.isPinned || this.homeCollapseAt == null) {
+    if (State.mode !== "expanded" || this.homeCollapseAt == null) {
       put(this.countdown, "width", "0px");
       return;
     }
@@ -2367,10 +2640,35 @@ export class Island {
   // ── DOM sync ────────────────────────────────────────────────────────────────
 
   private syncDom() {
+    if (__NOOK_DEV_BUILD__) shelfTrace("sync-dom", { mode: State.mode, view: State.view, dirty: this.dirty });
     const expanded = State.mode === "expanded";
     const greetingActive = expanded && State.view === "greeting";
+    const homeVisible = expanded && State.view === "overview";
+    const firstHomeFrame = homeVisible && !this.homeWasVisible;
+    const revealContent = expanded && !greetingActive && this.contentEl.style.opacity !== "1";
+    const traceHome = __NOOK_DEV_BUILD__ && isShelfTraceSourceRecording();
 
-    this.contentEl.style.opacity = expanded && !greetingActive ? "1" : "0";
+    if (homeVisible && traceHome && !this.homeResizeObserver && typeof ResizeObserver !== "undefined") {
+      this.homeResizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const box = entry.contentRect;
+          shelfTrace("home-resize", { source: "ResizeObserver", width: Math.round(box.width * 100) / 100, height: Math.round(box.height * 100) / 100 });
+        }
+      });
+      const home = this.views.get("overview")?.el.querySelector(".home");
+      if (home) this.homeResizeObserver.observe(home);
+    } else if ((!homeVisible || !traceHome) && this.homeResizeObserver) {
+      this.homeResizeObserver.disconnect();
+      this.homeResizeObserver = null;
+    }
+
+    if (traceHome && homeVisible) {
+      shelfTrace("home-sync-start", { locale: currentLanguage(), source: this.homeSyncSource, changed: firstHomeFrame });
+      shelfTrace("locale-before-home-sync", { locale: currentLanguage(), languagePreference: State.settings.language, source: this.homeSyncSource });
+    } else if (traceHome && this.homeWasVisible) {
+      shelfTrace("home-close", { locale: currentLanguage(), source: "Island.syncDom" });
+    }
+
     // Folded or hidden, the views are out of sight but still in the page: what
     // moves in them on its own stops (see #content.away), and picks up when the
     // island unfolds.
@@ -2378,12 +2676,44 @@ export class Island {
     this.contentEl.style.pointerEvents = expanded && !greetingActive ? "auto" : "none";
     this.greetingCanvas.style.display = greetingActive ? "block" : "none";
 
-    this.header.sync();
+    this.header.sync(NOOK_DEV_BUILD && this.paging && this.springing
+      ? (this.pageTarget === 1 ? "shelf" : State.defaultView())
+      : State.view);
     for (const [name, view] of this.views) {
       const on = name === State.view;
       view.el.classList.toggle("on", on);
       if (on) view.sync();
     }
+    // Home's state renderer and any remaining exact-string localization run
+    // before the content becomes visible. The MutationObserver stays a safety
+    // net for future nodes, never the first visible translation pass.
+    if (homeVisible && (revealContent || firstHomeFrame)) {
+      const visibleView = this.views.get(State.view);
+      if (visibleView) localizeSubtree(visibleView.el);
+    }
+    this.contentEl.style.opacity = expanded && !greetingActive ? "1" : "0";
+    if (traceHome && homeVisible) {
+      shelfTrace("home-dom-visible", {
+        source: "Island.syncDom",
+        changed: this.contentEl.style.opacity === "1" && !!this.views.get("overview")?.el.classList.contains("on"),
+      });
+    }
+    if (traceHome && homeVisible) {
+      shelfTrace("home-sync-end", { locale: currentLanguage(), source: this.homeSyncSource, changed: firstHomeFrame });
+      if (!this.homeWasVisible) {
+        requestAnimationFrame(() => {
+          if (State.mode === "expanded" && State.view === "overview") {
+            const home = this.views.get("overview")?.el.querySelector(".home");
+            const bounds = home?.getBoundingClientRect();
+            if (bounds) {
+              shelfTrace("home-first-raf", { locale: currentLanguage(), source: "after-open-frame", width: bounds.width, height: bounds.height });
+              shelfTrace("locale-first-frame", { locale: currentLanguage(), languagePreference: State.settings.language, source: "Island.requestAnimationFrame" });
+            }
+          }
+        });
+      }
+    }
+    this.homeWasVisible = homeVisible;
     // The Shelf ticks, and its camera may run, only while it is what is on show.
     this.syncBare();
     this.shelf.visible(expanded && !greetingActive && State.view === "shelf");
@@ -2396,10 +2726,10 @@ export class Island {
     const was = this.compactSize;
     if (State.mode === "compact" && (Math.abs(plan.width - was.w) > 0.5 || Math.abs(plan.height - was.h) > 0.5)) {
       // One of the two is the folded island's own (width in the row, height in the column); the other stays.
-      this.animateGeometry(plan.width + plan.height < was.w + was.h);
+      this.animateGeometry(plan.width + plan.height < was.w + was.h, "compact-plan-change");
     }
 
-    this.overall = overallState(plan.live);
+    this.overall = plan.idle && State.mode === "compact" ? "idle" : overallState(plan.live);
     // What may hold the folded island on show: looked at again whenever the sessions' state changes.
     this.active = plan.live.some(isActive);
     this.fsm.refresh();
@@ -2420,7 +2750,12 @@ export class Island {
    */
   private watchUsageReset() {
     const now = Date.now();
-    const due = State.mode === "hidden" ? 0 : (nextUsageReset(State.usage, now) ?? 0);
+    const codexResets = [State.codexQuota?.quotas?.fiveHour?.resetsAt, State.codexQuota?.quotas?.sevenDay?.resetsAt]
+      .filter((at): at is number => at != null && at > now);
+    const nextCodexReset = codexResets.length ? Math.min(...codexResets) : null;
+    const due = State.mode === "hidden" ? 0 : ([nextUsageReset(State.usage, now), nextCodexReset]
+      .filter((at): at is number => at != null)
+      .sort((a, b) => a - b)[0] ?? 0);
     if (due === this.resetDue) return;
     if (this.resetTimer != null) window.clearTimeout(this.resetTimer);
     this.resetTimer = null;
@@ -2430,6 +2765,7 @@ export class Island {
       this.resetTimer = null;
       this.resetDue = 0;
       State.setUsage(State.usage);
+      if (State.settings.codexQuotaEnabled) State.setCodexQuota(State.codexQuota);
     }, Math.min(due - now + 250, 2_000_000_000));
   }
 
@@ -2485,18 +2821,22 @@ export class Island {
   applySettings() {
     Sound.setEnabled(State.settings.soundEnabled);
     Sound.setVolume(State.settings.soundVolume);
+    const restartAutoClose = this.homeCollapseAt != null && State.settings.autoCloseInterval !== this.fsm.homeToPetitDelay;
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
+    if (restartAutoClose) this.homeCollapseAt = performance.now() + State.settings.autoCloseInterval * 1000;
     // Settings → Island → Visibility: applied to an island already folded, from now.
     const hideAfter = foldedAutoHide(State.settings);
     const restart = hideAfter !== this.fsm.petitToHiddenDelay;
     this.fsm.petitToHiddenDelay = hideAfter;
-    this.fsm.refresh(restart);
+    this.fsm.refresh(restart || restartAutoClose);
     this.yieldToFullscreen();
     // The plush chosen in Settings, on the island's bot and on every mini made after.
     const theme = State.settings.botTheme;
-    if (theme in BOT_THEMES) {
-      BotEngine.defaultTheme = theme as BotTheme;
-      this.engine.theme = theme as BotTheme;
+    this.engine.tintYieldsToTheme = true;
+    if (theme in BOT_THEMES && BotEngine.setDefaultTheme(theme as BotTheme)) {
+      // The island's bot follows the default by itself; it, and every mini already made, are drawn once more in the new plush.
+      this.botStale = true;
+      refreshMiniBotThemes();
     }
     // Settings → Appearance: whether the bot plays with the mouse, and how much it may move.
     const playful = State.settings.playfulReactions !== false;

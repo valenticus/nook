@@ -12,6 +12,42 @@
 // it is not available.
 
 use serde::Serialize;
+use std::fmt::Display;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlaybackStatus {
+    Closed,
+    Opened,
+    Changing,
+    Stopped,
+    Playing,
+    Paused,
+    Unknown,
+}
+
+pub(super) fn is_displayable_session(status: PlaybackStatus) -> bool {
+    matches!(status, PlaybackStatus::Playing | PlaybackStatus::Paused)
+}
+
+pub(super) fn preferred_playing_session<T>(
+    sessions: impl IntoIterator<Item = (T, PlaybackStatus)>,
+) -> Option<T> {
+    sessions
+        .into_iter()
+        .find_map(|(session, status)| (status == PlaybackStatus::Playing).then_some(session))
+}
+
+pub(super) fn state_from_read_result<E: Display>(
+    result: Result<Option<MediaState>, E>,
+) -> MediaState {
+    match result {
+        Ok(Some(state)) => state,
+        Ok(None) => MediaState::none(),
+        Err(err) => {
+            MediaState::unavailable(format!("Windows would not say what is playing ({err})."))
+        }
+    }
+}
 
 /// What is playing, as the page draws it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -39,11 +75,18 @@ pub struct MediaState {
 impl MediaState {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn none() -> Self {
-        MediaState { kind: "none", ..Default::default() }
+        MediaState {
+            kind: "none",
+            ..Default::default()
+        }
     }
 
     pub fn unavailable(reason: impl Into<String>) -> Self {
-        MediaState { kind: "unavailable", reason: Some(reason.into()), ..Default::default() }
+        MediaState {
+            kind: "unavailable",
+            reason: Some(reason.into()),
+            ..Default::default()
+        }
     }
 }
 
@@ -115,7 +158,10 @@ pub fn app_name(id: &str) -> String {
         Some((_, app)) => app.rsplit('.').next().unwrap_or(app),
         None => id,
     };
-    let named = named.strip_suffix(".exe").or_else(|| named.strip_suffix(".EXE")).unwrap_or(named);
+    let named = named
+        .strip_suffix(".exe")
+        .or_else(|| named.strip_suffix(".EXE"))
+        .unwrap_or(named);
     let mut chars = named.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -127,13 +173,24 @@ pub fn app_name(id: &str) -> String {
 /// since it said so while it plays, and held between the timeline's start and end (when it has one).
 /// Times are the system's own: 100 ns steps.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn position_ms(position: i64, start: i64, end: i64, said_at: i64, now: i64, playing: bool) -> (u64, u64) {
+pub fn position_ms(
+    position: i64,
+    start: i64,
+    end: i64,
+    said_at: i64,
+    now: i64,
+    playing: bool,
+) -> (u64, u64) {
     let duration = (end - start).max(0);
     let mut at = position - start;
     if playing && now > said_at {
         at += now - said_at;
     }
-    let at = if duration > 0 { at.clamp(0, duration) } else { at.max(0) };
+    let at = if duration > 0 {
+        at.clamp(0, duration)
+    } else {
+        at.max(0)
+    };
     ((at / 10_000) as u64, (duration / 10_000) as u64)
 }
 
@@ -159,11 +216,21 @@ pub fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -180,11 +247,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_player_wins_over_paused_and_stopped_sessions() {
+        let sessions = vec![
+            ("paused", PlaybackStatus::Paused),
+            ("stopped", PlaybackStatus::Stopped),
+            ("playing", PlaybackStatus::Playing),
+        ];
+        assert_eq!(preferred_playing_session(sessions), Some("playing"));
+    }
+
+    #[test]
+    fn switching_active_players_selects_the_new_playing_session() {
+        let first_poll = vec![
+            ("VLC", PlaybackStatus::Playing),
+            ("Browser", PlaybackStatus::Paused),
+        ];
+        let second_poll = vec![
+            ("VLC", PlaybackStatus::Paused),
+            ("Browser", PlaybackStatus::Playing),
+        ];
+        assert_eq!(preferred_playing_session(first_poll), Some("VLC"));
+        assert_eq!(preferred_playing_session(second_poll), Some("Browser"));
+    }
+
+    #[test]
+    fn paused_current_session_is_valid_but_completed_sessions_are_not() {
+        assert!(is_displayable_session(PlaybackStatus::Playing));
+        assert!(is_displayable_session(PlaybackStatus::Paused));
+        assert!(!is_displayable_session(PlaybackStatus::Stopped));
+        assert!(!is_displayable_session(PlaybackStatus::Closed));
+        assert!(!is_displayable_session(PlaybackStatus::Opened));
+        assert!(!is_displayable_session(PlaybackStatus::Changing));
+        assert!(!is_displayable_session(PlaybackStatus::Unknown));
+    }
+
+    #[test]
+    fn no_eligible_sessions_means_nothing_playing() {
+        let sessions = vec![
+            ("VLC", PlaybackStatus::Stopped),
+            ("Browser", PlaybackStatus::Closed),
+        ];
+        assert_eq!(preferred_playing_session(sessions), None);
+        assert_eq!(state_from_read_result::<&str>(Ok(None)).kind, "none");
+    }
+
+    #[test]
+    fn metadata_absence_remains_a_session_with_empty_metadata_for_ui_fallbacks() {
+        let state = MediaState {
+            kind: "session",
+            ..MediaState::default()
+        };
+        assert_eq!(
+            (
+                state.title.as_str(),
+                state.artist.as_str(),
+                state.album.as_str()
+            ),
+            ("", "", "")
+        );
+    }
+
+    #[test]
+    fn winrt_read_errors_remain_distinct_from_no_session() {
+        let unavailable = state_from_read_result::<&str>(Err("test WinRT failure"));
+        assert_eq!(unavailable.kind, "unavailable");
+        assert!(unavailable.reason.unwrap().contains("test WinRT failure"));
+        assert_eq!(state_from_read_result::<&str>(Ok(None)).kind, "none");
+    }
+
+    #[test]
     fn players_are_named_in_plain_words() {
         assert_eq!(app_name("Spotify.exe"), "Spotify");
         assert_eq!(app_name("chrome.exe"), "Chrome");
         assert_eq!(app_name("msedge.exe"), "Msedge");
-        assert_eq!(app_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), "ZuneMusic");
+        assert_eq!(
+            app_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"),
+            "ZuneMusic"
+        );
         assert_eq!(app_name("  "), "");
         assert_eq!(app_name("vlc"), "Vlc");
     }
@@ -192,21 +331,36 @@ mod tests {
     #[test]
     fn the_position_moves_on_while_it_plays_and_stays_inside_the_track() {
         let s = 10_000_000; // one second in the system's 100 ns steps
-        // Said 10 s in, 3 s ago, playing: 13 s of a 200 s track.
-        assert_eq!(position_ms(10 * s, 0, 200 * s, 100 * s, 103 * s, true), (13_000, 200_000));
+                            // Said 10 s in, 3 s ago, playing: 13 s of a 200 s track.
+        assert_eq!(
+            position_ms(10 * s, 0, 200 * s, 100 * s, 103 * s, true),
+            (13_000, 200_000)
+        );
         // Paused: it does not move.
-        assert_eq!(position_ms(10 * s, 0, 200 * s, 100 * s, 103 * s, false), (10_000, 200_000));
+        assert_eq!(
+            position_ms(10 * s, 0, 200 * s, 100 * s, 103 * s, false),
+            (10_000, 200_000)
+        );
         // Past the end (the player was slow to say): held at the end.
-        assert_eq!(position_ms(199 * s, 0, 200 * s, 0, 50 * s, true), (200_000, 200_000));
+        assert_eq!(
+            position_ms(199 * s, 0, 200 * s, 0, 50 * s, true),
+            (200_000, 200_000)
+        );
         // A timeline that starts later is measured from its start.
-        assert_eq!(position_ms(30 * s, 20 * s, 120 * s, 0, 0, false), (10_000, 100_000));
+        assert_eq!(
+            position_ms(30 * s, 20 * s, 120 * s, 0, 0, false),
+            (10_000, 100_000)
+        );
         // No end: no length, the position is what was said.
         assert_eq!(position_ms(5 * s, 0, 0, 0, 0, false), (5_000, 0));
     }
 
     #[test]
     fn a_picture_is_known_by_its_first_bytes() {
-        assert_eq!(image_type(&[0x89, b'P', b'N', b'G', 1, 2]), Some("image/png"));
+        assert_eq!(
+            image_type(&[0x89, b'P', b'N', b'G', 1, 2]),
+            Some("image/png")
+        );
         assert_eq!(image_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(image_type(b"GIF89a"), Some("image/gif"));
         assert_eq!(image_type(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
@@ -224,13 +378,19 @@ mod tests {
         assert_eq!(base64(b"foob"), "Zm9vYg==");
         assert_eq!(base64(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        assert_eq!(data_url(&[0xFF, 0xD8, 0xFF]).unwrap(), "data:image/jpeg;base64,/9j/");
+        assert_eq!(
+            data_url(&[0xFF, 0xD8, 0xFF]).unwrap(),
+            "data:image/jpeg;base64,/9j/"
+        );
     }
 
     #[test]
     fn nothing_playing_and_not_available_are_two_things() {
         assert_eq!(MediaState::none().kind, "none");
         let gone = MediaState::unavailable("no");
-        assert_eq!((gone.kind, gone.reason.as_deref()), ("unavailable", Some("no")));
+        assert_eq!(
+            (gone.kind, gone.reason.as_deref()),
+            ("unavailable", Some("no"))
+        );
     }
 }

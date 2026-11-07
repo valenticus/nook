@@ -5,9 +5,13 @@
 // centre of the main display (or at another edge: dock.rs) inside a borderless,
 // transparent, always-on-top window that never takes focus.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+#[cfg(feature = "nook-dev")]
+use std::time::Instant;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, WebviewWindow};
@@ -108,19 +112,18 @@ impl Gate {
     }
 }
 
-/// Wakes / parks the cursor poll thread — and the metrics one (metrics.rs) — so
-/// a hidden island costs literally nothing.
+/// Wakes / parks the cursor poll thread so a hidden island costs literally nothing.
 pub struct PollGate {
     active: Mutex<Gate>,
     cv: Condvar,
-    /// How many times the gate has opened: what was measured before a park is
-    /// told from what is measured after it.
+    /// Number of gate openings, used to verify wake behavior in tests.
+    #[cfg(test)]
     wakes: AtomicU64,
     pub collapsed: AtomicBool,
     pub rect: Mutex<IslandRect>,
     /// The full window's size, as last worked out for the display.
     pub panel: Mutex<PanelSize>,
-    /// Mirrors the window flag so we only call into the OS when it changes.
+    /// Last requested window flag; Dev separately reads back the applied Win32 style.
     ignoring: AtomicBool,
 }
 
@@ -129,21 +132,21 @@ impl PollGate {
         Self {
             active: Mutex::new(Gate::default()),
             cv: Condvar::new(),
+            #[cfg(test)]
             wakes: AtomicU64::new(0),
             collapsed: AtomicBool::new(true),
             rect: Mutex::new(IslandRect::default()),
-            panel: Mutex::new(PanelSize { width: PANEL_MIN_W, height: PANEL_MIN_H, dock: Dock::Top }),
+            panel: Mutex::new(PanelSize {
+                width: PANEL_MIN_W,
+                height: PANEL_MIN_H,
+                dock: Dock::Top,
+            }),
             ignoring: AtomicBool::new(false),
         }
     }
 
     pub fn set_rect(&self, rect: IslandRect) {
         *self.rect.lock().unwrap() = rect;
-    }
-
-    /// Forces the next poll tick to re-apply the flag (after a window resize).
-    pub fn forget_ignore_state(&self) {
-        self.ignoring.store(false, Ordering::Relaxed);
     }
 
     /// The island's own wish: on show (true) or folded away (false).
@@ -159,8 +162,10 @@ impl PollGate {
 
     fn update(&self, change: impl FnOnce(&mut Gate)) {
         let mut guard = self.active.lock().unwrap();
+        #[cfg(test)]
         let was = guard.open();
         change(&mut guard);
+        #[cfg(test)]
         if guard.open() && !was {
             self.wakes.fetch_add(1, Ordering::Relaxed);
         }
@@ -177,13 +182,18 @@ impl PollGate {
     /// Sleeps for `period`, or until the gate closes, whichever comes first:
     /// a thread with a slow tick is parked the moment the island hides, not a
     /// tick later. True when the gate is still open.
+    #[cfg(test)]
     pub(crate) fn wait_while_active(&self, period: Duration) -> bool {
         let guard = self.active.lock().unwrap();
-        let (guard, _) = self.cv.wait_timeout_while(guard, period, |gate| gate.open()).unwrap();
+        let (guard, _) = self
+            .cv
+            .wait_timeout_while(guard, period, |gate| gate.open())
+            .unwrap();
         guard.open()
     }
 
     /// Changes every time the gate opens again after having been closed.
+    #[cfg(test)]
     pub(crate) fn wakes(&self) -> u64 {
         self.wakes.load(Ordering::Relaxed)
     }
@@ -191,6 +201,44 @@ impl PollGate {
     fn is_active(&self) -> bool {
         self.active.lock().unwrap().open()
     }
+
+    /// Production retains the existing reset path; Dev commits only successful
+    /// native transitions so a rejected call can be retried by the poll loop.
+    #[cfg(not(feature = "nook-dev"))]
+    pub fn forget_ignore_state(&self) {
+        self.ignoring.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Track the last requested mode. The Dev poll compares this request with the
+/// Win32 style because Tauri's setter only confirms that its update was queued.
+#[cfg(any(feature = "nook-dev", test))]
+fn set_ignore_if_changed<E>(
+    gate: &PollGate,
+    on_island: bool,
+    applied_ignore: Option<bool>,
+    set: impl FnOnce(bool) -> Result<(), E>,
+) -> Result<bool, E> {
+    let ignore = !on_island;
+    if applied_ignore == Some(ignore) {
+        gate.ignoring.store(ignore, Ordering::Relaxed);
+        return Ok(false);
+    }
+    set(ignore)?;
+    gate.ignoring.store(ignore, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Poll again when the sampled native cursor mode disagrees with the hit-test
+/// result, even if neither the cursor nor the animated rect moved.
+#[cfg(any(feature = "nook-dev", test))]
+fn pointer_state_needs_update(
+    moved: bool,
+    rect_changed: bool,
+    applied_ignore: Option<bool>,
+    on_island: bool,
+) -> bool {
+    moved || rect_changed || applied_ignore != Some(!on_island)
 }
 
 pub fn window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -213,7 +261,9 @@ pub fn set_shown(app: &AppHandle, shown: bool) {
 
 fn put_shown(app: &AppHandle, shown: bool) {
     let Some(win) = window(app) else { return };
-    let Some(shared) = app.try_state::<crate::Shared>() else { return };
+    let Some(shared) = app.try_state::<crate::Shared>() else {
+        return;
+    };
     if !shown {
         shared.gate.set_hidden(true);
         let _ = win.hide();
@@ -224,7 +274,12 @@ fn put_shown(app: &AppHandle, shown: bool) {
         (settings.screen.clone(), settings.dock())
     };
     // Placed again from the display as it is now: it may have changed while hidden.
-    apply_geometry(app, &pref, dock, shared.gate.collapsed.load(Ordering::Relaxed));
+    apply_geometry(
+        app,
+        &pref,
+        dock,
+        shared.gate.collapsed.load(Ordering::Relaxed),
+    );
     platform::show_inactive(&win);
     refresh_click_through(app, &shared.gate);
     shared.gate.set_hidden(false);
@@ -272,26 +327,49 @@ pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
                 scale,
             }
         }
-        None => ScreenInfo { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0, scale: 1.0 },
+        None => ScreenInfo {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            scale: 1.0,
+        },
     }
 }
 
 fn rect_of(position: &PhysicalPosition<i32>, size: &PhysicalSize<u32>) -> Rect {
-    Rect { x: position.x, y: position.y, w: size.width, h: size.height }
+    Rect {
+        x: position.x,
+        y: position.y,
+        w: size.width,
+        h: size.height,
+    }
 }
 
 /// Places and sizes the window. `collapsed` picks the wake strip instead of the
 /// panel. The arithmetic is dock.rs; this asks the display and applies the answer.
 pub fn apply_geometry(app: &AppHandle, pref: &str, dock: Dock, collapsed: bool) {
     let Some(win) = window(app) else { return };
-    let Some(m) = target_monitor(app, pref) else { return };
+    let Some(m) = target_monitor(app, pref) else {
+        return;
+    };
 
     let scale = m.scale_factor();
     let monitor = rect_of(m.position(), m.size());
     let work = m.work_area();
-    let place = dock::place(dock, monitor, rect_of(&work.position, &work.size), scale, collapsed);
+    let place = dock::place(
+        dock,
+        monitor,
+        rect_of(&work.position, &work.size),
+        scale,
+        collapsed,
+    );
 
-    let panel = PanelSize { width: place.panel.0, height: place.panel.1, dock };
+    let panel = PanelSize {
+        width: place.panel.0,
+        height: place.panel.1,
+        dock,
+    };
     if let Some(shared) = app.try_state::<crate::Shared>() {
         let mut known = shared.gate.panel.lock().unwrap();
         if *known != panel {
@@ -383,14 +461,27 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
         // Without a cursor to read (Linux) the loop only watches the display
         // layout, and twice a second is plenty for that: waking at 60 Hz just to
         // find no cursor costs CPU for nothing.
-        let (period, screen_every) = if platform::CURSOR_POLL { (24, 20) } else { (500, 1) };
+        let (period, screen_every) = if platform::CURSOR_POLL {
+            (24, 20)
+        } else {
+            (500, 1)
+        };
         loop {
             gate.wait_until_active();
             let mut last = (f64::MIN, f64::MIN);
-            let mut last_rect = IslandRect { x: f64::MIN, ..IslandRect::default() };
+            let mut last_rect = IslandRect {
+                x: f64::MIN,
+                ..IslandRect::default()
+            };
             let mut ticks: u32 = 0;
             // Said again after every wake: what was in front may have changed while nothing looked.
             let mut last_full: Option<bool> = None;
+            #[cfg(feature = "nook-dev")]
+            let mut last_native_request: Option<(bool, Instant)> = None;
+            #[cfg(feature = "nook-dev")]
+            let mut last_native_observation: Option<(bool, Option<bool>)> = None;
+            #[cfg(feature = "nook-dev")]
+            let mut last_native_hit_miss: Option<(f64, f64, Instant)> = None;
             // One look between two windows (a click elsewhere) must not hide the island.
             let mut steady = crate::fullscreen::Steady::default();
             while gate.is_active() {
@@ -425,7 +516,14 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                         if last_full != Some(full) {
                             // Logged when it changes only: why the island got out of the way, or came back.
                             if full || last_full.is_some() {
-                                crate::log::line(format!("full-screen {}: {said}", if full { "in front, island hides" } else { "gone" }));
+                                crate::log::line(format!(
+                                    "full-screen {}: {said}",
+                                    if full {
+                                        "in front, island hides"
+                                    } else {
+                                        "gone"
+                                    }
+                                ));
                             }
                             last_full = Some(full);
                             let _ = app.emit_to(WINDOW_LABEL, "fullscreen", full);
@@ -437,9 +535,13 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 }
 
                 let Some(win) = window(&app) else { continue };
-                let Ok(origin) = win.outer_position() else { continue };
+                let Ok(origin) = win.outer_position() else {
+                    continue;
+                };
                 let scale = win.scale_factor().unwrap_or(1.0);
-                let Some((cx, cy)) = cursor_physical() else { continue };
+                let Some((cx, cy)) = cursor_physical() else {
+                    continue;
+                };
                 let x = (cx - origin.x as f64) / scale;
                 let y = (cy - origin.y as f64) / scale;
                 let moved = (x - last.0).abs() >= 1.0 || (y - last.1).abs() >= 1.0;
@@ -448,7 +550,59 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 // far larger than the island: the flag is decided again whenever
                 // either of the two has changed, not only when the cursor has.
                 let r = *gate.rect.lock().unwrap();
-                if !moved && r == last_rect {
+                let on_island = r.near(x, y);
+                let rect_changed = r != last_rect;
+                #[cfg(feature = "nook-dev")]
+                let applied_ignore = platform::ignore_cursor_events_applied(&win);
+                #[cfg(feature = "nook-dev")]
+                let requested_ignore = !on_island;
+                #[cfg(feature = "nook-dev")]
+                {
+                    let inside_rect = x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+                    let native_hit = platform::point_hits_island(&win, cx, cy);
+                    if inside_rect && native_hit == Some(false) {
+                        let report = last_native_hit_miss.is_none_or(|(px, py, at)| {
+                            (cx - px).abs() >= 8.0
+                                || (cy - py).abs() >= 8.0
+                                || at.elapsed() >= Duration::from_millis(250)
+                        });
+                        if report {
+                            let snapshot = platform::pointer_gate_snapshot(&win, cx, cy);
+                            crate::log::line(format!(
+                                "dev native hit-test mismatch: cursor_physical=({cx},{cy}) cursor_logical=({x:.1},{y:.1}) rect_logical=({:.1},{:.1},{:.1},{:.1}) scale={scale:.3} window_origin_physical=({}, {}) requested_ignore={requested_ignore} native_ignore_applied={:?} point_hits_island={:?} foreground={} {}",
+                                r.x, r.y, r.w, r.h, origin.x, origin.y, snapshot.ignore_applied, snapshot.point_hits_island, snapshot.foreground, snapshot.native_windows
+                            ));
+                            last_native_hit_miss = Some((cx, cy, Instant::now()));
+                        }
+                    } else {
+                        last_native_hit_miss = None;
+                    }
+                }
+                #[cfg(feature = "nook-dev")]
+                let retry_due = applied_ignore != Some(requested_ignore)
+                    && last_native_request.is_none_or(|(previous, at)| {
+                        previous != requested_ignore || at.elapsed() >= Duration::from_millis(250)
+                    });
+                #[cfg(feature = "nook-dev")]
+                if last_native_observation != Some((requested_ignore, applied_ignore)) {
+                    let request_age_ms = last_native_request
+                        .filter(|(requested, _)| *requested == requested_ignore)
+                        .map(|(_, at)| at.elapsed().as_millis());
+                    let snapshot = platform::pointer_gate_snapshot(&win, cx, cy);
+                    crate::log::line(format!(
+                        "dev pointer gate sample: cursor_physical=({cx},{cy}) cursor_logical=({x:.1},{y:.1}) rect_logical=({:.1},{:.1},{:.1},{:.1}) scale={scale:.3} window_origin_physical=({}, {}) inside_with_margin={on_island} requested_ignore={requested_ignore} native_ignore_applied={:?} request_age_ms={request_age_ms:?} point_hits_island={:?} foreground={} {}",
+                        r.x, r.y, r.w, r.h, origin.x, origin.y, snapshot.ignore_applied, snapshot.point_hits_island, snapshot.foreground, snapshot.native_windows
+                    ));
+                    last_native_observation = Some((requested_ignore, applied_ignore));
+                }
+                #[cfg(feature = "nook-dev")]
+                if !pointer_state_needs_update(moved, rect_changed, applied_ignore, on_island)
+                    || (!moved && !rect_changed && !retry_due)
+                {
+                    continue;
+                }
+                #[cfg(not(feature = "nook-dev"))]
+                if !moved && !rect_changed {
                     continue;
                 }
                 last_rect = r;
@@ -456,11 +610,40 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 // Click-through: the window only takes the mouse over the island
                 // shape. A small entry margin means the flag is already off by the
                 // time a moving cursor reaches a button.
-                let on_island = r.near(x, y);
-
+                #[cfg(feature = "nook-dev")]
+                {
+                    let must_request = retry_due;
+                    if must_request {
+                        let result =
+                            set_ignore_if_changed(&gate, on_island, applied_ignore, |ignore| {
+                                win.set_ignore_cursor_events(ignore)
+                            });
+                        match result {
+                            Ok(true) => {
+                                last_native_request = Some((requested_ignore, Instant::now()));
+                                let snapshot = platform::pointer_gate_snapshot(&win, cx, cy);
+                                crate::log::line(format!(
+                                    "dev pointer gate request: cursor_physical=({cx},{cy}) cursor_logical=({x:.1},{y:.1}) rect_logical=({:.1},{:.1},{:.1},{:.1}) scale={scale:.3} window_origin_physical=({}, {}) inside_with_margin={on_island} requested_ignore={requested_ignore} api=queued native_ignore_applied={:?} point_hits_island={:?} foreground={} {}",
+                                    r.x, r.y, r.w, r.h, origin.x, origin.y, snapshot.ignore_applied, snapshot.point_hits_island, snapshot.foreground, snapshot.native_windows
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                last_native_request = Some((requested_ignore, Instant::now()));
+                                let snapshot = platform::pointer_gate_snapshot(&win, cx, cy);
+                                crate::log::line(format!(
+                                    "dev pointer gate request error: {error}; retry=bounded-250ms cursor_physical=({cx},{cy}) cursor_logical=({x:.1},{y:.1}) rect_logical=({:.1},{:.1},{:.1},{:.1}) scale={scale:.3} window_origin_physical=({}, {}) inside_with_margin={on_island} requested_ignore={requested_ignore} native_ignore_applied={:?} point_hits_island={:?} foreground={} {}",
+                                    r.x, r.y, r.w, r.h, origin.x, origin.y, snapshot.ignore_applied, snapshot.point_hits_island, snapshot.foreground, snapshot.native_windows
+                                ));
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "nook-dev"))]
                 if gate.ignoring.load(Ordering::Relaxed) == on_island {
-                    gate.ignoring.store(!on_island, Ordering::Relaxed);
-                    let _ = win.set_ignore_cursor_events(!on_island);
+                    let ignore = !on_island;
+                    gate.ignoring.store(ignore, Ordering::Relaxed);
+                    let _ = win.set_ignore_cursor_events(ignore);
                 }
 
                 // The page is only told of a cursor that moved: a shape that
@@ -481,9 +664,20 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
             // input region does, and it is set by refresh_click_through.
             if platform::CURSOR_POLL {
                 if let Some(win) = window(&app) {
-                    let _ = win.set_ignore_cursor_events(false);
+                    #[cfg(feature = "nook-dev")]
+                    if let Err(error) = win.set_ignore_cursor_events(false) {
+                        crate::log::line(format!(
+                            "dev pointer gate reset error; transition will retry: {error}"
+                        ));
+                    } else {
+                        gate.ignoring.store(false, Ordering::Relaxed);
+                    }
+                    #[cfg(not(feature = "nook-dev"))]
+                    {
+                        let _ = win.set_ignore_cursor_events(false);
+                        gate.forget_ignore_state();
+                    }
                 }
-                gate.forget_ignore_state();
             }
         }
     });
@@ -496,8 +690,13 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
 /// the island itself, or to the whole wake strip while collapsed.
 pub fn refresh_click_through(app: &AppHandle, gate: &PollGate) {
     if platform::CURSOR_POLL {
-        set_ignore_cursor(app, false);
-        gate.forget_ignore_state();
+        #[cfg(feature = "nook-dev")]
+        set_ignore_cursor(app, gate, false);
+        #[cfg(not(feature = "nook-dev"))]
+        {
+            set_ignore_cursor(app, false);
+            gate.forget_ignore_state();
+        }
         return;
     }
     let Some(win) = window(app) else { return };
@@ -506,7 +705,11 @@ pub fn refresh_click_through(app: &AppHandle, gate: &PollGate) {
         // fails to shrink to the strip, the rest of it must not swallow clicks
         // meant for whatever sits under the edge of the screen. The strip is
         // the window, so it starts at its corner, whichever edge it is on.
-        let (w, h) = if gate.panel.lock().unwrap().dock.vertical() { (STRIP_H, STRIP_W) } else { (STRIP_W, STRIP_H) };
+        let (w, h) = if gate.panel.lock().unwrap().dock.vertical() {
+            (STRIP_H, STRIP_W)
+        } else {
+            (STRIP_W, STRIP_H)
+        };
         Some((0.0, 0.0, w, h))
     } else {
         let r = *gate.rect.lock().unwrap();
@@ -524,6 +727,23 @@ pub fn refresh_click_through(app: &AppHandle, gate: &PollGate) {
     platform::set_input_region(&win, region);
 }
 
+#[cfg(feature = "nook-dev")]
+fn set_ignore_cursor(app: &AppHandle, gate: &PollGate, ignore: bool) {
+    if let Some(win) = window(app) {
+        if let Err(error) = win.set_ignore_cursor_events(ignore) {
+            #[cfg(feature = "nook-dev")]
+            crate::log::line(format!(
+                "dev pointer gate reset error; transition will retry: {error}"
+            ));
+            #[cfg(not(feature = "nook-dev"))]
+            let _ = error;
+        } else {
+            gate.ignoring.store(ignore, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(not(feature = "nook-dev"))]
 pub fn set_ignore_cursor(app: &AppHandle, ignore: bool) {
     if let Some(win) = window(app) {
         let _ = win.set_ignore_cursor_events(ignore);
@@ -550,7 +770,10 @@ mod tests {
             // The same size: only moved.
             assert_eq!(size_before_move(dock, panel, panel), None);
             // Wider but shorter: shrunk in height only, moved, then widened.
-            assert_eq!(size_before_move(dock, (600, 600), (700, 500)), Some((600, 500)));
+            assert_eq!(
+                size_before_move(dock, (600, 600), (700, 500)),
+                Some((600, 500))
+            );
         }
         assert_eq!(size_before_move(Dock::Top, strip, panel), Some(panel));
         assert_eq!(size_before_move(Dock::Top, panel, strip), Some(strip));
@@ -586,17 +809,162 @@ mod tests {
     /// Nothing pushed yet, nothing takes the pointer.
     #[test]
     fn a_retracted_island_is_still_found_at_its_edge() {
-        let top = IslandRect { x: 476.0, y: 0.0, w: 184.0, h: 0.0 };
+        let top = IslandRect {
+            x: 476.0,
+            y: 0.0,
+            w: 184.0,
+            h: 0.0,
+        };
         assert!(top.near(568.0, 3.0));
         assert!(!top.near(568.0, 40.0));
-        let left = IslandRect { x: 0.0, y: 308.0, w: 0.0, h: 38.0 };
+        let left = IslandRect {
+            x: 0.0,
+            y: 308.0,
+            w: 0.0,
+            h: 38.0,
+        };
         assert!(left.drawn());
         assert!(left.near(2.0, 327.0));
         assert!(!left.near(40.0, 327.0));
         assert!(!left.near(2.0, 200.0));
-        let right = IslandRect { x: 1136.0, y: 308.0, w: 0.0, h: 38.0 };
+        let right = IslandRect {
+            x: 1136.0,
+            y: 308.0,
+            w: 0.0,
+            h: 38.0,
+        };
         assert!(right.near(1134.0, 320.0));
         assert!(!IslandRect::default().near(0.0, 0.0));
+    }
+
+    #[test]
+    fn compact_and_expanded_hit_regions_follow_the_pushed_island_rect() {
+        let gate = PollGate::new();
+        let compact = IslandRect {
+            x: 476.0,
+            y: 0.0,
+            w: 184.0,
+            h: 38.0,
+        };
+        gate.set_rect(compact);
+        let current = *gate.rect.lock().unwrap();
+        assert!(current.near(568.0, 18.0), "compact body is interactive");
+        assert!(
+            current.near(670.0, 40.0),
+            "the configured entry margin is retained"
+        );
+        assert!(
+            !current.near(700.0, 40.0),
+            "the rest of the transparent window stays click-through"
+        );
+
+        let expanded = IslandRect {
+            x: 32.0,
+            y: 0.0,
+            w: 1072.0,
+            h: 640.0,
+        };
+        gate.set_rect(expanded);
+        let current = *gate.rect.lock().unwrap();
+        assert!(
+            current.near(48.0, 24.0),
+            "expanded header region is interactive"
+        );
+        assert!(
+            current.near(1088.0, 620.0),
+            "expanded panel body is interactive"
+        );
+        assert!(
+            !current.near(1130.0, 620.0),
+            "outside the expanded panel and margin remains click-through"
+        );
+    }
+
+    #[test]
+    fn failed_native_cursor_gate_change_is_retried_on_the_next_poll() {
+        let gate = PollGate::new();
+        let mut calls = 0;
+        let failed = set_ignore_if_changed(&gate, false, None, |ignore| {
+            calls += 1;
+            assert!(ignore);
+            Err("simulated native error")
+        });
+        assert_eq!(failed, Err("simulated native error"));
+        assert!(
+            !gate.ignoring.load(Ordering::Relaxed),
+            "failed change is not cached"
+        );
+        assert!(
+            pointer_state_needs_update(false, false, None, false),
+            "an unchanged cursor/rect still retries while the OS mode is stale"
+        );
+
+        let retried = set_ignore_if_changed(&gate, false, None, |ignore| {
+            calls += 1;
+            assert!(ignore);
+            Ok::<(), &str>(())
+        });
+        assert_eq!(retried, Ok(true));
+        assert!(gate.ignoring.load(Ordering::Relaxed));
+        assert_eq!(calls, 2);
+        assert!(
+            !pointer_state_needs_update(false, false, Some(true), false),
+            "once native mode matches, an unchanged poll is skipped"
+        );
+
+        let unchanged = set_ignore_if_changed(&gate, false, Some(true), |_| Ok::<(), &str>(()));
+        assert_eq!(
+            unchanged,
+            Ok(false),
+            "unchanged pointer regions do not reissue the native call"
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn cursor_samples_from_the_reported_logs_are_inside_the_bounded_margin() {
+        let greeting_resize = IslandRect {
+            x: 51.0,
+            y: 0.0,
+            w: 618.0,
+            h: 143.0,
+        };
+        let expanded = IslandRect {
+            x: 40.0,
+            y: 0.0,
+            w: 640.0,
+            h: 248.0,
+        };
+        assert!(greeting_resize.near(42.0, 56.0));
+        assert!(!greeting_resize.near(36.0, 56.0));
+        assert!(expanded.near(473.0, 261.0));
+        assert!(!expanded.near(473.0, 263.0));
+    }
+
+    #[test]
+    fn a_queued_native_change_is_retried_until_readback_matches() {
+        let gate = PollGate::new();
+        let mut calls = 0;
+        assert!(pointer_state_needs_update(false, false, Some(false), false));
+        assert_eq!(
+            set_ignore_if_changed(&gate, false, Some(false), |_| {
+                calls += 1;
+                Ok::<(), &str>(())
+            }),
+            Ok(true)
+        );
+        // Queue success changes the requested cache, not the sampled Windows style.
+        assert!(gate.ignoring.load(Ordering::Relaxed));
+        assert!(pointer_state_needs_update(false, false, Some(false), false));
+        assert_eq!(
+            set_ignore_if_changed(&gate, false, Some(false), |_| {
+                calls += 1;
+                Ok::<(), &str>(())
+            }),
+            Ok(true)
+        );
+        assert_eq!(calls, 2);
+        assert!(!pointer_state_needs_update(false, false, Some(true), false));
     }
 
     /// The island coming back from hidden is the gate opening again: what
@@ -622,13 +990,19 @@ mod tests {
             let gate = gate.clone();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                (gate.wait_while_active(Duration::from_secs(30)), started.elapsed())
+                (
+                    gate.wait_while_active(Duration::from_secs(30)),
+                    started.elapsed(),
+                )
             })
         };
         std::thread::sleep(Duration::from_millis(30));
         gate.set_active(false);
         let (still_open, waited) = waiter.join().unwrap();
-        assert!(!still_open && waited < Duration::from_secs(10), "parked after {waited:?}");
+        assert!(
+            !still_open && waited < Duration::from_secs(10),
+            "parked after {waited:?}"
+        );
 
         // Shown again: a thread parked on the gate goes on, and sees another wake.
         let parked = {

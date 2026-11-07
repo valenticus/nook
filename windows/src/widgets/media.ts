@@ -15,6 +15,7 @@ import { clear, h, svg } from "../views/dom";
 import { ICONS } from "../views/icons";
 import { ShelfBackend } from "./backend";
 import { notifyShelf } from "./core";
+import { shelfTrace } from "../core/shelf-trace";
 import { frame, mark, mini, setIcon, shared, type Widget, type WidgetContext } from "./ui";
 
 const PLAY = "M7 4.5v15l12-7.5z";
@@ -97,7 +98,9 @@ async function press(action: "previous" | "toggle" | "next", expanded: boolean) 
     media.at = Date.now();
     notifyShelf();
   }
-  await ShelfBackend.media.control(action);
+  if (__NOOK_DEV_BUILD__) shelfTrace("ui-state", { source: `media-${action}-request`, mutationType: "media-control" });
+  const applied = await ShelfBackend.media.control(action);
+  if (__NOOK_DEV_BUILD__) shelfTrace("ui-state", { source: `media-${action}-result`, mutationType: "media-control", changed: applied });
   await refresh(expanded);
 }
 
@@ -120,9 +123,9 @@ export function buildMedia(ctx: WidgetContext): Widget {
   let expandedOn: () => boolean = () => false;
 
   const controls = (playSize: number, skipSize: number) => {
-    const prev = shared(h("button", { class: "media-skip", title: "Previous", "aria-label": "Previous track", onclick: () => void press("previous", expandedOn()) }, svg(PREVIOUS, skipSize)), "media-prev");
-    const play = shared(h("button", { class: "media-play", title: "Play / pause", "aria-label": "Play or pause", onclick: () => void press("toggle", expandedOn()) }), "media-play");
-    const next = shared(h("button", { class: "media-skip", title: "Next", "aria-label": "Next track", onclick: () => void press("next", expandedOn()) }, svg(NEXT, skipSize)), "media-next");
+    const prev = shared(h("button", { class: "media-skip", title: "Previous", "aria-label": "Previous track", "data-nook-action": "media-previous", onclick: () => void press("previous", expandedOn()) }, svg(PREVIOUS, skipSize)), "media-prev");
+    const play = shared(h("button", { class: "media-play", title: "Play / pause", "aria-label": "Play or pause", "data-nook-action": "media-toggle", onclick: () => void press("toggle", expandedOn()) }), "media-play");
+    const next = shared(h("button", { class: "media-skip", title: "Next", "aria-label": "Next track", "data-nook-action": "media-next", onclick: () => void press("next", expandedOn()) }, svg(NEXT, skipSize)), "media-next");
     return { row: h("div", { class: "media-ctl" }, prev, play, next), play, prev, next, playSize };
   };
 
@@ -143,8 +146,11 @@ export function buildMedia(ctx: WidgetContext): Widget {
   const bar = h("div", { class: "media-bar" }, fill);
   const times = h("div", { class: "media-times" }, h("span"), h("span"));
   const ctl = controls(18, 16);
-  const volume = h("input", { class: "media-vol", type: "range", min: 0, max: 100, step: 1, title: "Volume", "aria-label": "Volume" });
-  volume.addEventListener("input", () => setVolume(Number(volume.value)));
+  const volume = h("input", { class: "media-vol", type: "range", min: 0, max: 100, step: 1, title: "Volume", "aria-label": "Volume", "data-nook-action": "media-volume" });
+  volume.addEventListener("input", () => {
+    if (__NOOK_DEV_BUILD__) shelfTrace("ui-state", { source: "media-volume-input", mutationType: "volume-input", changed: true });
+    setVolume(Number(volume.value));
+  });
   const volumeIcon = h("span", { class: "media-vol-icon" });
   const volumeBox = h("div", { class: "media-volume" }, volumeIcon, volume);
   const state = h("span", { class: "fc-aside" });

@@ -23,7 +23,10 @@ use tauri::WebviewWindow;
 use super::{home_dir, LocalTime};
 use crate::dock::Dock;
 
-/// File name of the Claude Code relay.
+/// Relay name is fixed by the independently compiled app flavor.
+#[cfg(feature = "nook-standalone")]
+pub const HOOK_EXE: &str = "nook-hook-standalone";
+#[cfg(not(feature = "nook-standalone"))]
 pub const HOOK_EXE: &str = "nook-hook";
 
 /// Environment variable holding the home directory.
@@ -42,14 +45,28 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 
 /// ~/.config/nook — preferences.
 pub fn config_dir() -> PathBuf {
-    xdg("XDG_CONFIG_HOME", ".config").join("nook")
+    let dir = if cfg!(feature = "nook-dev") {
+        "nook-dev"
+    } else if cfg!(feature = "nook-standalone") {
+        "nook-standalone"
+    } else {
+        "nook"
+    };
+    xdg("XDG_CONFIG_HOME", ".config").join(dir)
 }
 
 /// ~/.local/share/nook — where nook-hook and the log live. The
 /// relay has to sit at a stable path: an AppImage is mounted somewhere new on
 /// every launch.
 pub fn local_dir() -> PathBuf {
-    xdg("XDG_DATA_HOME", ".local/share").join("nook")
+    let dir = if cfg!(feature = "nook-dev") {
+        "nook-dev"
+    } else if cfg!(feature = "nook-standalone") {
+        "nook-standalone"
+    } else {
+        "nook"
+    };
+    xdg("XDG_DATA_HOME", ".local/share").join(dir)
 }
 
 /// Environment the webview must inherit, set before any thread or process
@@ -107,7 +124,8 @@ fn is_private_dir(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Where nook-hook finds us: `$XDG_RUNTIME_DIR/nook.sock`, or
+/// Where nook-hook finds us: `$XDG_RUNTIME_DIR/nook.sock` (or `nook-dev.sock`
+/// for the isolated Dev build), or
 /// `/run/user/<uid>/nook.sock` when the variable is missing. A directory
 /// that is not ours and private means no relay at all — never a fallback to a
 /// shared place like /tmp. Must match `socket_path()` in hook/src/unix.rs
@@ -117,7 +135,30 @@ pub fn relay_socket_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
-    is_private_dir(&dir).then(|| dir.join("nook.sock"))
+    is_private_dir(&dir).then(|| dir.join(relay_socket_name()))
+}
+
+fn relay_socket_name() -> &'static str {
+    if cfg!(feature = "nook-dev") {
+        "nook-dev.sock"
+    } else if cfg!(feature = "nook-standalone") {
+        "nook-standalone.sock"
+    } else {
+        "nook.sock"
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    #[test]
+    fn relay_socket_uses_the_build_namespace() {
+        let name = super::relay_socket_name();
+        if cfg!(feature = "nook-dev") {
+            assert_eq!(name, "nook-dev.sock");
+        } else {
+            assert_eq!(name, "nook.sock");
+        }
+    }
 }
 
 // ── Processes ─────────────────────────────────────────────────────────────────
@@ -175,38 +216,6 @@ pub fn top_windows() -> Vec<crate::target::Window> {
 
 pub fn bring_forward(_window: isize) -> bool {
     false
-}
-
-// ── The machine ───────────────────────────────────────────────────────────────
-
-/// Memory in use and memory installed, in bytes: MemTotal − MemAvailable of
-/// /proc/meminfo, which is what `free` calls used. One small read.
-pub fn memory() -> Option<(u64, u64)> {
-    crate::metrics::parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
-}
-
-/// What every processor has spent since the machine started, idle and in all:
-/// the first line of /proc/stat.
-pub fn cpu_times() -> Option<crate::metrics::CpuTimes> {
-    crate::metrics::parse_proc_stat(&std::fs::read_to_string("/proc/stat").ok()?)
-}
-
-/// The graphics processor's use is not measured on Linux: there is no one
-/// counter for it across vendors. Opening says so, once, and `gpu` stays `null`.
-pub struct GpuCounters;
-
-impl GpuCounters {
-    pub fn open() -> Result<Self, String> {
-        Err("not measured on Linux".into())
-    }
-
-    pub fn collect(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-
-    pub fn read(&mut self) -> Result<Option<f64>, String> {
-        Ok(None)
-    }
 }
 
 // ── Cursor ────────────────────────────────────────────────────────────────────
@@ -281,7 +290,9 @@ fn gtk_window_ptr(win: &gtk::ApplicationWindow) -> *mut gtk::ffi::GtkWindow {
 pub fn make_non_activating(win: &WebviewWindow) {
     let Ok(gw) = win.gtk_window() else { return };
     // NOOK_LAYER_SHELL=0 is the way out on a compositor where it misbehaves.
-    let wanted = std::env::var("NOOK_LAYER_SHELL").map(|v| v != "0").unwrap_or(true);
+    let wanted = std::env::var("NOOK_LAYER_SHELL")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let supported = unsafe { layer::gtk_layer_is_supported() } != 0;
     if !wanted || !supported || gw.is_realized() {
         let why = if !wanted {
@@ -352,7 +363,12 @@ pub fn set_dock(win: &WebviewWindow, dock: Dock) {
     };
     let ptr = gtk_window_ptr(&gw);
     unsafe {
-        for edge in [layer::EDGE_LEFT, layer::EDGE_RIGHT, layer::EDGE_TOP, layer::EDGE_BOTTOM] {
+        for edge in [
+            layer::EDGE_LEFT,
+            layer::EDGE_RIGHT,
+            layer::EDGE_TOP,
+            layer::EDGE_BOTTOM,
+        ] {
             if edge != wanted {
                 layer::gtk_layer_set_anchor(ptr, edge, 0);
             }
@@ -372,7 +388,11 @@ pub fn set_activating(win: &WebviewWindow, activating: bool) {
     // refuses focus until we say otherwise — on a layer surface too.
     gw.set_accept_focus(activating);
     if LAYER_SURFACE.load(Ordering::Relaxed) {
-        let mode = if activating { layer::KEYBOARD_ON_DEMAND } else { layer::KEYBOARD_NONE };
+        let mode = if activating {
+            layer::KEYBOARD_ON_DEMAND
+        } else {
+            layer::KEYBOARD_NONE
+        };
         unsafe { layer::gtk_layer_set_keyboard_mode(gtk_window_ptr(&gw), mode) };
     }
 }
@@ -405,7 +425,9 @@ fn apply_input_region(gw: &impl IsA<gtk::Widget>, rect: Region) {
     match rect {
         None => gw.input_shape_combine_region(None),
         Some((x, y, w, h)) => {
-            let Some(gdk_window) = gw.window() else { return };
+            let Some(gdk_window) = gw.window() else {
+                return;
+            };
             let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
                 x.floor() as i32,
                 y.floor() as i32,
@@ -427,7 +449,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let dir = base.join("runtime");
         std::fs::create_dir_all(&dir).unwrap();
-        let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let set =
+            |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
 
         set(0o700);
         assert!(is_private_dir(&dir));

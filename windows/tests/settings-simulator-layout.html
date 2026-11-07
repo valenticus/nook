@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nook Dev simulator layout test</title>
+  </head>
+  <body class="settings-window">
+    <div id="settings-root">
+      <div class="sp-app" style="width: 390px; height: 300px; margin: 16px;">
+        <aside class="sp-side" aria-hidden="true"></aside>
+        <main class="sp-main">
+          <div class="sp-pane" id="connect-pane" role="tabpanel" aria-label="Connect">
+            <header class="sp-head"><div class="sp-head-text"><h1 class="sp-title">Connect</h1></div></header>
+            <section class="sp-tool codex" aria-label="Codex"><header class="sp-tool-head"><div class="sp-tool-text"><h2 class="sp-tool-name">Codex</h2></div></header></section>
+            <div id="simulator-host"></div>
+          </div>
+        </main>
+      </div>
+    </div>
+    <pre id="test-result" data-test-result="pending">pending</pre>
+    <script type="module" src="/tests/settings-simulator-layout.ts"></script>
+  </body>
+</html>

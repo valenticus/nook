@@ -16,10 +16,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::{platform, settings};
+
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
-use crate::{platform, settings};
 
 /// Every event the island reacts to, with the hook timeout written to settings.json.
 /// PermissionRequest waits for a human, so it gets the decision timeout + 10 s.
@@ -44,7 +46,7 @@ pub(crate) const MARKER: &str = "nook-hook";
 /// The relay's name before the rename, when the app was called Coucou. Entries
 /// carrying it are ours to replace and to remove, but never count as installed.
 /// Can be dropped once nobody has the old entries in their settings.json.
-const LEGACY_MARKER: &str = "coucou-hook";
+pub(crate) const LEGACY_MARKER: &str = "coucou-hook";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,7 +93,7 @@ fn read_settings() -> Result<Value, String> {
 
 /// The parsing half of `read_settings`, split out so it can be tested without a
 /// home directory.
-fn parse_settings(bytes: &[u8], path: &str) -> Result<Value, String> {
+pub(crate) fn parse_settings(bytes: &[u8], path: &str) -> Result<Value, String> {
     // PowerShell writes a UTF-8 BOM with `Set-Content -Encoding utf8`, and
     // serde_json refuses it. Stripping it is safe and well defined; guessing at
     // anything else is not.
@@ -106,6 +108,127 @@ fn parse_settings(bytes: &[u8], path: &str) -> Result<Value, String> {
             "{path} isn't valid JSON ({err}). Fix or move it, then try again — Nook won't overwrite it."
         )),
     }
+}
+
+/// Produces the Claude settings object that would use the supplied relay.
+/// Used by Connect preview; it never writes the file.
+#[cfg(test)]
+pub(crate) fn merged_for_relay(existing: &Value, relay: &Path) -> Value {
+    merged_for_connect(existing, relay, true)
+}
+
+#[cfg(test)]
+pub(crate) fn merged_for_connect(existing: &Value, relay: &Path, remove_dev: bool) -> Value {
+    merged_for_connect_filtered(existing, relay, |hook| {
+        entry_is_dev_command(hook) && remove_dev || entry_is_ours_hook(hook)
+    })
+    .unwrap_or_else(|_| existing.clone())
+}
+
+pub(crate) fn merged_for_connect_filtered(
+    existing: &Value,
+    relay: &Path,
+    remove_hook: impl Fn(&Value) -> bool,
+) -> Result<Value, String> {
+    let mut root = existing.as_object().cloned().unwrap_or_default();
+    let mut hooks = match root.get("hooks") {
+        None => Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => return Err("The Claude settings hooks key is not an object".into()),
+    };
+    for (event, timeout) in HOOK_EVENTS {
+        let mut list = match hooks.get(*event) {
+            None => Vec::new(),
+            Some(Value::Array(list)) => list.clone(),
+            Some(_) => return Err(format!("The Claude {event} hooks are not a list")),
+        };
+        list = filter_hook_groups(&list, &remove_hook);
+        let command = if cfg!(windows) {
+            relay.to_string_lossy().replace('\\', "/")
+        } else {
+            relay.to_string_lossy().to_string()
+        };
+        let entry =
+            json!({ "type": "command", "command": command, "args": [event], "timeout": timeout });
+        list.push(json!({ "hooks": [entry] }));
+        hooks.insert((*event).to_string(), Value::Array(list));
+    }
+    root.insert("hooks".into(), Value::Object(hooks));
+    Ok(Value::Object(root))
+}
+
+#[cfg(test)]
+pub(crate) fn without_ours_for_preview(existing: &Value) -> Value {
+    without_ours(existing)
+}
+
+fn entry_is_dev_command(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(command_is_dev)
+}
+fn entry_is_ours_hook(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(command_is_ours)
+}
+
+pub(crate) fn filter_hook_groups(
+    groups: &[Value],
+    remove_hook: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let Some(list) = group.get("hooks").and_then(Value::as_array) else {
+                return Some(group.clone());
+            };
+            let rest: Vec<Value> = list
+                .iter()
+                .filter(|hook| !remove_hook(hook))
+                .cloned()
+                .collect();
+            if rest.len() == list.len() {
+                Some(group.clone())
+            } else if rest.is_empty() {
+                None
+            } else {
+                let mut copy = group.clone();
+                copy["hooks"] = Value::Array(rest);
+                Some(copy)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn filter_settings_hooks(
+    existing: &Value,
+    remove_hook: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut root = existing.as_object().cloned().unwrap_or_default();
+    let Some(Value::Object(old)) = root.get("hooks") else {
+        return Value::Object(root);
+    };
+    let mut hooks = Map::new();
+    for (event, value) in old {
+        match value {
+            Value::Array(groups) => {
+                let rest = filter_hook_groups(groups, &remove_hook);
+                if !rest.is_empty() || groups.is_empty() {
+                    hooks.insert(event.clone(), Value::Array(rest));
+                }
+            }
+            other => {
+                hooks.insert(event.clone(), other.clone());
+            }
+        }
+    }
+    if hooks.is_empty() {
+        root.remove("hooks");
+    } else {
+        root.insert("hooks".into(), Value::Object(hooks));
+    }
+    Value::Object(root)
 }
 
 /// The settings as they are, or an empty object when we cannot tell. Only for
@@ -152,7 +275,11 @@ fn entry_is_current(entry: &Value) -> bool {
         && entry
             .get("hooks")
             .and_then(Value::as_array)
-            .is_some_and(|hooks| hooks.iter().all(|h| h.get("args").is_some_and(Value::is_array)))
+            .is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .all(|h| h.get("args").is_some_and(Value::is_array))
+            })
 }
 
 /// Claude Code runs the command through `sh`, which still reads `$`, `` ` ``
@@ -160,7 +287,10 @@ fn entry_is_current(entry: &Value) -> bool {
 /// the home directory is called.
 #[cfg(unix)]
 fn hook_command(event: &str) -> String {
-    format!("{} {event}", sh_quote(&settings::hook_exe_path().to_string_lossy()))
+    format!(
+        "{} {event}",
+        sh_quote(&settings::hook_exe_path().to_string_lossy())
+    )
 }
 
 /// `s` as one single-quoted shell word: `'` becomes `'\''`, nothing else is
@@ -179,20 +309,61 @@ fn entry_has(entry: &Value, marker: &str) -> bool {
             hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(Value::as_str)
-                    .map(|c| c.contains(marker))
+                    .map(|c| command_name(c).is_some_and(|name| name_matches_marker(&name, marker)))
                     .unwrap_or(false)
             })
         })
         .unwrap_or(false)
 }
 
+fn command_name(command: &str) -> Option<String> {
+    let command = command.trim();
+    let executable = if let Some(rest) = command.strip_prefix('"') {
+        rest.split_once('"').map(|(path, _)| path)?
+    } else if let Some(rest) = command.strip_prefix('\'') {
+        rest.split_once('\'').map(|(path, _)| path)?
+    } else {
+        command.split_whitespace().next()?
+    };
+    executable
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_lowercase)
+}
+
+fn name_matches_marker(name: &str, marker: &str) -> bool {
+    let known = if marker == MARKER {
+        &[
+            "nook-hook",
+            "nook-hook.exe",
+            "nook-hook-dev.exe",
+            "nook-hook-standalone.exe",
+        ][..]
+    } else {
+        &["coucou-hook", "coucou-hook.exe"][..]
+    };
+    known.contains(&name)
+}
+
+/// Exact relay filename check shared with Connect ownership detection.
+pub(crate) fn command_is_ours(command: &str) -> bool {
+    command_name(command).is_some_and(|name| {
+        name_matches_marker(&name, MARKER) || name_matches_marker(&name, LEGACY_MARKER)
+    })
+}
+pub(crate) fn command_is_dev(command: &str) -> bool {
+    command_name(command).is_some_and(|name| name == "nook-hook-dev.exe")
+}
+
 /// An entry written by Coucou, before the rename.
-fn entry_is_legacy(entry: &Value) -> bool {
+pub(crate) fn entry_is_legacy(entry: &Value) -> bool {
     entry_has(entry, LEGACY_MARKER)
 }
 
 /// Ours to replace or remove: a Nook entry, or one left by Coucou.
-fn entry_is_ours(entry: &Value) -> bool {
+pub(crate) fn entry_is_ours(entry: &Value) -> bool {
     entry_has(entry, MARKER) || entry_is_legacy(entry)
 }
 
@@ -249,8 +420,7 @@ fn without_ours(existing: &Value) -> Value {
     for (event, value) in hooks {
         match value.as_array() {
             Some(list) => {
-                let kept: Vec<Value> =
-                    list.iter().filter(|e| !entry_is_ours(e)).cloned().collect();
+                let kept: Vec<Value> = list.iter().filter(|e| !entry_is_ours(e)).cloned().collect();
                 if !kept.is_empty() {
                     out.insert(event, Value::Array(kept));
                 }
@@ -285,13 +455,26 @@ fn stamp() -> String {
 /// Where a file is copied to before Nook changes it: beside it, under its own
 /// name and the time — `settings.json.bak-20261004-101500`, `CLAUDE.md.bak-…`.
 fn backup_of(path: &Path) -> PathBuf {
-    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!("{name}.bak-{}", stamp()))
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let base = path.with_file_name(format!("{name}.bak-{}", stamp()));
+    if !base.exists() {
+        return base;
+    }
+    for suffix in 1..10_000u32 {
+        let candidate = path.with_file_name(format!("{name}.bak-{}-{suffix}", stamp()));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.with_file_name(format!("{name}.bak-{}-{}", stamp(), std::process::id()))
 }
 
 /// Identifies the exact bytes a preview was computed from. FNV-1a is plenty:
 /// the question is only "is this still the file I showed the user?".
-fn fingerprint(bytes: &[u8]) -> String {
+pub(crate) fn fingerprint(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         hash ^= *b as u64;
@@ -327,18 +510,32 @@ pub fn status() -> HookStatus {
 }
 
 pub fn preview(install: bool) -> Result<HookPreview, String> {
-    preview_change(|current| Ok(if install { merged(current) } else { without_ours(current) }))
+    preview_change(|current| {
+        Ok(if install {
+            merged(current)
+        } else {
+            without_ours(current)
+        })
+    })
 }
 
 pub fn write(install: bool, fingerprint: &str) -> Result<String, String> {
-    write_change(fingerprint, |current| Ok(if install { merged(current) } else { without_ours(current) }))
+    write_change(fingerprint, |current| {
+        Ok(if install {
+            merged(current)
+        } else {
+            without_ours(current)
+        })
+    })
 }
 
 /// The diff a change to settings.json would make, without writing anything.
 /// `change` is given the settings as they are and returns them as they would
 /// be; the hooks and the status line (statusline.rs) are both installed and
 /// removed through this pair, so there is one way a settings.json is written.
-pub(crate) fn preview_change(change: impl Fn(&Value) -> Result<Value, String>) -> Result<HookPreview, String> {
+pub(crate) fn preview_change(
+    change: impl Fn(&Value) -> Result<Value, String>,
+) -> Result<HookPreview, String> {
     preview_file(&settings_path(), json_change(change))
 }
 
@@ -348,7 +545,10 @@ pub(crate) fn preview_change(change: impl Fn(&Value) -> Result<Value, String>) -
 /// in between — another tool, another window, the user's own editor — we stop
 /// and make them look at a fresh diff, because the only thing worse than not
 /// installing the hooks is silently reverting somebody else's edit.
-pub(crate) fn write_change(fingerprint: &str, change: impl Fn(&Value) -> Result<Value, String>) -> Result<String, String> {
+pub(crate) fn write_change(
+    fingerprint: &str,
+    change: impl Fn(&Value) -> Result<Value, String>,
+) -> Result<String, String> {
     write_file(&settings_path(), fingerprint, json_change(change))
 }
 
@@ -356,7 +556,9 @@ pub(crate) fn write_change(fingerprint: &str, change: impl Fn(&Value) -> Result<
 /// is read as settings.json always was (a missing or empty one is `{}`, a BOM
 /// is let by, anything that is not an object is refused), and what is written
 /// is the result, pretty-printed, with a newline at its end.
-fn json_change(change: impl Fn(&Value) -> Result<Value, String>) -> impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String> {
+fn json_change(
+    change: impl Fn(&Value) -> Result<Value, String>,
+) -> impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String> {
     move |path, bytes| {
         let current = match bytes {
             Some(bytes) => parse_settings(bytes, &path.display().to_string())?,
@@ -366,7 +568,11 @@ fn json_change(change: impl Fn(&Value) -> Result<Value, String>) -> impl Fn(&Pat
         let after = pretty(&next);
         let mut written = after.clone().into_bytes();
         written.push(b'\n');
-        Ok(FileChange { before: pretty(&current), after, bytes: written })
+        Ok(FileChange {
+            before: pretty(&current),
+            after,
+            bytes: written,
+        })
     }
 }
 
@@ -404,7 +610,10 @@ pub(crate) fn read_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
 }
 
 /// The diff a change to `path` would make, without writing anything.
-pub(crate) fn preview_file(path: &Path, change: impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String>) -> Result<HookPreview, String> {
+pub(crate) fn preview_file(
+    path: &Path,
+    change: impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String>,
+) -> Result<HookPreview, String> {
     let current = read_file(path)?;
     let next = change(path, current.as_deref())?;
     Ok(HookPreview {
@@ -420,7 +629,23 @@ pub(crate) fn preview_file(path: &Path, change: impl Fn(&Path, Option<&[u8]>) ->
 ///
 /// `fingerprint` is the one the preview was computed from: a file that
 /// changed in between is refused, and left alone.
-pub(crate) fn write_file(path: &Path, fingerprint: &str, change: impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String>) -> Result<String, String> {
+pub(crate) fn write_file(
+    path: &Path,
+    fingerprint: &str,
+    change: impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String>,
+) -> Result<String, String> {
+    write_file_with_backup(path, fingerprint, None, change)
+        .map(|backup| backup.unwrap_or_else(|| backup_of(path).to_string_lossy().to_string()))
+}
+
+/// Applies a preview while using its exact, previously displayed backup path.
+/// If the path was claimed since preview, the write is refused.
+pub(crate) fn write_file_with_backup(
+    path: &Path,
+    fingerprint: &str,
+    expected_backup: Option<&Path>,
+    change: impl Fn(&Path, Option<&[u8]>) -> Result<FileChange, String>,
+) -> Result<Option<String>, String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
 
@@ -437,9 +662,35 @@ pub(crate) fn write_file(path: &Path, fingerprint: &str, change: impl Fn(&Path, 
     // Worked out before the backup too: a change that cannot be made leaves no trace.
     let next = change(path, current.as_deref())?;
 
-    let backup = backup_of(path);
-    if path.exists() {
-        std::fs::copy(path, &backup).map_err(|e| format!("backup failed: {e}"))?;
+    let backup = if current.is_some() {
+        let backup = expected_backup
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| backup_of(path));
+        let original = current.as_deref().unwrap_or_default();
+        if backup.exists() {
+            if std::fs::read(&backup).ok().as_deref() != Some(original) {
+                return Err(format!(
+                    "backup path was already claimed: {}",
+                    backup.display()
+                ));
+            }
+        } else {
+            write_backup(&backup, original, Some(path))?;
+        }
+        Some(backup)
+    } else {
+        if expected_backup.is_some() {
+            return Err("The preview expected a backup for a file that is now missing.".into());
+        }
+        None
+    };
+
+    // A concurrent editor may have changed the file while its backup was being made.
+    if crate::hooks::fingerprint(read_file(path)?.as_deref().unwrap_or_default()) != fingerprint {
+        return Err(format!(
+            "{} changed during apply. The backup was kept and no replacement was written.",
+            path.display()
+        ));
     }
 
     // A dotfiles setup often makes the file a symlink: write to the file it
@@ -449,8 +700,15 @@ pub(crate) fn write_file(path: &Path, fingerprint: &str, change: impl Fn(&Path, 
 
     // Write beside the target and rename over it: a crash or a full disk leaves
     // the original intact rather than half a file.
-    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-    let temp = path.with_file_name(format!("{name}.nook-{}", std::process::id()));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!(
+        "{name}.nook-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     if let Err(err) = write_like(&temp, path, &next.bytes) {
         let _ = std::fs::remove_file(&temp);
         return Err(format!("write failed: {err}"));
@@ -459,7 +717,84 @@ pub(crate) fn write_file(path: &Path, fingerprint: &str, change: impl Fn(&Path, 
         let _ = std::fs::remove_file(&temp);
         return Err(format!("write failed: {err}"));
     }
-    Ok(backup.to_string_lossy().to_string())
+    Ok(backup.map(|path| path.to_string_lossy().to_string()))
+}
+
+pub(crate) fn write_backup(
+    path: &Path,
+    bytes: &[u8],
+    original: Option<&Path>,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("backup failed: {e}"))?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("backup failed: {error}"));
+    }
+    #[cfg(unix)]
+    if let Some(original) = original {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(original) {
+            file.set_permissions(std::fs::Permissions::from_mode(
+                meta.permissions().mode() & 0o777,
+            ))
+            .map_err(|e| format!("backup permissions failed: {e}"))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = original;
+    Ok(())
+}
+
+/// Restore only if the target still contains the bytes this transaction wrote.
+/// This keeps a concurrent user edit from being overwritten during rollback.
+pub(crate) fn rollback_file(
+    path: &Path,
+    backup: Option<&Path>,
+    old_missing: bool,
+    expected_new_fingerprint: &str,
+) -> Result<(), String> {
+    let current = read_file(path)?;
+    if fingerprint(current.as_deref().unwrap_or_default()) != expected_new_fingerprint {
+        return Err(format!(
+            "{} changed during rollback; it was left untouched",
+            path.display()
+        ));
+    }
+    if old_missing {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("could not remove newly created {}: {e}", path.display()))?;
+        return Ok(());
+    }
+    let backup = backup.ok_or_else(|| format!("missing rollback backup for {}", path.display()))?;
+    let original = std::fs::read(backup)
+        .map_err(|e| format!("could not read rollback backup {}: {e}", backup.display()))?;
+    let temp = path.with_file_name(format!(
+        "{}.restore-{}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    write_like(&temp, path, &original)
+        .map_err(|e| format!("could not stage rollback for {}: {e}", path.display()))?;
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("could not restore {}: {e}", path.display())
+    })?;
+    if std::fs::read(path).ok().as_deref() != Some(original.as_slice()) {
+        return Err(format!(
+            "restored bytes did not verify for {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Writes `bytes` to `temp`, which is about to replace `original`.
@@ -470,7 +805,7 @@ pub(crate) fn write_file(path: &Path, fingerprint: &str, change: impl Fn(&Path, 
 fn write_like(temp: &Path, original: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(temp)?;
@@ -508,7 +843,10 @@ pub fn ensure_hook_exe(app: &AppHandle) {
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(p) = app.path().resolve(platform::HOOK_EXE, tauri::path::BaseDirectory::Resource) {
+    if let Ok(p) = app
+        .path()
+        .resolve(platform::HOOK_EXE, tauri::path::BaseDirectory::Resource)
+    {
         candidates.push(p);
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -677,8 +1015,11 @@ mod tests {
     #[test]
     fn empty_and_whitespace_files_start_from_nothing() {
         assert_eq!(parse_settings(b"", WHERE).unwrap(), json!({}));
-        assert_eq!(parse_settings(b"  
-	 ", WHERE).unwrap(), json!({}));
+        assert_eq!(
+            parse_settings(b"  \n\t ", WHERE)
+            .unwrap(),
+            json!({})
+        );
     }
 
     #[test]
@@ -704,7 +1045,9 @@ mod tests {
 
         let pre = after["hooks"]["PreToolUse"].as_array().unwrap();
         assert!(
-            pre.iter().any(|e| serde_json::to_string(e).unwrap().contains("someone-elses-tool.exe")),
+            pre.iter().any(|e| serde_json::to_string(e)
+                .unwrap()
+                .contains("someone-elses-tool.exe")),
             "another tool's hook was dropped"
         );
         assert!(pre.iter().any(entry_is_ours), "our own hook was not added");
@@ -724,8 +1067,18 @@ mod tests {
             assert_eq!(hook["type"], "command");
             // Just the relay's path: nothing a shell would have to parse.
             let command = hook["command"].as_str().unwrap();
-            assert!(command.ends_with("nook-hook.exe"), "got {command}");
-            assert!(!command.contains('"'), "no shell quoting in exec form: {command}");
+            let relay_name = if cfg!(feature = "nook-standalone") {
+                "nook-hook-standalone.exe"
+            } else if cfg!(feature = "nook-dev") {
+                "nook-hook-dev.exe"
+            } else {
+                "nook-hook.exe"
+            };
+            assert!(command.ends_with(relay_name), "got {command}");
+            assert!(
+                !command.contains('"'),
+                "no shell quoting in exec form: {command}"
+            );
             assert_eq!(hook["args"], json!([event]));
             assert_eq!(hook["timeout"], json!(timeout));
         }
@@ -738,10 +1091,18 @@ mod tests {
         let old = json!({ "hooks": { "Stop": [
             { "hooks": [{ "type": "command", "command": "\"C:/Users/me/AppData/Local/Nook/bin/nook-hook.exe\" Stop" }] }
         ] } });
-        assert!(old["hooks"]["Stop"].as_array().unwrap().iter().all(|e| !entry_is_current(e)));
+        assert!(old["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| !entry_is_current(e)));
         let after = merged(&old);
         let stop = after["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1, "the old entry must be replaced, not kept next to the new one");
+        assert_eq!(
+            stop.len(),
+            1,
+            "the old entry must be replaced, not kept next to the new one"
+        );
         assert!(entry_is_current(&stop[0]));
     }
 
@@ -778,9 +1139,19 @@ mod tests {
             let list = after["hooks"][*event].as_array().unwrap();
             let ours: Vec<&Value> = list.iter().filter(|e| entry_is_ours(e)).collect();
             assert_eq!(ours.len(), 1, "{event}: exactly one relay entry");
-            assert!(entry_is_current(ours[0]), "{event}: the entry left must be Nook's");
-            assert!(!list.iter().any(entry_is_legacy), "{event}: a Coucou entry survived");
-            let others = if *event == "PreToolUse" { vec![foreign()] } else { vec![] };
+            assert!(
+                entry_is_current(ours[0]),
+                "{event}: the entry left must be Nook's"
+            );
+            assert!(
+                !list.iter().any(entry_is_legacy),
+                "{event}: a Coucou entry survived"
+            );
+            let others = if *event == "PreToolUse" {
+                vec![foreign()]
+            } else {
+                vec![]
+            };
             let kept: Vec<Value> = list.iter().filter(|e| !entry_is_ours(e)).cloned().collect();
             assert_eq!(kept, others, "{event}: foreign hooks must be left alone");
         }
@@ -887,7 +1258,10 @@ mod tests {
         std::env::set_var(platform::HOME_VAR, &tmp);
 
         let path = settings_path();
-        assert!(path.starts_with(&tmp), "the test must not touch the real home");
+        assert!(
+            path.starts_with(&tmp),
+            "the test must not touch the real home"
+        );
 
         // A real-shaped file, written the way PowerShell 5 would: UTF-8 with BOM.
         let original = r#"{"model":"claude-opus-5","theme":"dark","tui":{"x":1},"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"other-tool.exe"}]}]}}"#;
@@ -897,7 +1271,10 @@ mod tests {
 
         // Install.
         let plan = preview(true).expect("a BOM must not stop the preview");
-        assert!(plan.diff.contains("nook-hook"), "the diff must show what changes");
+        assert!(
+            plan.diff.contains("nook-hook"),
+            "the diff must show what changes"
+        );
         let backup = write(true, &plan.fingerprint).expect("install should succeed");
 
         // The backup holds the original bytes, BOM and all.
@@ -909,7 +1286,9 @@ mod tests {
         assert_eq!(after["theme"], "dark");
         assert_eq!(after["tui"]["x"], 1);
         let pre = after["hooks"]["PreToolUse"].as_array().unwrap();
-        assert!(pre.iter().any(|e| serde_json::to_string(e).unwrap().contains("other-tool.exe")));
+        assert!(pre
+            .iter()
+            .any(|e| serde_json::to_string(e).unwrap().contains("other-tool.exe")));
         assert!(status().installed);
 
         // A file that moved since the preview is refused, and left alone.
