@@ -2,11 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [ui, bridge, backend, rust] = await Promise.all([
+const [ui, bridge, backend, rust, aboutRust] = await Promise.all([
   readFile(new URL("../src/settings/main.ts", import.meta.url), "utf8"),
   readFile(new URL("../src/core/bridge.ts", import.meta.url), "utf8"),
   readFile(new URL("../src/settings/backend.ts", import.meta.url), "utf8"),
   readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8"),
+  readFile(new URL("../src-tauri/src/about.rs", import.meta.url), "utf8"),
 ]);
 
 test("Connect has independent Claude Code and Codex status cards", () => {
@@ -24,13 +25,32 @@ test("Connect has independent Claude Code and Codex status cards", () => {
   assert.doesNotMatch(ui.slice(ui.indexOf("function connectSection()"), ui.indexOf("function quotaWindowRow")), /cursorGroup\(|Cursor hooks/);
 });
 
-test("Connect copy is localized and About is the Nook Personal Edition", async () => {
+test("Connect copy is localized and About credits the original author", async () => {
   const i18n = await readFile(new URL("../src/core/i18n.ts", import.meta.url), "utf8");
-  for (const phrase of ["Needs repair", "Receiving events", "Waiting for activity", "Last event: {event}{time}", "I approve migrating Original Nook hooks.", "I understand Codex may ask me to trust these hooks in its own prompt.", "Developed by", "Valentyn Fetisov"]) {
+  for (const phrase of ["Needs repair", "Receiving events", "Waiting for activity", "Last event: {event}{time}", "I approve migrating Original Nook hooks.", "I understand Codex may ask me to trust these hooks in its own prompt."]) {
     assert.ok(i18n.includes(`"${phrase}": { en:`), `missing localized phrase ${phrase}`);
   }
-  assert.match(ui, /Nook Personal Edition/);
-  assert.doesNotMatch(ui, /zubairbinshaukat|zubyr\.dev|linkedin\.com\/in\/zubairbinshaukat/);
+  const aboutStart = ui.indexOf("function aboutSection()");
+  const aboutEnd = ui.indexOf("// ── Putting a category on show", aboutStart);
+  const about = ui.slice(aboutStart, aboutEnd);
+  const linksStart = ui.indexOf("const LINKS:");
+  const linksEnd = ui.indexOf("function updatesGroup()", linksStart);
+  const links = ui.slice(linksStart, linksEnd);
+  assert.match(about, /bare\("Made by"/);
+  assert.match(about, /text: "Zubair Bin Shaukat"/);
+  assert.match(about, /"aria-label": "Zubair Bin Shaukat's links"/);
+  assert.match(about, /Open source, under the MIT licence\./);
+  assert.match(about, /"author made by credits github linkedin website portfolio contact licence license open source"/);
+  assert.doesNotMatch(about, /Valentyn Fetisov|Developed by/);
+  assert.doesNotMatch(about, /Nook Personal Edition/);
+  assert.match(about, /LINKS\.map\(link\)/);
+  assert.match(links, /which: "portfolio", name: "Portfolio", where: "zubyr\.dev", mark: \(\) => icon\(LUCIDE\.globe, 16\)/);
+  assert.match(links, /which: "github", name: "GitHub", where: "github\.com\/zubairbinshaukat", mark: \(\) => brand\(BRANDS\.github, 16\)/);
+  assert.match(links, /which: "linkedin", name: "LinkedIn", where: "linkedin\.com\/in\/zubairbinshaukat", mark: \(\) => icon\(LUCIDE\.briefcaseBusiness, 16\)/);
+  assert.match(links, /which: "x", name: "X", where: "x\.com\/zubyrdev", mark: \(\) => brand\(BRANDS\.x, 14\)/);
+  for (const url of ["https://zubyr.dev", "https://github.com/zubairbinshaukat", "https://www.linkedin.com/in/zubairbinshaukat", "https://x.com/zubyrdev"]) {
+    assert.ok(aboutRust.includes(url), `missing original About destination ${url}`);
+  }
 });
 
 test("Claude Usage distinguishes Standalone, Original and third-party statusLines", async () => {

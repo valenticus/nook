@@ -15,7 +15,7 @@ import {
   COMPACT_PAD, COMPACT_READING_GAP, COMPACT_SLOT_GAP, COMPACT_USAGE_CELL_W, COMPACT_WAITING_CELL_W, IDLE_BATTERY_GROUP_W, IDLE_CLOCK_BATTERY_GAP, IDLE_CLOCK_W, IDLE_SIDE_BATTERY_H, IDLE_SIDE_CLOCK_H, IDLE_SIDE_GROUP_GAP, NOTCH_H, Room, compactLayout, type CompactLayout,
 } from "../core/layout";
 import {
-  State, USAGE_SOURCE_WORDS, compactMetrics, usageLevel, usageShown,
+  State, USAGE_RESET_WORDS, USAGE_SOURCE_WORDS, compactMetrics, usageLevel, usageShown,
   type CompactMetric, type Usage, type UsageLevel,
 } from "../core/state";
 import { clear, h } from "../views/dom";
@@ -24,7 +24,7 @@ import { CLAUDE_BRAND_MARK, LUCIDE, OPENAI_BRAND_MARK, brand, lucide } from "../
 import { wear } from "../views/palette";
 import { DOT_LEGEND, TOOL_NAME } from "../views/tool";
 import { labelText, roster, stateWords, waitingCount, type Entry } from "../views/roster";
-import { quotaProviderDisplay } from "../settings/codex-quota-view";
+import { quotaFailureReasonLabel, quotaProviderDisplay } from "../settings/codex-quota-view";
 import { createCompactUsageCycle, type UsageAgent } from "./compact-usage-cycle";
 import { Bridge, type DevBatteryStatus } from "../core/bridge";
 import { advanceBatteryAlertGate, batteryLevel, batteryPollDelay, cancelIdleTimers, EMPTY_BATTERY_ALERT_CYCLE, EMPTY_BATTERY_ALERT_GATE, formatLocalClock, hasKnownBattery, IDLE_AFTER_MS, idleStatusExtent, latestActivityAt, shouldShowIdle, updateBatteryAlertCycle, type BatteryAlert, type BatteryAlertCycle, type BatteryAlertGate } from "./idle-mode";
@@ -104,12 +104,13 @@ export function reading(kind: CompactMetric, { usage, waiting, codexQuota, codex
         const win = kind === "usage5h" ? display.fiveHour : display.sevenDay;
         const agentName = compactAgentName("codex");
         if (!win || win.state === "unavailable") {
-          const state = win?.state === "unavailable" ? "Unavailable · reset, waiting for new data" : display.status;
-          return { text: "—", more: `${agentName} · ${state}${display.failureReason ? ` · ${display.failureReason}` : ""}`, dim: true };
+          const state = win?.state === "unavailable" ? message(USAGE_RESET_WORDS) : message(display.status);
+          const reason = display.failureReason ? quotaFailureReasonLabel(display.failureReason) : "";
+          return { text: "—", more: [agentName, state, reason].filter(Boolean).join(" · "), dim: true };
         }
         return {
           text: `${Math.round(win.percent)}%`,
-          more: `${display.status}${win.resetCountdown ? ` · resets in ${win.resetCountdown}` : ""}`,
+          more: [message(display.status), win.resetCountdown ? message(win.resetCountdown) : ""].filter(Boolean).join(" · "),
           level: usageLevel(win.percent),
           dim: win.state !== "fresh",
         };
@@ -120,7 +121,7 @@ export function reading(kind: CompactMetric, { usage, waiting, codexQuota, codex
       const reset = shown.state === "reset";
       return {
         text: `${shown.percent}%`,
-        more: [shown.countdown, USAGE_SOURCE_WORDS].filter(Boolean).join(". "),
+        more: [shown.countdown ? message(shown.countdown) : "", message(USAGE_SOURCE_WORDS)].filter(Boolean).join(". "),
         level: reset ? undefined : usageLevel(shown.percent),
         dim: shown.state !== "fresh",
       };
@@ -206,7 +207,8 @@ export function compactSlots(plan: CompactPlan, from: Gauges): CompactSlots {
     more: hidden.length ? { count: hidden.length, color: hidden[0].color, calls: hidden[0].rank === 0 } : null,
     cells: plan.kinds.map((kind) => {
       const read = reading(kind, from);
-      return { kind, ...read, title: read.more ? `${METRIC[kind].name} — ${read.more}` : METRIC[kind].name };
+      const name = message(METRIC[kind].name);
+      return { kind, ...read, title: read.more ? message("{name} · {detail}", { name, detail: read.more }) : name };
     }),
   };
 }
@@ -484,13 +486,14 @@ export function buildCompact(devFixture?: CompactDevFixture, batteryAlertHandler
     for (const [kind, elements] of values) {
       const { cell, value } = elements;
       const { text, more, level, dim } = reading(kind, from);
+      const metricName = message(METRIC[kind].name);
       const title = kind === "waiting"
-        ? message("{name} · {detail}", { name: message(METRIC[kind].name), detail: more ?? message("{waiting} waiting", { waiting: 0 }) })
-        : more ? `${agentName} ${METRIC[kind].name} — ${more}` : METRIC[kind].name;
+        ? message("{name} · {detail}", { name: metricName, detail: more ?? message("{waiting} waiting", { waiting: 0 }) })
+        : more ? message("{name} · {detail}", { name: `${agentName} · ${metricName}`, detail: more }) : metricName;
       if (kind === "waiting" && cell.title !== title) cell.title = title;
       else if (kind !== "waiting") {
-        const detail = more ?? (usageAgent === "claude" ? USAGE_SOURCE_WORDS : "");
-        const fullTitle = [agentName, METRIC[kind].name, detail].filter(Boolean).join(" · ");
+        const detail = more ?? (usageAgent === "claude" ? message(USAGE_SOURCE_WORDS) : "");
+        const fullTitle = [agentName, metricName, detail].filter(Boolean).join(" · ");
         if (cell.title !== fullTitle) cell.title = fullTitle;
       }
       if (value.dataset.level !== (level ?? "")) value.dataset.level = level ?? "";

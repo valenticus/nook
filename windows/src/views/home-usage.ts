@@ -19,7 +19,7 @@ function makeRows(): Row[] {
       const value = h("span", { class: "res-value" });
       const fill = h("i");
       const el = h("div", { class: "res-row" },
-        h("div", { class: "res-head" }, lucide(icon, RES_ICON), h("b", { text: label }), resets, value),
+        h("div", { class: "res-head" }, lucide(icon, RES_ICON), h("b", { text: message(label) }), resets, value),
         h("div", { class: "res-bar" }, fill));
       return { el, resets, value, fill };
     });
@@ -126,14 +126,14 @@ export function buildHomeUsage() {
       const data = window?.state === "unavailable"
         ? null
         : window
-          ? { percent: window.percent, state: window.state, countdown: window.resetCountdown ? `resets ${window.resetCountdown}` : "", resetsAt: window.resetsAt }
+          ? { percent: window.percent, state: window.state, countdown: window.resetCountdown, resetsAt: window.resetsAt }
           : null;
       paintRow(row, data, hasCodexWindow && !window);
       if (window?.state === "unavailable") {
         setTextIfChanged(row.value, message("Unavailable"));
         row.value.classList.add("blank");
         removeAttributeIfPresent(row.value, "data-level");
-        setTextIfChanged(row.resets, message("reset"));
+        setTextIfChanged(row.resets, message("Window reset"));
         setAttributeIfChanged(row.resets, "title", window.resetsAt > 0 ? formatResetTime(window.resetsAt) : "");
         setStyleValueIfChanged(row.fill, "width", "0%");
         removeStylePropertyIfPresent(row.fill, "--used");

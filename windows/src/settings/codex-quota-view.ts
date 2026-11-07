@@ -1,3 +1,6 @@
+import { currentLanguage, message } from "../core/i18n";
+import { resetCountdown } from "../core/state";
+
 export type QuotaProviderStatus = "Disabled" | "Loading" | "Fresh" | "Stale" | "Unavailable";
 
 export interface QuotaWindowValue {
@@ -37,15 +40,7 @@ export interface QuotaProviderDisplay {
 export const formatQuotaPercent = (value: number): string => `${Math.max(0, Math.min(100, Math.round(value)))}%`;
 
 export function formatResetTime(timestamp: number): string {
-  return new Date(timestamp).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-}
-
-const countdown = (resetsAt: number, now: number): string => {
-  const mins = Math.floor(Math.max(0, resetsAt - now) / 60_000);
-  if (mins < 60) return `${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ${mins % 60}m`;
-  return `${Math.floor(hrs / 24)}d ${hrs % 24}h`;
+  return new Date(timestamp).toLocaleString(currentLanguage() === "uk" ? "uk-UA" : "en-GB", { dateStyle: "medium", timeStyle: "short" });
 };
 
 function showWindow(value: QuotaWindowValue | null | undefined, status: QuotaProviderStatus, now: number): QuotaWindowDisplay | null {
@@ -55,12 +50,21 @@ function showWindow(value: QuotaWindowValue | null | undefined, status: QuotaPro
     ...value,
     windowDurationMins: value.windowDurationMins,
     percent: Math.max(0, Math.min(100, value.usedPercent)),
-    resetCountdown: value.resetsAt > 0 ? countdown(value.resetsAt, now) : "",
+    resetCountdown: value.resetsAt > 0 ? resetCountdown(value.resetsAt - now) : "",
     state: status === "Stale" ? "stale" : status === "Fresh" ? "fresh" : "unavailable",
   };
 }
 
-const formatLocalTime = (timestamp: number): string => new Date(timestamp).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+const formatLocalTime = (timestamp: number): string => new Date(timestamp).toLocaleString(currentLanguage() === "uk" ? "uk-UA" : "en-GB", { dateStyle: "medium", timeStyle: "short" });
+
+export function quotaFailureReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    timeout: "Timed out", unauthorized: "Not authorized", protocolError: "Unexpected provider response",
+    cliUnavailable: "Codex CLI unavailable", spawnFailed: "Could not start Codex", serverExited: "Codex provider stopped",
+    quotaUnavailable: "Quota data unavailable", disabled: "Provider is disabled", processIsolationUnavailable: "Process isolation unavailable",
+  };
+  return message(labels[reason] ?? "Unknown error");
+}
 
 /** Resolve provider state and windows using numeric timestamps; formatting belongs to the UI. */
 export function quotaProviderDisplay(enabled: boolean, snapshot: CodexQuotaInput | QuotaProviderSnapshot | null, now = Date.now()): QuotaProviderDisplay {

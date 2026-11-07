@@ -138,15 +138,24 @@ test("Claude Usage connection and migration copy is localized in both languages"
 
 test("dynamic interface templates translate while preserving user and numeric values", () => {
   setLanguage("uk");
-  assert.equal(message("resets in 2h 14m"), "скидання через 2 год 14 хв");
-  assert.equal(message("resets in <1m"), "скидання через менше хвилини");
+  assert.equal(message("resets in 2h 14m"), "Скидання через 2 год 14 хв");
+  assert.equal(message("Resets in 4h 53m"), "Скидання через 4 год 53 хв");
+  assert.equal(message("resets in <1m"), "Скидання через менше хвилини");
+  assert.equal(message("resets in 6d"), "Скидання через 6 дн.");
+  assert.equal(message("5 h"), "5 год");
+  assert.equal(message("7 d"), "7 дн.");
+  assert.equal(message("Window reset"), "Ліміт скинуто");
   assert.equal(message("{agent}: {percent}% used{countdown}. {source}", {
     agent: "Claude Code", percent: 74, countdown: " · Resets 10:30 (local time)", source: "Usage only updates while Claude Code runs. Usage from claude.ai and the desktop app counts toward the same limits but isn't visible to Nook.",
   }), "Claude Code: використано 74% · Resets 10:30 (local time). Дані про використання оновлюються лише під час роботи Claude Code. Використання claude.ai та настільного застосунку враховується в тих самих лімітах, але Nook його не бачить.");
   assert.equal(message("{count} decisions further down", { count: 3 }), "Нижче ще рішень: 3");
   assert.equal(message("{percent}%. Підключіть зарядний пристрій.", { percent: 20 }), "20%. Підключіть зарядний пристрій.");
   setLanguage("en");
-  assert.equal(message("скидання через 2 год 14 хв"), "resets in 2h 14m");
+  assert.equal(message("Скидання через 2 год 14 хв"), "Resets in 2h 14m");
+  assert.equal(message("Скидання через 4 год 53 хв"), "Resets in 4h 53m");
+  assert.equal(message("Скидання через 6 дн."), "Resets in 6d");
+  assert.equal(message("5 h"), "5 h");
+  assert.equal(message("7 d"), "7 d");
   assert.equal(message("20%. Підключіть зарядний пристрій."), "20%. Connect the charger.");
   assert.equal(message("{summary}: {running} running{waiting}", {
     summary: "2 subagents", running: 1, waiting: ", 1 waiting for you",

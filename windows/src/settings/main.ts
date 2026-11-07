@@ -15,12 +15,12 @@
 // between is refused by Rust rather than written over.
 
 import "./settings.css";
-import type { CodexQuotaSnapshot, CodexStatus, ConnectAgent, ConnectOperation, ConnectPreview, ConnectScan, CursorStatus, DataPaths, HookPreview, HookStatus, ReplyFormatAction, ReplyFormatStatus, ShortcutName, ShortcutStatus, UsageStatus } from "../core/bridge";
+import type { AboutLink, CodexQuotaSnapshot, CodexStatus, ConnectAgent, ConnectOperation, ConnectPreview, ConnectScan, CursorStatus, DataPaths, HookPreview, HookStatus, ReplyFormatAction, ReplyFormatStatus, ShortcutName, ShortcutStatus, UsageStatus } from "../core/bridge";
 import { COMPACT_METRICS, DEFAULT_SETTINGS, FADE_MAX, FADE_MIN, FOLDED_AUTO_HIDE, MAX_COMPACT_METRICS, compactMetrics, foldedAutoHide, type CompactMetric, type Settings } from "../core/state";
 import { currentLanguage, message, resolveLanguage, setLanguage, trayMenuLabels, type Language } from "../core/i18n";
 import { BOT_THEMES } from "../bot/engine";
 import { clear, h, replay } from "../views/dom";
-import { LUCIDE } from "../views/iconset";
+import { BRANDS, LUCIDE, brand } from "../views/iconset";
 import { connect, type Backend } from "./backend";
 import { createConnectPreviewGate } from "./connect-preview-gate";
 import { formatQuotaPercent, formatResetTime, quotaProviderDisplay, type QuotaWindowDisplay } from "./codex-quota-view";
@@ -1504,19 +1504,19 @@ async function showConnectPlan(agent: ConnectAgent, operation: ConnectOperation,
 function quotaWindowRow(label: string, window: QuotaWindowDisplay | null, status: string): HTMLElement {
   if (window?.state === "unavailable") {
     return h("div", { class: "sp-codex-quota-row" },
-      h("strong", { text: label }),
+      h("strong", { text: message(label) }),
       h("span", { class: "sp-codex-quota-empty", text: "Unavailable" }));
   }
   if (!window) {
-    const message = status === "Loading" ? "Waiting for provider update" : status === "Disabled" ? "Provider is disabled" : "Unavailable";
+    const emptyLabel = status === "Loading" ? "Waiting for provider update" : status === "Disabled" ? "Provider is disabled" : "Unavailable";
     return h("div", { class: "sp-codex-quota-row" },
-      h("strong", { text: label }),
-      h("span", { class: "sp-codex-quota-empty", text: message }));
+      h("strong", { text: message(label) }),
+      h("span", { class: "sp-codex-quota-empty", text: message(emptyLabel) }));
   }
   return h("div", { class: "sp-codex-quota-row" },
-    h("strong", { text: label }),
-    h("span", { text: `${formatQuotaPercent(window.percent)} used` }),
-    h("span", { class: "sp-codex-quota-reset", text: `Resets ${formatResetTime(window.resetsAt)} (local time)` }));
+    h("strong", { text: message(label) }),
+    h("span", { text: message("{percent}% used", { percent: formatQuotaPercent(window.percent).replace("%", "") }) }),
+    h("span", { class: "sp-codex-quota-reset", text: message("Resets at {time} (local time)", { time: formatResetTime(window.resetsAt) }) }));
 }
 
 function paintCodexQuota() {
@@ -1526,14 +1526,14 @@ function paintCodexQuota() {
   codexQuotaPanel.dataset.status = display.status.toLowerCase();
   codexQuotaPanel.append(
     h("div", { class: "sp-codex-quota-heading" },
-      h("strong", { text: "Status" }),
+      h("strong", { text: message("Status") }),
       h("span", { class: "sp-codex-quota-state", text: display.status })),
     quotaWindowRow("Codex 5h", display.fiveHour, display.status),
     quotaWindowRow("Codex 7d", display.sevenDay, display.status),
     h("div", { class: "sp-codex-quota-meta" },
       h("span", { text: message("Last successful update: {time}{stale}", { time: display.lastSuccessfulUpdate ?? message("None yet"), stale: codexQuota?.stale ? ` · ${message("Stale data")}` : "" }) }),
       display.failureReason ? h("span", { text: message("Failure reason: {reason}", { reason: quotaFailureReasonLabel(display.failureReason) }) }) : null,
-      h("span", { text: "Source: Codex Desktop App Server" })));
+      h("span", { text: message("Source: Codex Desktop App Server") })));
 }
 
 function quotaFailureReasonLabel(reason: string): string {
@@ -1546,7 +1546,7 @@ function quotaFailureReasonLabel(reason: string): string {
 }
 
 function codexQuotaDiagnostics(): HTMLElement {
-  const panel = h("section", { class: "sp-codex-quota", "aria-label": "Codex quota diagnostics" });
+  const panel = h("section", { class: "sp-codex-quota", "aria-label": message("Codex quota diagnostics") });
   codexQuotaPanel = panel;
   followers.push(paintCodexQuota);
   paintCodexQuota();
@@ -2334,6 +2334,15 @@ function shelfTraceControls(): HTMLElement {
 
 // ── About ─────────────────────────────────────────────────────────────────────
 
+/** The original author's four links; Rust resolves these stable IDs to their URLs. */
+const LINKS: readonly { which: AboutLink; name: string; where: string; mark: () => SVGSVGElement }[] = [
+  { which: "portfolio", name: "Portfolio", where: "zubyr.dev", mark: () => icon(LUCIDE.globe, 16) },
+  { which: "github", name: "GitHub", where: "github.com/zubairbinshaukat", mark: () => brand(BRANDS.github, 16) },
+  // Simple Icons carries no LinkedIn mark: a neutral glyph of the set stands for it.
+  { which: "linkedin", name: "LinkedIn", where: "linkedin.com/in/zubairbinshaukat", mark: () => icon(LUCIDE.briefcaseBusiness, 16) },
+  { which: "x", name: "X", where: "x.com/zubyrdev", mark: () => brand(BRANDS.x, 14) },
+];
+
 function aboutSection(): Kid[] {
   const language = segmented<Language>("Language", [["uk", "Українська"], ["en", "English"]], resolveLanguage(settings.language), (value) => change({ language: value }));
   followers.push(() => language.set(resolveLanguage(settings.language)));
@@ -2341,6 +2350,11 @@ function aboutSection(): Kid[] {
     findable(h("div", { class: "sp-row" },
       rowText(label, help),
       h("span", { class: "sp-path" }, ...(path ? breakable(path) : ["—"]))), label, help, keys);
+  const link = ({ which, name, where, mark }: (typeof LINKS)[number]) =>
+    h("button", {
+      class: "sp-social", type: "button", title: where,
+      "aria-label": `${name}: ${where}. Opens in your browser.`, onclick: () => void nook.openLink(which),
+    }, h("i", {}, mark()), h("span", { text: name }));
   return [
     head("about"),
     group("Language", row("Language", "Choose the language used throughout Nook.", language.el)),
@@ -2349,7 +2363,7 @@ function aboutSection(): Kid[] {
       h("div", {},
         h("p", { class: "sp-about-name", text: "Nook" }),
         h("p", { class: "sp-about-version", text: version ? `Version ${version}` : "" }),
-        h("p", { class: "sp-about-version", text: "Nook Personal Edition · With Gullu, Nook's buddy" }))),
+        h("p", { class: "sp-about-version", text: "With Gullu, Nook's buddy" }))),
     findable(bare("Privacy",
       h("div", { class: "sp-box sp-privacy" },
         icon(LUCIDE.circleCheck, 18, 2),
@@ -2364,11 +2378,12 @@ function aboutSection(): Kid[] {
         h("button", { class: "sp-link", type: "button", onclick: () => void nook.openLogFolder() },
           icon(LUCIDE.folderOpen, 16), h("span", { class: "sp-link-text", text: "Open the log folder" }), icon(LUCIDE.arrowUpRight, 14))),
       "Open the log folder", null, "logs log folder open explorer files")),
-    findable(bare("Developed by",
+    findable(bare("Made by",
       h("div", { class: "sp-credit" },
-        h("p", { class: "sp-made", text: "Valentyn Fetisov" })),
+        h("p", { class: "sp-made", text: "Zubair Bin Shaukat" }),
+        h("div", { class: "sp-links", role: "group", "aria-label": "Zubair Bin Shaukat's links" }, ...LINKS.map(link))),
       h("p", { class: "sp-credits", text: "Open source, under the MIT licence." })),
-    "Developed by", "Valentyn Fetisov. Open source, under the MIT licence.",
+    "Made by", "Zubair Bin Shaukat. Open source, under the MIT licence.",
     "author made by credits github linkedin website portfolio contact licence license open source", true),
   ];
 }

@@ -3,7 +3,9 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 
 import { COMPACT_AGENT_ICON_W, COMPACT_CELL_H, COMPACT_MAX_VISIBLE, COMPACT_USAGE_CELL_W, COMPACT_WAITING_CELL_W, compactLayout } from "../src/core/layout.ts";
-import { CLAUDE_BRAND_MARK, OPENAI_BRAND_MARK } from "../src/views/iconset.ts";
+import { BRANDS, CLAUDE_BRAND_MARK, CLAUDE_MARK, OPENAI_BRAND_MARK } from "../src/views/iconset.ts";
+import { toolMarkAsset } from "../src/views/tool.ts";
+import { message, setLanguage } from "../src/core/i18n.ts";
 import type { QuotaProviderSnapshot } from "../src/settings/codex-quota-view.ts";
 
 Object.assign(globalThis, { __nookDevBuildFlag: true });
@@ -153,6 +155,14 @@ test("Claude compact cells show both independently reported 1% windows", () => {
   assert.equal(seven.text, "1%");
 });
 
+test("agent identity marks use the recognizable Claude and OpenAI assets consistently", () => {
+  assert.deepEqual(toolMarkAsset("claude"), { kind: "lucide", path: CLAUDE_MARK });
+  assert.deepEqual(toolMarkAsset("codex"), { kind: "brand", path: OPENAI_BRAND_MARK });
+  assert.deepEqual(toolMarkAsset("cursor"), { kind: "brand", path: BRANDS.cursor });
+  assert.equal(compactAgentPath("codex"), toolMarkAsset("codex").path);
+  assert.equal(compactAgentPath("claude"), CLAUDE_BRAND_MARK);
+});
+
 test("rotation eligibility skips loading/unavailable values and accepts fresh or stale windows", () => {
   const claudeOnly = { fiveHour: { usedPercent: 3, resetsAt: NOW + 60_000 }, sevenDay: null, updatedAt: NOW };
   const claudeUsage = { fiveHour: null, sevenDay: null, updatedAt: NOW };
@@ -207,9 +217,10 @@ test("each quota window remains independent when the other one is missing", () =
 });
 
 test("Codex loading, failure, stale and reset never render missing usage as zero", () => {
+  setLanguage("uk");
   const loading = reading("usage5h", { usage: null, waiting: 0, codexQuota: null, codexEnabled: true, usageAgent: "codex", now: NOW });
   assert.equal(loading.text, "—");
-  assert.match(loading.more ?? "", /Loading/);
+  assert.ok((loading.more ?? "").includes(message("Loading")));
 
   const failed = reading("usage5h", {
     usage: null, waiting: 0,
@@ -217,7 +228,8 @@ test("Codex loading, failure, stale and reset never render missing usage as zero
     codexEnabled: true, usageAgent: "codex", now: NOW,
   });
   assert.equal(failed.text, "—");
-  assert.match(failed.more ?? "", /Unavailable/);
+  assert.ok((failed.more ?? "").includes(message("Unavailable")));
+  assert.ok((failed.more ?? "").includes(message("Timed out")));
 
   const stale = reading("usage7d", { usage: null, waiting: 0, codexQuota: codex({ stale: true }), codexEnabled: true, usageAgent: "codex", now: NOW });
   assert.equal(stale.text, "85%");
@@ -235,6 +247,7 @@ test("Codex loading, failure, stale and reset never render missing usage as zero
   } });
   assert.equal(reading("usage5h", { usage: null, waiting: 0, codexQuota: bothReset, codexEnabled: true, usageAgent: "codex", now: NOW }).text, "—");
   assert.equal(reading("usage7d", { usage: null, waiting: 0, codexQuota: bothReset, codexEnabled: true, usageAgent: "codex", now: NOW }).text, "—");
+  setLanguage("en");
 });
 
 test("waiting cell retains 0, 1 and multiple request counts", () => {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatQuotaPercent, quotaProviderDisplay, QuotaSnapshotGate, type QuotaProviderSnapshot } from "../src/settings/codex-quota-view.ts";
+import { formatQuotaPercent, formatResetTime, quotaProviderDisplay, QuotaSnapshotGate, type QuotaProviderSnapshot } from "../src/settings/codex-quota-view.ts";
+import { setLanguage } from "../src/core/i18n.ts";
 
 const NOW = 1_800_000_000_000;
 const snapshot = (patch: Partial<QuotaProviderSnapshot> = {}): QuotaProviderSnapshot => ({
@@ -17,7 +18,7 @@ test("Claude-only hides Codex; Codex-only exposes its two independent windows", 
   assert.equal(codex.status, "Fresh");
   assert.equal(codex.fiveHour?.percent, 6.4);
   assert.equal(codex.sevenDay?.percent, 2.2);
-  assert.equal(codex.fiveHour?.resetCountdown, "2h 10m");
+  assert.equal(codex.fiveHour?.resetCountdown, "resets in 2h 10m");
   assert.notEqual(codex.fiveHour?.resetsAt, codex.sevenDay?.resetsAt);
   assert.equal(formatQuotaPercent(snapshot().quotas!.fiveHour!.usedPercent), "6%");
 });
@@ -57,7 +58,7 @@ test("window reset timestamps are retained exactly", () => {
     sevenDay: { usedPercent: 1, resetsAt: NOW + 5 * 24 * 60 * 60_000, windowDurationMins: 10_080 },
   } }), NOW);
   assert.equal(view.fiveHour?.resetsAt, resetAt);
-  assert.equal(view.fiveHour?.resetCountdown, "2h 10m");
+  assert.equal(view.fiveHour?.resetCountdown, "resets in 2h 10m");
   assert.equal(view.sevenDay?.resetsAt, NOW + 5 * 24 * 60 * 60_000);
 });
 
@@ -86,12 +87,28 @@ test("real provider failures leave Loading and show Unavailable", () => {
 });
 
 test("last-known-good quota data keeps its update time and is marked stale", () => {
+  setLanguage("en");
   const data = snapshot({ stale: true, failureReason: "timeout" });
   const view = quotaProviderDisplay(true, data, NOW);
   assert.equal(view.status, "Stale");
-  assert.equal(view.lastSuccessfulUpdate, new Date(NOW).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }));
+  assert.equal(view.lastSuccessfulUpdate, new Date(NOW).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" }));
   assert.equal(view.fiveHour?.state, "stale");
   assert.equal(data.quotas!.fiveHour!.usedPercent, 6.4, "display does not rewrite cached quota values");
+});
+
+test("Codex reset countdown uses shared duration units while timestamps follow Nook language", () => {
+  const data = snapshot({ quotas: {
+    fiveHour: { usedPercent: 1, resetsAt: NOW + 4 * 60 * 60_000 + 53 * 60_000 },
+    sevenDay: { usedPercent: 1, resetsAt: NOW + 6 * 24 * 60 * 60_000 },
+  } });
+  setLanguage("uk");
+  const uk = quotaProviderDisplay(true, data, NOW);
+  assert.equal(uk.fiveHour?.resetCountdown, "resets in 4h 53m");
+  assert.equal(formatResetTime(uk.fiveHour!.resetsAt), new Date(uk.fiveHour!.resetsAt).toLocaleString("uk-UA", { dateStyle: "medium", timeStyle: "short" }));
+  setLanguage("en");
+  const en = quotaProviderDisplay(true, data, NOW);
+  assert.equal(en.sevenDay?.resetCountdown, "resets in 6d");
+  assert.equal(formatResetTime(en.sevenDay!.resetsAt), new Date(en.sevenDay!.resetsAt).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" }));
 });
 
 test("timeout without cached quotas remains unavailable and has no invented timestamp", () => {

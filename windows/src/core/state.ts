@@ -716,7 +716,7 @@ export interface Usage {
 export const USAGE_OLD_MS = 2 * 60 * 60_000;
 
 /** What a window says once its reset time has passed, until Claude Code reports again. */
-export const USAGE_RESET_WORDS = "reset, waiting for new data";
+export const USAGE_RESET_WORDS = "Reset, waiting for new data";
 /** Why the numbers are as old as they are: the tooltip of the usage block, and of a usage cell. */
 export const USAGE_SOURCE_WORDS =
   "Usage only updates while Claude Code runs. Usage from claude.ai and the desktop app counts toward the same limits but isn't visible to Nook.";
@@ -728,7 +728,9 @@ export function resetCountdown(ms: number): string {
   if (minutes < 60) return `resets in ${minutes}m`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `resets in ${hours}h ${minutes % 60}m`;
-  return `resets in ${Math.floor(hours / 24)}d ${hours % 24}h`;
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return `resets in ${days}d${remainingHours ? ` ${remainingHours}h` : ""}`;
 }
 
 /**

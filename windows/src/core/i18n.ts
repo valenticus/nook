@@ -130,8 +130,6 @@ export const MESSAGES = {
   "Claude Code": { en: "Claude Code", uk: "Claude Code" },
   "Codex": { en: "Codex", uk: "Codex" },
   "Cursor": { en: "Cursor", uk: "Cursor" },
-  "5-hour usage": { en: "5-hour usage", uk: "Використання за 5 годин" },
-  "7-day usage": { en: "7-day usage", uk: "Використання за 7 днів" },
   "Usage only updates while Claude Code runs. Usage from claude.ai and the desktop app counts toward the same limits but isn't visible to Nook.": { en: "Usage only updates while Claude Code runs. Usage from claude.ai and the desktop app counts toward the same limits but isn't visible to Nook.", uk: "Дані про використання оновлюються лише під час роботи Claude Code. Використання claude.ai та настільного застосунку враховується в тих самих лімітах, але Nook його не бачить." },
   "Sessions waiting for you": { en: "Sessions waiting for you", uk: "Сесії, що очікують на вас" },
   "Unread notifications": { en: "Unread notifications", uk: "Непрочитані сповіщення" },
@@ -631,6 +629,14 @@ export const MESSAGES = {
   "1 request is waiting: the oldest first": { en: "1 request is waiting: the oldest first", uk: "Очікує 1 запит. Спершу показано найстаріший." },
   "Nothing matches “{query}”. Try a simpler word.": { en: "Nothing matches “{query}”. Try a simpler word.", uk: "За запитом «{query}» нічого не знайдено. Спробуйте простіше слово." },
   "reset": { en: "reset", uk: "скинути" },
+  "Window reset": { en: "Window reset", uk: "Ліміт скинуто" },
+  "5 h": { en: "5 h", uk: "5 год" },
+  "7 d": { en: "7 d", uk: "7 дн." },
+  "Codex 5h": { en: "Codex 5h", uk: "Codex 5 год" },
+  "Codex 7d": { en: "Codex 7d", uk: "Codex 7 дн." },
+  "{percent}% used": { en: "{percent}% used", uk: "Використано {percent}%" },
+  "Resets at {time} (local time)": { en: "Resets at {time} (local time)", uk: "Скидання {time} за місцевим часом" },
+  "Resets": { en: "Resets", uk: "Скидання" },
   "Search settings (/)": { en: "Search settings (/)", uk: "Пошук у налаштуваннях (/)" },
   "Agents list": { en: "Agents list", uk: "Список агентів" },
   "{agent}: {percent}% used{countdown}. {source}": { en: "{agent}: {percent}% used{countdown}. {source}", uk: "{agent}: використано {percent}%{countdown}. {source}" },
@@ -952,18 +958,22 @@ function translate(source: string): string {
   if (mapped) return activeLanguage === "uk" ? mapped.uk : mapped.en;
   const exactReverse = reverse.get(source);
   if (exactReverse) return activeLanguage === "uk" ? source : exactReverse;
-  const resetEnglish = source.match(/^resets in (?:(\d+)d )?(?:(\d+)h )?(?:(\d+)m|<1m)$/);
+  const resetEnglish = source.match(/^resets in (?:(\d+)d)?(?:\s*(\d+)h)?(?:\s*(\d+)m|\s*<1m)?$/i);
   if (resetEnglish) {
     const [, days, hours, minutes] = resetEnglish;
+    const lessThanMinute = /<1m$/i.test(source);
+    if (!days && !hours && !minutes && !lessThanMinute) return source;
     const parts = [days && `${days} дн.`, hours && `${hours} год`, minutes && `${minutes} хв`].filter(Boolean);
-    return activeLanguage === "uk" ? `скидання через ${parts.length ? parts.join(" ") : "менше хвилини"}` : source;
+    return activeLanguage === "uk" ? `Скидання через ${parts.length ? parts.join(" ") : "менше хвилини"}` : `Resets in ${source.slice("resets in ".length)}`;
   }
-  const resetUkrainian = source.match(/^скидання через (?:(\d+) дн\. )?(?:(\d+) год )?(?:(\d+) хв|менше хвилини)$/);
+  const resetUkrainian = source.match(/^скидання через (?:(\d+) дн\.)?(?:\s*(\d+) год)?(?:\s*(\d+) хв|\s*менше хвилини)?$/i);
   if (resetUkrainian) {
     const [, days, hours, minutes] = resetUkrainian;
+    const lessThanMinute = /менше хвилини$/i.test(source);
+    if (!days && !hours && !minutes && !lessThanMinute) return source;
     return activeLanguage === "en"
-      ? `resets in ${days ? `${days}d ` : ""}${hours ? `${hours}h ` : ""}${minutes ? `${minutes}m` : "<1m"}`
-      : source;
+      ? `Resets in ${days ? `${days}d` : ""}${hours ? `${days ? " " : ""}${hours}h` : ""}${minutes ? `${days || hours ? " " : ""}${minutes}m` : lessThanMinute ? `${days || hours ? " " : ""}<1m` : ""}`
+      : `Скидання через ${[days && `${days} дн.`, hours && `${hours} год`, minutes && `${minutes} хв`].filter(Boolean).join(" ") || "менше хвилини"}`;
   }
   const template = templates.find((entry) => entry.pattern.test(source));
   if (template) {

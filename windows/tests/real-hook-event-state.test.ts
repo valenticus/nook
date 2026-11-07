@@ -126,6 +126,11 @@ test("completion does not affect the bell count, which remains for pending reque
   deliver("claude", "Stop", "same-session-id", { last_message: "Claude done" });
   deliver("codex", "Stop", "same-session-id", { turn_id: "codex-turn", last_message: "Codex done" });
 
+  assert.deepEqual(State.sessions.map(({ agent, id, state, completionPending }) => [agent, id, state, completionPending]), [
+    ["claude", "same-session-id", "finished", true],
+    ["codex", "codex:same-session-id", "finished", true],
+  ]);
+  assert.equal(waitingCount(), 0, "completed parallel sessions do not count as waiting");
   assert.equal(reading("waiting", { usage: null, waiting: 4 }).text, "4");
   assert.equal(State.sessions.every((session) => session.completionPending), true);
 });
