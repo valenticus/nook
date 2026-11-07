@@ -40,8 +40,7 @@ const SET = {
   session: "view=session&theme=dark",
   home: "home=4&decision=1&theme=dark",
   shelf: "home=4&tab=shelf&theme=dark",
-  "folded-metrics": "home=4&fold=1&theme=dark",
-  "folded-metrics-light": "home=4&fold=1&theme=light",
+  folded: "home=4&fold=1&theme=dark",
   agents: "view=session&subagents=1&ask=none&theme=dark",
 };
 

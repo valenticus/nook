@@ -54,7 +54,7 @@ export const PRESET_GROUPS: { title: string; items: Preset[] }[] = [
     ],
   },
   {
-    title: "Usage and metrics",
+    title: "Claude usage",
     items: [
       { label: "Usage stale", q: "home=4&usage=stale" },
       { label: "Usage reset", q: "home=4&usage=reset" },
@@ -62,15 +62,15 @@ export const PRESET_GROUPS: { title: string; items: Preset[] }[] = [
       { label: "Usage 3 h old", q: "home=4&usage=old" },
       { label: "No usage", q: "home=4&usage=none" },
       { label: "Usage off", q: "home=4&usage=off" },
-      { label: "No CPU yet", q: "home=4&metrics=wait" },
+      { label: "No usage data", q: "home=4&usage=none" },
     ],
   },
   {
     title: "Folded",
     items: [
       { label: "Folded, 4 sessions", q: "home=4&fold=1" },
-      { label: "Worst case", q: "home=6&fold=1&metrics=worst&usage=worst" },
-      { label: "0 metrics", q: "home=4&fold=1&cells=none" },
+      { label: "Usage at limit", q: "home=6&fold=1&usage=worst" },
+      { label: "No compact cells", q: "home=4&fold=1&cells=none" },
       { label: "0 sessions", q: "home=0&fold=1" },
       { label: "9 sessions", q: "home=9&fold=1" },
       { label: "Narrow screen", q: "home=9&fold=1&screen=800" },
@@ -102,6 +102,6 @@ export const PRESET_GROUPS: { title: string; items: Preset[] }[] = [
 /** Every key claude-preview.ts reads for the scenario (the stage's own are in options.ts). `target` is the island's and stays. */
 export const SCENARIO_KEYS = [
   "view", "live", "list", "file", "idle", "answered", "multi", "many", "diff", "reply", "sessions", "subagents", "ask", "stop",
-  "ids", "queued", "asked", "step", "phantoms", "quiet", "home", "hooks", "decision", "subs", "usage", "metrics", "gpu", "cells",
+  "ids", "queued", "asked", "step", "phantoms", "quiet", "home", "hooks", "decision", "subs", "usage", "cells",
   "fold", "screen", "tab", "hidden", "order", "check",
 ] as const;

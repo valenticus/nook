@@ -11,8 +11,6 @@ import { renderStage, wallpaperSettled } from "./stage";
 import "./stage.css";
 import "./sidebar.css";
 
-export { rng } from "./options";
-
 export interface Stage {
   /** What the URL says (kept current by live changes). */
   options: StageOptions;

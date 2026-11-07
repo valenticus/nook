@@ -40,7 +40,6 @@ export interface StageOptions {
   date: string;
   /** Page colour behind everything: "#rrggbb", or "transparent" (scene=none). */
   bg: string | null;
-  seed: number | null;
   motion: "reduce" | "full" | null;
 }
 
@@ -48,7 +47,7 @@ export interface StageOptions {
 export const LIVE_KEYS = ["scene", "theme", "taskbar", "wallpaper", "time", "date", "bg", "ui", "toggle"] as const;
 
 /** Every key the stage reads (the scenario keys are claude-preview.ts's). */
-export const STAGE_KEYS = [...LIVE_KEYS, "dock", "shot", "w", "h", "scale", "zoom", "light", "seed", "motion"] as const;
+export const STAGE_KEYS = [...LIVE_KEYS, "dock", "shot", "w", "h", "scale", "zoom", "light", "motion"] as const;
 
 const oneOf = <T extends string>(list: readonly T[], value: string | null, fallback: T): T =>
   list.includes(value as T) ? (value as T) : fallback;
@@ -67,7 +66,6 @@ const size = (value: string | null): number | null => {
 export function parseOptions(params: URLSearchParams): StageOptions {
   const shot = flag(params.get("shot"), false);
   const scale = Number(params.get("scale") ?? params.get("zoom"));
-  const seed = params.get("seed");
   const bg = (params.get("bg") ?? "").trim().toLowerCase();
   const time = (params.get("time") ?? "").trim();
   const motion = params.get("motion");
@@ -88,20 +86,7 @@ export function parseOptions(params: URLSearchParams): StageOptions {
     time: /^([01]?\d|2[0-3]):[0-5]\d$/.test(time) ? time : "10:09",
     date: (params.get("date") ?? "").trim().slice(0, 24) || "10/6/2026",
     bg: bg === "transparent" ? bg : /^#?([0-9a-f]{3}|[0-9a-f]{6})$/.test(bg) ? (bg.startsWith("#") ? bg : `#${bg}`) : null,
-    seed: seed != null && seed !== "" && Number.isFinite(Number(seed)) ? Math.trunc(Number(seed)) : null,
     motion: motion === "reduce" || motion === "full" ? motion : null,
-  };
-}
-
-/** A small seeded generator (mulberry32): the same seed, the same numbers. */
-export function rng(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 

@@ -35,14 +35,12 @@ const DOT_GAP = 6;
 const MORE_W = 24;
 const METRIC_GAP = 8;
 
-type MetricKind = "cpu" | "ram" | "usage5" | "usage7" | "waiting";
+type MetricKind = "usage5h" | "usage7d" | "waiting";
 
 /** Wide enough for the worst each can say: "100%", "16.0 GB", "99". */
 const METRIC: Record<MetricKind, { width: number; name: string; icon: string; stroke: boolean }> = {
-  cpu: { width: 50, name: "CPU", stroke: true, icon: "M7 7h10v10H7zM10 3.5V7M14 3.5V7M10 17v3.5M14 17v3.5M3.5 10H7M3.5 14H7M17 10h3.5M17 14h3.5" },
-  ram: { width: 66, name: "RAM", stroke: true, icon: "M3 8h18v8H3zM7 16v3M12 16v3M17 16v3M8 11v2M12 11v2M16 11v2" },
-  usage5: { width: 50, name: "5-hour usage", stroke: false, icon: ICONS.timer },
-  usage7: { width: 50, name: "7-day usage", stroke: true, icon: "M4 6.5h16v13H4zM4 10.5h16M8.5 4v4M15.5 4v4" },
+  usage5h: { width: 52, name: "5-hour usage", stroke: true, icon: ICONS.timer },
+  usage7d: { width: 52, name: "7-day usage", stroke: true, icon: "M4 6.5h16v13H4zM4 10.5h16M8.5 4v4M15.5 4v4" },
   waiting: { width: 36, name: "Sessions waiting for you", stroke: true, icon: ICONS.bell },
 };
 
@@ -92,7 +90,7 @@ function fit(sessions: number, metrics: Metric[], cap: number): { dots: number; 
 interface Variant { title: string; about: string; sessions: FakeSession[]; metrics: Metric[] }
 
 const usual: Metric[] = [
-  { kind: "cpu", text: "31%" }, { kind: "ram", text: "11.2 GB" }, { kind: "usage5", text: "38%" },
+  { kind: "usage5h", text: "38%" }, { kind: "usage7d", text: "12%" }, { kind: "waiting", text: "3" },
 ];
 
 const urgentBehind = (): FakeSession[] => {
@@ -103,10 +101,10 @@ const urgentBehind = (): FakeSession[] => {
 
 const VARIANTS: Variant[] = [
   {
-    title: "(a) 3 metrics at their worst, 6 sessions",
-    about: "100%, 16.0 GB and 100% must fit their cells.",
+    title: "(a) 5h and 7d usage plus waiting, 6 sessions",
+    about: "Both usage windows and the waiting count keep their fixed cell widths.",
     sessions: fakeSessions(6),
-    metrics: [{ kind: "cpu", text: "100%" }, { kind: "ram", text: "16.0 GB" }, { kind: "usage5", text: "100%" }],
+    metrics: [{ kind: "usage5h", text: "100%" }, { kind: "usage7d", text: "100%" }, { kind: "waiting", text: "6" }],
   },
   { title: "(b) 0 metrics", about: "The metrics slot collapses: the island is narrower.", sessions: fakeSessions(4), metrics: [] },
   { title: "(c) 0 sessions", about: "The dots slot collapses; the bot is at rest.", sessions: [], metrics: usual },
@@ -114,19 +112,19 @@ const VARIANTS: Variant[] = [
     title: "(d) 9 sessions",
     about: "Six dots, most urgent first, then \"+3\". It hides only finished ones: green, as one result is unseen.",
     sessions: nineSessions(),
-    metrics: [{ kind: "cpu", text: "31%" }, { kind: "ram", text: "11.2 GB" }, { kind: "usage7", text: "12%" }],
+    metrics: [{ kind: "usage5h", text: "38%" }, { kind: "usage7d", text: "12%" }, { kind: "waiting", text: "0" }],
   },
   {
     title: "(e) needs you, with an urgent one behind \"+N\"",
     about: "Seven sessions ask and one works: \"+2\" takes the colour of the most urgent it hides.",
     sessions: urgentBehind(),
-    metrics: [{ kind: "cpu", text: "31%" }, { kind: "waiting", text: "7" }, { kind: "usage5", text: "38%" }],
+    metrics: [{ kind: "usage5h", text: "38%" }, { kind: "waiting", text: "7" }, { kind: "usage7d", text: "12%" }],
   },
   {
-    title: "(f) CPU before its first sample",
-    about: "\"—\" in the same fixed cell: nothing moves when the number arrives.",
+    title: "(f) Usage not available yet",
+    about: "An em dash keeps the cell in place until usage data arrives.",
     sessions: fakeSessions(4),
-    metrics: [{ kind: "cpu", text: "—" }, { kind: "ram", text: "11.2 GB" }, { kind: "usage5", text: "38%" }],
+    metrics: [{ kind: "usage5h", text: "—" }, { kind: "usage7d", text: "—" }, { kind: "waiting", text: "0" }],
   },
 ];
 

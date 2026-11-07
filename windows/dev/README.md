@@ -11,6 +11,12 @@ npm run shots          # the whole set into windows/shots/ (git-ignored)
 node scripts/shot.mjs "home=4&scene=browser&theme=light" --out shots/x.png
 ```
 
+The stage reuses the current production Island, hook event handlers, compact-cell layout, usage state, sounds and
+Shelf widgets. It uses synthetic agent, Claude usage and waiting data only. Other
+standalone previews are `dev/home-preview.html`, `dev/compact-preview.html`, `dev/settings-preview.html` and
+`dev/shelf-preview.html`. They are visual harnesses and are not bundled with Nook. `dev/preview-b/island-check.ts`
+contains browser self-checks for compact cells, usage, wake behavior and gestures.
+
 Press `S` or `` ` `` (or the small corner button) for the sidebar: every control writes the URL, so a state is a
 link. Unknown keys are ignored; invalid values fall back to the default. `shot=1` wins over `ui=1`.
 
@@ -27,7 +33,6 @@ link. Unknown keys are ignored; invalid values fall back to the default. `shot=1
 | `bg` | `#rrggbb` or `transparent` | page colour; for `scene=none` (flat or transparent) |
 | `w`, `h` | px, 200..8192 | display size; default the window. `shot.mjs` sets both from `--size` |
 | `scale` | `1`..`3` (`1.25`) | display scaling like Windows' 125 %; alias `zoom` |
-| `seed` | integer | the made-up CPU/GPU numbers; shot mode uses 1 if absent |
 | `motion` | `reduce` `full` | shot mode defaults to `reduce` (springs jump to their end) |
 | `ui` | `0` `1` | sidebar open. It overlays: the stage never moves |
 | `toggle` | `1` `0` | the corner button that opens the sidebar |
@@ -76,8 +81,8 @@ without checking Microsoft's terms; `wallpaper=nook` is the free-to-share look.
 
 `view=overview|session|question|approval|finished` (+ `live` `list` `file` `idle` `answered` `multi` `many` `diff`
 `reply=1|long`), `target=claude|vscode|cursor|wt|powershell|cmd|none`, `home=0|1|4|8|9|needs|long` (+ `hooks=0`
-`decision=1|main` `subs=two|asking|stopped|six`), `tools=claude,claude,cursor` (the tool of each home session) + `names=web,api,docs` (their folders), `fold=1`, `cells=`, `screen=<px>`, `usage=fresh|stale|reset|soon|old|warm|hot|worst|none|off`,
-`metrics=live|worst|wait|off`, `gpu=none`, `tab=shelf` (+ `hidden=` `order=`), `sessions=1`, `subagents=1`
+`decision=1|main` `subs=two|asking|stopped|six`), `tools=claude,claude,cursor` (the tool of each home session) + `names=web,api,docs` (their folders), `fold=1`, `screen=<px>`, `usage=fresh|stale|reset|soon|old|warm|hot|worst|none|off`,
+`cells=usage5h,usage7d,waiting|none`, `tab=shelf` (+ `hidden=` `order=`), `sessions=1`, `subagents=1`
 (+ `ask=question|none` `queued=1` `stop=early|real|silent|both|same` `ids=missing`), `phantoms=`, `quiet=<s>`, `step=read|run`, `asked=1`.
 
 ## Copy-paste links
@@ -106,5 +111,5 @@ node scripts/shot.mjs --set [name,name]  [--out dir]     # the set; --list print
 `--cli` uses the plain headless CLI with a virtual-time budget instead (less exact). `--base` or `$NOOK_DEV`
 points at another dev server; `--browser` or `$CHROME_PATH` at another executable. The set: `hero-dark`,
 `hero-light`, `dock-bottom`, `dock-left`, `dock-right`, `over-browser-tabs`, `over-editor`, `over-terminal`,
-`approval`, `approval-diff`, `question`, `session`, `home`, `shelf`, `folded-metrics(-light)`, `agents`.
+`approval`, `approval-diff`, `question`, `session`, `home`, `shelf`, `folded`, `agents`.
 Page errors are printed. For a transparent PNG use `scene=none&bg=transparent` with `--transparent`.

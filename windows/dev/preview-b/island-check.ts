@@ -1,14 +1,14 @@
 // A self-check of the folded island: what its slots show is a plain function
 // of the state (src/island/compact.ts `compactSlots`), and the island coming
 // back from hidden must show all of it at once — the bot awake, a dot per
-// session, every metric cell. There is no test runner on this side, so it is
+// session, every compact cell. There is no test runner on this side, so it is
 // checked here, where a preview page loads: the console says how many held,
 // and names each one that did not. Preview only.
 
 import { compactPlan, compactSlots, reading, type Gauges } from "../../src/island/compact";
 import {
-  FOLDED_AUTO_HIDE, State, USAGE_OLD_MS, USAGE_RESET_WORDS, USAGE_SOURCE_WORDS, foldedAutoHide, keepKnown, nextUsageReset, resetCountdown, usageShown,
-  type Metrics, type Usage,
+  FOLDED_AUTO_HIDE, State, USAGE_OLD_MS, USAGE_RESET_WORDS, USAGE_SOURCE_WORDS, foldedAutoHide, nextUsageReset, resetCountdown, usageShown,
+  type Usage,
 } from "../../src/core/state";
 import { IslandStateMachine, type FsmTimers } from "../../src/island/fsm";
 import {
@@ -39,40 +39,20 @@ function report(name: string, t: Tally) {
   return { passed: t.passed, failed: t.failed };
 }
 
-const GB = 1024 ** 3;
-
-/** The cells, and what a wake does to the numbers: plain functions, no island. */
+/** The current compact cells, as plain functions with no island. */
 export function checkSlots() {
   const t = tally();
-  const none: Gauges = { metrics: null, usage: null, waiting: 0 };
-  const sample: Metrics = { cpu: 31.4, gpu: 18, ramUsed: 8 * GB, ramTotal: 16 * GB };
+  const none: Gauges = { usage: null, waiting: 0 };
   const usage = { fiveHour: { usedPercent: 70, resetsAt: 0 }, sevenDay: { usedPercent: 12, resetsAt: 0 }, updatedAt: 0 };
 
-  // Nothing known: every cell is there, and says "—" (the count of sessions waiting is always known).
-  for (const kind of ["cpu", "gpu", "ram", "usage5h", "usage7d"] as const) t.same(`nothing known: ${kind}`, reading(kind, none).text, "—");
+  // Missing usage stays blank; the count of sessions waiting is always known.
+  for (const kind of ["usage5h", "usage7d"] as const) t.same(`nothing known: ${kind}`, reading(kind, none).text, "—");
   t.same("nothing known: waiting", reading("waiting", none).text, "0");
-  // `now: 0` is the moment the sample's usage was reported, so it is fresh; the tooltip is the source note (no reset time was said).
-  const known: Gauges = { metrics: sample, usage, waiting: 3, now: 0 };
-  t.same("cpu", reading("cpu", known).text, "31%");
-  t.same("ram", reading("ram", known), { text: "50%", more: "8.0 of 16.0 GB" });
+  // `now: 0` is the moment the usage was reported, so it is fresh.
+  const known: Gauges = { usage, waiting: 3, now: 0 };
   t.same("5-hour usage, coloured", reading("usage5h", known), { text: "70%", more: USAGE_SOURCE_WORDS, level: "warm", dim: false });
   t.same("7-day usage", reading("usage7d", known).text, "12%");
   t.same("waiting", reading("waiting", known).text, "3");
-
-  // The first sample after a wake has no processor and no graphics use: the last known stay.
-  const wake: Metrics = { cpu: null, gpu: null, ramUsed: 9 * GB, ramTotal: 16 * GB };
-  const kept = keepKnown(sample, wake);
-  t.same("after a wake the last CPU stays", [kept.cpu, kept.gpu, kept.ramUsed], [31.4, 18, 9 * GB]);
-  t.same("…and its cell is not blank", reading("cpu", { ...known, metrics: kept }).text, "31%");
-  // Once only: still missing on the sample after, it is not known any more.
-  const again = keepKnown(kept, wake);
-  t.same("a number missing twice is gone", [again.cpu, again.gpu], [null, null]);
-  // The very first sample of all: "—" for the processor, the memory at once.
-  const first = keepKnown(null, wake);
-  t.same("the first sample ever", [reading("cpu", { ...none, metrics: first }).text, reading("ram", { ...none, metrics: first }).text], ["—", "56%"]);
-  // A real reading always wins, and a machine with no graphics counters never gets one made up.
-  t.same("a reading replaces what was kept", keepKnown(kept, { ...sample, cpu: 5 }).cpu, 5);
-  t.same("no GPU stays no GPU", keepKnown({ ...sample, gpu: null }, wake).gpu, null);
 
   // The slots of the state as it is now: one dot per session on show, one cell per metric picked that fits.
   const plan = compactPlan();
@@ -375,14 +355,14 @@ export function checkUsage() {
   t.same("no usage", nextUsageReset(null, at), null);
 
   // The folded cell: the same state. Reset: "0%", dimmed, no colour of a level, the reason in its tooltip.
-  const cell = (now: number, updatedAt = at) => reading("usage5h", { metrics: null, usage: { ...usage, updatedAt }, waiting: 0, now });
+  const cell = (now: number, updatedAt = at) => reading("usage5h", { usage: { ...usage, updatedAt }, waiting: 0, now });
   t.same("cell, fresh", [cell(at).text, cell(at).level, cell(at).dim], ["83%", "warm", false]);
   t.same("cell, reset", [cell(win.resetsAt + 1).text, cell(win.resetsAt + 1).level, cell(win.resetsAt + 1).dim], ["0%", undefined, true]);
   t.check("cell, reset: the tooltip says so", (cell(win.resetsAt + 1).more ?? "").startsWith(USAGE_RESET_WORDS));
   t.check("cell, fresh: the tooltip has the countdown", (cell(at).more ?? "").startsWith("resets in 2h 14m"));
   t.same("cell, old but not reset: dimmed, its number kept", [cell(at + HOUR, at - 90 * MIN).text, cell(at + HOUR, at - 90 * MIN).dim], ["83%", true]);
   t.same("cell, ten minutes old: not dimmed", cell(at, at - 10 * MIN).dim, false);
-  t.same("the other window is its own", reading("usage7d", { metrics: null, usage, waiting: 0, now: win.resetsAt + 1 }).text, "12%");
+  t.same("the other window is its own", reading("usage7d", { usage, waiting: 0, now: win.resetsAt + 1 }).text, "12%");
   return report("usage", t);
 }
 
@@ -390,11 +370,11 @@ export function checkUsage() {
 function fakeClock(): { timers: FsmTimers; advance(seconds: number): void } {
   let now = 0;
   let ids = 0;
-  const due = new Map<number, { at: number; run: () => void }>();
+  const due = new Map<number, { at: number; fire: () => void }>();
   return {
     timers: {
       set(run, ms) {
-        due.set(++ids, { at: now + ms, run });
+        due.set(++ids, { at: now + ms, fire: run });
         return ids;
       },
       clear: (id) => void due.delete(id),
@@ -406,7 +386,7 @@ function fakeClock(): { timers: FsmTimers; advance(seconds: number): void } {
         if (!next) break;
         due.delete(next[0]);
         now = next[1].at;
-        next[1].run();
+        next[1].fire();
       }
       now = end;
     },
@@ -555,21 +535,15 @@ export function checkWake(island: Island) {
     cells: [...el.querySelectorAll(".ci-metric b")].map((b) => b.textContent ?? ""),
   });
   const bot = () => (island as unknown as { engine: { state: string } }).engine.state;
-  const before = State.metrics;
-  const hadCpu = before?.cpu != null;
-
   for (const how of ["hover", "work event"] as const) {
-    // A whole sample, as the island had while it was on show.
-    if (before) State.setMetrics({ cpu: before.cpu, gpu: before.gpu, ramUsed: before.ramUsed, ramTotal: before.ramTotal });
     island.fsm.forceHidden();
     t.same(`${how}: hidden`, State.mode, "hidden");
-    // What Rust sends first after a wake: memory, and no processor use yet.
+    // The same usage snapshot remains available after the island wakes.
     if (how === "hover") island.fsm.mouseEntered();
     else island.reveal();
-    if (State.metrics) State.setMetrics({ cpu: null, gpu: null, ramUsed: State.metrics.ramUsed, ramTotal: State.metrics.ramTotal });
 
     const plan = compactPlan();
-    const slots = compactSlots(plan, { metrics: State.metrics, usage: State.usage, waiting: waitingCount() });
+    const slots = compactSlots(plan, { usage: State.usage, waiting: waitingCount() });
     const now = drawn();
     t.same(`${how}: folded again`, State.mode, "compact");
     t.check(`${how}: the slots are on show`, now.on);
@@ -577,8 +551,6 @@ export function checkWake(island: Island) {
     t.check(`${how}: dots there when sessions are`, plan.live.length === 0 || (!now.dotsHidden && (now.dots > 0 || slots.more != null)));
     t.same(`${how}: every metric cell, with its number`, now.cells, slots.cells.map((c) => c.text));
     t.same(`${how}: as many cells as were picked and fit`, now.cells.length, plan.kinds.length);
-    const cpuAt = plan.kinds.indexOf("cpu");
-    if (hadCpu && cpuAt >= 0) t.check(`${how}: the CPU cell keeps its last number`, now.cells[cpuAt] !== "—");
     const { live } = roster();
     t.same(`${how}: the bot wears the most urgent session's state`, bot(), overallState(live));
     t.check(`${how}: the bot is not asleep with sessions or hooks`, bot() !== "sleeping" || (live.length === 0 && !State.settings.hooksInstalled));

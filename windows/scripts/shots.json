@@ -23,7 +23,7 @@
         "README.md"
       ],
       "out": "hero",
-      "alt": "Nook open on the Home view at 125% scaling: three agents, two from Claude Code and one from Cursor, with CPU, GPU, RAM and Claude usage beside them.",
+      "alt": "Nook open on the Home view at 125% scaling: three agents, two from Claude Code and one from Cursor, with Claude 5-hour and 7-day usage beside them.",
       "notes": "The whole desktop at 125 % Windows scaling, island open on Home with three sessions: web working, api needs permission, docs (Cursor) done."
     },
     {
@@ -41,7 +41,7 @@
         "README.md"
       ],
       "out": "island-home",
-      "alt": "The Nook island open on Home: a session card that needs permission, the working and done sessions, and CPU, GPU, RAM and Claude usage.",
+      "alt": "The Nook island open on Home: a session card that needs permission, the working and done sessions, and Claude usage.",
       "notes": "The island alone, with 40 px around it."
     },
     {
@@ -57,8 +57,8 @@
         "guides/first-run#tour"
       ],
       "out": "folded",
-      "alt": "The Nook island folded to a small pill: the character, a dot for each session, and the CPU, GPU, RAM and Claude usage readings.",
-      "notes": "The compact (folded) island alone with its metrics."
+      "alt": "The Nook island folded to a small pill: the character, a dot for each session, and Claude usage cells.",
+      "notes": "The compact (folded) island alone with its Claude usage cells."
     },
     {
       "id": "over-browser-tabs",

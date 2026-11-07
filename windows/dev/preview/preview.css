@@ -507,11 +507,6 @@ body {
   white-space: nowrap;
 }
 
-/* "100%" fits; "—" sits in the same cell. */
-.res-value.cpu {
-  width: 34px;
-}
-
 .res-value.blank {
   color: var(--dim-4);
 }
@@ -523,26 +518,6 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.res-spark {
-  flex: 1 1 0;
-  min-width: 0;
-  height: 14px;
-}
-
-.res-spark .line {
-  fill: none;
-  stroke: #cfe0f5;
-  stroke-width: 1.2;
-  stroke-linejoin: round;
-  stroke-linecap: round;
-  vector-effect: non-scaling-stroke;
-  opacity: 0.85;
-}
-
-.res-spark .area {
-  fill: rgba(207, 224, 245, 0.12);
 }
 
 .res-bar {

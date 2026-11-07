@@ -13,6 +13,7 @@ import "./preview-b/controls.css";
 import "./preview-b/settings-preview.css";
 import { NOTCH_H, ROUNDED_CORNER, botPosition } from "../src/core/layout";
 import { BOT_THEMES, type BotTheme } from "../src/bot/engine";
+import type { CompactMetric } from "../src/core/state";
 import { clear, h } from "../src/views/dom";
 import { ICONS } from "../src/views/icons";
 import { mountBot, startBots } from "./preview/bots";
@@ -66,7 +67,7 @@ function remember() {
 
 // ── The made-up preferences ───────────────────────────────────────────────────
 
-type MetricId = "cpu" | "ram" | "usage5" | "usage7" | "waiting" | "gpu";
+type MetricId = CompactMetric;
 const AUTO_CLOSE = ["3", "5", "10", "15", "30", "custom"] as const;
 
 const prefs = {
@@ -78,7 +79,7 @@ const prefs = {
   autostart: false,
   botTheme: "cream" as BotTheme,
   /** The metrics chosen, in the order the island shows them. */
-  metrics: ["cpu", "ram", "usage5"] as MetricId[],
+  metrics: ["usage5h"] as MetricId[],
   shelfOrder: [...DEFAULT_ORDER],
   shelfHidden: new Set<WidgetId>(),
 };
@@ -628,18 +629,13 @@ interface MetricDef {
   /** The cell's fixed width in the island, as compact-preview.ts has it. */
   width: number;
   value: string;
-  later?: boolean;
 }
 
 const METRICS: Record<MetricId, MetricDef> = {
-  cpu: { name: "CPU", icon: UI_ICONS.cpu, width: 50, value: "31%" },
-  ram: { name: "RAM", icon: UI_ICONS.ram, width: 66, value: "11.2 GB" },
-  usage5: { name: "5-hour usage", icon: UI_ICONS.gauge, width: 50, value: "38%" },
-  usage7: { name: "7-day usage", icon: UI_ICONS.week, width: 50, value: "12%" },
-  waiting: { name: "Sessions waiting", icon: ICONS.bell, width: 36, value: "1" },
-  gpu: { name: "GPU", icon: UI_ICONS.gpu, width: 50, value: "" },
+  usage5h: { name: "5-hour usage", icon: UI_ICONS.gauge, width: 52, value: "38%" },
+  usage7d: { name: "7-day usage", icon: UI_ICONS.week, width: 52, value: "12%" },
+  waiting: { name: "Sessions waiting", icon: ICONS.bell, width: 38, value: "1" },
 };
-METRICS.gpu.later = true;
 const METRIC_IDS = Object.keys(METRICS) as MetricId[];
 
 // The compact island's fixed slots (dev/compact-preview.ts): bot · session dots · metrics.
@@ -682,14 +678,6 @@ const islandPreview = (() => {
     el.querySelector(".sp-desk")!.setAttribute("aria-label", `Preview of the folded island: ${words.textContent}`);
   };
   update(false);
-
-  // A sampled value moves, as it will on the island: the cell's width does not.
-  const cpu = ["31%", "34%", "28%", "47%", "39%", "100%", "36%"];
-  let tick = 0;
-  window.setInterval(() => {
-    const cell = cells.querySelector('[data-id="cpu"] b');
-    if (cell) cell.textContent = cpu[++tick % cpu.length];
-  }, 2500);
 
   return { el, update };
 })();
@@ -738,11 +726,7 @@ const metricPicker = (() => {
       h("i", { class: "box" }, icon(ICONS.check, 12, 3)),
       h("i", { class: "glyph" }, icon(m.icon, 16)),
       h("span", { class: "name", text: m.name }),
-      m.later ? h("span", { class: "sp-tag", text: "Later" }) : h("span", { class: "sample", text: m.value }));
-    if (m.later) {
-      check.disabled = true;
-      check.title = "Needs a different API per graphics vendor: not in the first version.";
-    }
+      h("span", { class: "sample", text: m.value }));
     check.addEventListener("click", () => {
       if (prefs.metrics.includes(id)) {
         prefs.metrics = prefs.metrics.filter((x) => x !== id);
@@ -835,7 +819,7 @@ function islandSection(): Kid[] {
     ...title("Island", "What the folded island shows beside the bot and the session dots."),
     islandPreview.el,
     h("section", { class: "sp-group", style: "margin-top:14px" },
-      h("h2", { class: "sp-group-label" }, "Metrics", metricPicker.count),
+      h("h2", { class: "sp-group-label" }, "Compact cells", metricPicker.count),
       metricPicker.list,
       metricPicker.refusal,
       h("p", { class: "sp-note", text: "Up to three, in the order shown: drag a chosen one to move it. With none, the island is narrower." })),

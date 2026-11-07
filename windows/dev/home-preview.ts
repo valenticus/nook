@@ -23,8 +23,8 @@ import {
 
 /**
  * How tall the island is for the home view. Today's overview is 160 and the
- * session panel 320 (VIEW_LAYOUTS); three columns with a bot, a row of minis
- * and five lines of resources need something between the two.
+ * session panel 320 (VIEW_LAYOUTS); the bot, session lanes and Claude usage
+ * need something between the two.
  */
 const HOME_H = 248;
 /** The island's entrance curve (.view.on in style.css): what moves, moves like this. */
@@ -33,9 +33,6 @@ const SPRING = "cubic-bezier(0.3, 1.2, 0.4, 1)";
 const EXPAND = "M4 9V4h5M20 15v5h-5M4 4l6 6M20 20l-6-6";
 const MAIN_BOT = 58;
 const MINI_BOT = 22;
-const CPU_SAMPLE_MS = 2500;
-const CPU_POINTS = 24;
-const RAM_TOTAL_GB = 16;
 
 // ── State of the preview ──────────────────────────────────────────────────────
 
@@ -43,7 +40,6 @@ let sessions: FakeSession[] = fakeSessions(4);
 let hooksMissing = false;
 let usage: FakeUsage | null = fakeUsage(2);
 let noUsageReason = 0;
-const cpu: number[] = [];
 let hoverId: string | null = null;
 let listOpen = false;
 /** Where each session stood last time: nothing reshuffles in a group under the pointer. */
@@ -87,11 +83,7 @@ const sessionsCard = h("div", { class: "card home-sessions" }, laneRow, empty, f
 laneRow.addEventListener("pointerenter", () => { pointerInRow = true; });
 laneRow.addEventListener("pointerleave", () => { pointerInRow = false; render(); });
 
-// Resources: every line is built once and only its words change, so nothing moves.
-const cpuValue = h("span", { class: "res-value cpu", text: "—" });
-const cpuSpark = sparkline();
-const ramValue = h("span", { class: "res-value" });
-const ramFill = h("i");
+// Claude usage rows are built once; only their values and countdowns change.
 const usageRows = (["5 h", "7 d"] as const).map((label) => {
   const resets = h("span", { class: "res-sub" });
   const value = h("span", { class: "res-value" });
@@ -108,10 +100,6 @@ const usageBox = h("div", { class: "res-usage" }, usageRows[0].el, usageRows[1].
 const usageAge = h("div", { class: "res-age" });
 const resCard = h(
   "div", { class: "card home-res" },
-  h("div", { class: "res-row" }, h("div", { class: "res-head" }, h("b", { text: "CPU" }), cpuSpark.el, cpuValue)),
-  h("div", { class: "res-row" },
-    h("div", { class: "res-head" }, h("b", { text: "RAM" }), h("span", { class: "grow" }), ramValue),
-    h("div", { class: "res-bar" }, ramFill)),
   h("div", { class: "lane-h", text: "Claude usage" }),
   usageBox,
   usageAge,
@@ -418,34 +406,6 @@ document.addEventListener("keydown", (e) => {
 
 // ── Resources ─────────────────────────────────────────────────────────────────
 
-function sparkline() {
-  const NS = "http://www.w3.org/2000/svg";
-  const el = document.createElementNS(NS, "svg");
-  el.setAttribute("viewBox", `0 0 ${CPU_POINTS - 1} 14`);
-  el.setAttribute("preserveAspectRatio", "none");
-  el.setAttribute("class", "res-spark");
-  const area = document.createElementNS(NS, "path");
-  area.setAttribute("class", "area");
-  const line = document.createElementNS(NS, "path");
-  line.setAttribute("class", "line");
-  el.append(area, line);
-  return {
-    el,
-    draw(values: number[]) {
-      if (values.length < 2) {
-        // Nothing measured yet: a flat line where the trace will be.
-        line.setAttribute("d", `M0 13H${CPU_POINTS - 1}`);
-        area.setAttribute("d", "");
-        return;
-      }
-      const x0 = CPU_POINTS - values.length;
-      const pts = values.map((v, i) => `${x0 + i} ${(13 - (v / 100) * 12).toFixed(1)}`);
-      line.setAttribute("d", `M${pts.join("L")}`);
-      area.setAttribute("d", `M${x0} 14L${pts.join("L")}L${CPU_POINTS - 1} 14Z`);
-    },
-  };
-}
-
 /** "2h 14m", "3d 4h": until a limit's window starts again. */
 function until(ms: number): string {
   const minutes = Math.max(0, Math.round(ms / 60_000));
@@ -458,15 +418,6 @@ function until(ms: number): string {
 const usageColor = (percent: number) => (percent >= 90 ? COLOR.red : percent >= 70 ? COLOR.amber : COLOR.blue);
 
 function renderResources() {
-  // CPU needs two samples: "—" in the same cell until the first real one.
-  cpuValue.textContent = cpu.length ? `${Math.round(cpu[cpu.length - 1])}%` : "—";
-  cpuValue.classList.toggle("blank", cpu.length === 0);
-  cpuSpark.draw(cpu);
-
-  const used = 11.2;
-  ramValue.textContent = `${used.toFixed(1)} / ${RAM_TOTAL_GB.toFixed(1)} GB`;
-  ramFill.style.width = `${(used / RAM_TOTAL_GB) * 100}%`;
-
   const windows = usage ? [usage.fiveHour, usage.sevenDay] : [];
   usageRows.forEach((row, i) => {
     const w = windows[i];
@@ -488,14 +439,6 @@ function renderResources() {
   usageAge.classList.toggle("stale", stale);
   usageAge.textContent = !usage ? "" : age < 60_000 ? "updated just now" : `updated ${span(age)} ago`;
 }
-
-// The metrics thread's first reading comes one interval after the island shows.
-window.setInterval(() => {
-  const last = cpu.length ? cpu[cpu.length - 1] : 31;
-  cpu.push(Math.max(4, Math.min(96, last + (Math.random() - 0.5) * 22)));
-  if (cpu.length > CPU_POINTS) cpu.shift();
-  renderResources();
-}, CPU_SAMPLE_MS);
 
 // Time passing on its own: a session that reaches its fade time leaves without a click.
 let fadedKey = "";

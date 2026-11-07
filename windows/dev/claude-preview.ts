@@ -12,12 +12,12 @@
 //   Stage:    scene=desktop|browser|editor|terminal|none   theme=dark|light   taskbar=bottom|top|hidden
 //             dock=top|bottom|left|right   time=HH:MM (10:09)   date=text   bg=#rrggbb|transparent (scene=none)
 //             w=, h=  the display's size in px (default: the window)   scale=1.25 (alias zoom)  display scale
-//             seed=n  the made-up CPU/GPU numbers      motion=reduce|full
+//             motion=reduce|full
 //   Tooling:  ui=1 opens the sidebar   toggle=0 hides its corner button
 //             shot=1 capture mode: no sidebar/button/cursor/hover, springs jumped, numbers frozen; sets
 //             <html data-ready="1"> and window.__shotReady when settled (shot wins over ui)
 //   Scenario: view=overview|session|question|approval|finished   home=0|1|4|8|9|needs|long   fold=1   tab=shelf
-//             target=claude|vscode|cursor|wt|powershell|cmd|none   usage=   metrics=   subs=   subagents=1 ...
+//             target=claude|vscode|cursor|wt|powershell|cmd|none   usage=   cells=   subs=   subagents=1 ...
 //             (each is described where it is read, below; the sidebar lists the usual ones)
 
 import "../src/style.css";
@@ -28,7 +28,7 @@ import { Island } from "../src/island/island";
 import { Sound } from "../src/core/sound";
 import { EXAMPLE_REPLY, LONG_REPLY } from "./preview-b/session-data";
 import { checkAutoHide, checkShelfSwipe, checkSlots, checkSwipe, checkUsage, checkWake } from "./preview-b/island-check";
-import { finishStage, installStage, placeIsland, rng } from "./stage";
+import { finishStage, installStage, placeIsland } from "./stage";
 
 const params = new URLSearchParams(location.search);
 // The stage's layers, before the island: it sizes itself by the window it finds.
@@ -587,16 +587,13 @@ if (params.has("subagents") && (view === "question" || view === "approval")) {
 //   usage=fresh|stale|none|off  Claude's usage: 2 min old, 14 min old (not dimmed), never arrived, not switched on;
 //   usage=reset|soon|old        the 5-hour window's reset has passed ("reset, waiting for new data"), passes in
 //                               20 s (watch it happen), or the numbers are 3 hours old (dimmed);
-//   usage=warm|hot|worst        the 5-hour window at 70 %, at 95 %, both windows used up; gpu=none: no GPU reported
-//   metrics=live|worst|wait|off the machine: a sample every 2.5 s (the first with no CPU), the worst each cell
-//                               can say, CPU never measured, no sample at all
-//   cells=cpu,gpu,ram,usage5h,usage7d,waiting|none   the folded island's cells
+//   usage=warm|hot|worst        the 5-hour window at 70 %, at 95 %, both windows used up
+//   cells=usage5h,usage7d,waiting|none   the folded island's compact cells
 //   fold=1                      folded; screen=800: the display's width, for the cap
 //   (light=1 and zoom=1.25 still work: they are theme=light and scale=1.25 of the stage)
 // From the console: ff(minutes) moves every session at rest that far back, wake() puts a finished one
-// back to work, usage("stale"), metricsTick().
+// back to work, usage("stale").
 const MIN = 60_000;
-const GB = 1024 ** 3;
 
 const fakeUsage = (kind: string): Usage | null => {
   if (kind === "none" || kind === "off") return null;
@@ -615,23 +612,6 @@ const usage = (kind = "fresh") => {
   State.usageInstalled = kind !== "off";
   State.setUsage(fakeUsage(kind));
   State.notify();
-};
-
-const metricsMode = params.get("metrics") ?? "live";
-let sampled = 0;
-let cpu = 31;
-let gpu = 18;
-// `seed=n` (a capture's default is 1) makes the CPU and GPU walk the same every time.
-const random = stage.options.seed != null || stage.options.shot ? rng(stage.options.seed ?? 1) : Math.random;
-const metricsTick = () => {
-  if (metricsMode === "off") return;
-  if (metricsMode === "worst") return State.setMetrics({ cpu: 100, gpu: 100, ramUsed: 16 * GB, ramTotal: 16 * GB });
-  cpu = Math.max(4, Math.min(96, cpu + (random() - 0.5) * 22));
-
-  gpu = Math.max(0, Math.min(100, gpu + (random() - 0.5) * 16));
-  // CPU and GPU take two readings: the first sample after the island shows has neither. gpu=none: a machine that reports none.
-  const first = metricsMode === "wait" || sampled++ === 0;
-  State.setMetrics({ cpu: first ? null : cpu, gpu: first || params.get("gpu") === "none" ? null : gpu, ramUsed: 11.2 * GB, ramTotal: 15.9 * GB });
 };
 
 interface HomeSpec { cwd: string; state: string; doing: string; minutes: number; seen?: boolean; reply?: string }
@@ -743,7 +723,7 @@ const wake = () => {
   handleHook(island, { ...of, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "npm test" } });
   return session.project;
 };
-Object.assign(window, { ff, wake, usage, metricsTick, Display });
+Object.assign(window, { ff, wake, usage, Display });
 
 if (params.has("home")) {
   // The session the page opened on gives way to the made-up ones.
@@ -774,15 +754,11 @@ if (params.has("home")) {
   State.present();
 }
 
-if (params.has("home") || params.has("fold") || params.has("metrics") || params.has("usage") || params.has("cells")) {
+if (params.has("home") || params.has("fold") || params.has("usage") || params.has("cells")) {
   const cells = params.get("cells");
   if (cells != null) State.settings.compactMetrics = cells === "none" ? [] : cells.split(",");
   if (params.has("screen")) island.setScreenWidth(Number(params.get("screen")) || 1920);
   usage(params.get("usage") ?? "fresh");
-  metricsTick();
-  // A capture takes the second sample at once (the first has no CPU) and keeps it: nothing moves after.
-  if (stage.options.shot) metricsTick();
-  else window.setInterval(metricsTick, 2500);
   // The folded island stays to be looked at: it does not retract a minute later.
   island.fsm.petitToHiddenDelay = 86_400;
   State.isPinned = true;

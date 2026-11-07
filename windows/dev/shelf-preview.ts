@@ -231,8 +231,6 @@ function buildHome(): HTMLElement {
           h("span", { text: "2 need you" }))),
       mid,
       h("div", { class: "card home-right" },
-        meter("CPU", "31%", 0.31, "#3B9EFF"),
-        meter("RAM", "11/16", 0.69, "#8B5CF6"),
         meter("5 h", "38%", 0.38, "#34D399"),
         meter("7 d", "12%", 0.12, "#34D399"),
         h("div", { class: "home-age", text: "usage updated 2 min ago" }))));

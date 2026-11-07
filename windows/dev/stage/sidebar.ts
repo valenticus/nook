@@ -176,10 +176,8 @@ export function mountSidebar(initial: StageOptions, host: SidebarHost) {
   seg(island, "Opens in", "target", [["claude", "Claude app"], ["vscode", "VS Code"], ["cursor", "Cursor"], ["wt", "Terminal"], ["powershell", "PowerShell"], ["cmd", "cmd"], ["none", "Nowhere"]]);
   check(island, "Folded", "fold", "1", null);
   seg(island, "Usage", "usage", [["fresh", "Fresh"], ["warm", "70 %"], ["hot", "95 %"], ["worst", "Used up"], ["none", "None"]]);
-  seg(island, "Metrics", "metrics", [["live", "Live"], ["worst", "Worst"], ["wait", "No CPU"], ["off", "Off"]]);
   seg(island, "Motion", "motion", [["full", "Full"], ["reduce", "Reduced"]]);
   seg(island, "Display", "scale", [["1", "100 %"], ["1.25", "125 %"], ["1.5", "150 %"], ["2", "200 %"]]);
-  text(island, "Seed", "seed", "1", "70px");
 
   // Scene
   const scene = group("Scene");
