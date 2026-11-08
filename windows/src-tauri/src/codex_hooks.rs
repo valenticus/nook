@@ -123,7 +123,7 @@ fn ours_in(groups: &[Value]) -> Vec<&Value> {
 /// One event's groups without Nook's hooks: a group that held nothing else
 /// goes, and everything that is somebody else's stays as it was.
 fn without_ours(groups: &[Value]) -> Vec<Value> {
-    without_selected(groups, |hook| is_ours(hook))
+    without_selected(groups, is_ours)
 }
 
 fn without_selected(groups: &[Value], selected: impl Fn(&Value) -> bool) -> Vec<Value> {

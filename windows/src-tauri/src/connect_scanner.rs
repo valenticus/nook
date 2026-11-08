@@ -490,9 +490,11 @@ fn collect_hooks(candidate: &Candidate, path: &str, value: &Value, out: &mut Vec
     }
 }
 
+/// Per agent, event and relay: the config files that carry it (lower-cased path -> scope and path as written).
+type RelayGroups = BTreeMap<(Agent, String, String), BTreeMap<String, (Scope, String)>>;
+
 fn find_duplicates(hooks: &[HookRecord]) -> Vec<DuplicateEvent> {
-    let mut groups: BTreeMap<(Agent, String, String), BTreeMap<String, (Scope, String)>> =
-        BTreeMap::new();
+    let mut groups: RelayGroups = BTreeMap::new();
     for hook in hooks {
         if !matches!(
             hook.ownership,
@@ -629,7 +631,7 @@ fn standalone_relay_path() -> PathBuf {
     // and runtime metadata. This avoids reconstructing LOCALAPPDATA separately.
     #[cfg(feature = "nook-standalone")]
     {
-        return crate::settings::hook_exe_path();
+        crate::settings::hook_exe_path()
     }
     #[cfg(not(feature = "nook-standalone"))]
     {
