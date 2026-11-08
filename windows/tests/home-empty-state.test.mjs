@@ -12,5 +12,7 @@ test("Home does not infer hook installation from an empty session list", () => {
 test("Home uses neutral Claude Code and Codex copy, with an explicit Dev limitation", () => {
   assert.match(source, /Claude Code and Codex sessions/);
   assert.match(source, /This Dev build does not inspect or install global agent integrations/);
-  assert.match(source, /if \(!State\.nookDev\).*openSettingsWindow/s);
+  // Dev never offers Settings; the other builds only when a check has found something to act on
+  // (core/integration-health.ts), never merely because no session is running.
+  assert.match(source, /if \(!State\.nookDev && phaseNeedsSettings\(phase\)\).*openSettingsWindow/s);
 });

@@ -644,15 +644,17 @@ fn same_connect_revision(
 
 #[tauri::command]
 fn connect_apply(
+    app: AppHandle,
     preview_id: String,
     confirmed: bool,
     approved_dev_scopes: Vec<String>,
     codex_trust_approved: bool,
     original_migration_approved: bool,
-    store: State<shelf::Store>,
-    tickets: State<connect_plan::PreviewTicket>,
 ) -> Result<Vec<String>, String> {
     ensure_connect_apply_allowed()?;
+    // The two managed states, taken from the handle (the command is already at the argument limit).
+    let store = app.state::<shelf::Store>();
+    let tickets = app.state::<connect_plan::PreviewTicket>();
     if !confirmed {
         return Err("Connect changes require explicit confirmation.".into());
     }
@@ -682,7 +684,17 @@ fn connect_apply(
                 .into(),
         );
     }
-    connect_plan::apply_preview(&reviewed, codex_trust_approved, None)
+    // `?`: a refused or failed apply returns here, before anything is announced.
+    let applied = connect_plan::apply_preview(&reviewed, codex_trust_approved, None)?;
+    // The files are written; tell the island, whose empty view reads the same inventory, to check
+    // again now rather than at its next throttled look. Connect and Disconnect alike. Read-only
+    // on the island's side: it only scans.
+    let _ = app.emit_to(
+        island::WINDOW_LABEL,
+        "integrations-changed",
+        format!("{:?}", reviewed.operation),
+    );
+    Ok(applied)
 }
 
 // ── Claude Code hooks ─────────────────────────────────────────────────────────

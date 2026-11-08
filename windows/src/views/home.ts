@@ -14,6 +14,7 @@ import { createStateBot, releaseMiniBot, restMiniBot } from "../bot/minibots";
 import { hexToRGB, type BotEngine } from "../bot/engine";
 import { homeContentSize, HOME_SIDE_BOT_H, HOME_SIDE_SESSIONS_H, HOME_STAGE, MAX_VISIBLE, washRGBA, type BotStateName, type Wash } from "../core/layout";
 import { DECISION_WORDS, State } from "../core/state";
+import { integrationHealth, phaseNeedsSettings } from "../core/integration-health";
 import { currentLanguage, message, plural } from "../core/i18n";
 import { shelfTrace } from "../core/shelf-trace";
 import {
@@ -359,7 +360,11 @@ export function buildHome(actions: ViewActions): ViewHost {
     setHiddenIfChanged(empty, !none);
     setHiddenIfChanged(laneRow, none);
     setHiddenIfChanged(foot, none);
-    const key = none ? `${tracked}:${State.nookDev}` : "";
+    // The way to Settings is for a confirmed problem only. Idle is not a problem, and neither is
+    // a check that has not finished or found nothing out (core/integration-health.ts).
+    const phase = State.nookDev ? "unknown" : integrationHealth.phase;
+    if (none && tracked === 0) void integrationHealth.verify();
+    const key = none ? `${tracked}:${State.nookDev}:${phase}` : "";
     if (key === emptyKey) return;
     emptyKey = key;
     clear(empty);
@@ -387,7 +392,7 @@ export function buildHome(actions: ViewActions): ViewHost {
       empty.append(h("div", { class: "sub", text: message(State.nookDev
         ? "This Dev build does not inspect or install global agent integrations. Only events sent to Nook Dev appear here."
         : "Nook displays Claude Code and Codex sessions when their integrations report activity.") }));
-      if (!State.nookDev) empty.append(h("button", { class: "btn secondary", onclick: () => actions.openSettingsWindow() }, svg(ICONS.gear, 12), message("Check integrations in Settings")));
+      if (!State.nookDev && phaseNeedsSettings(phase)) empty.append(h("button", { class: "btn secondary", onclick: () => actions.openSettingsWindow() }, svg(ICONS.gear, 12), message("Check integrations in Settings")));
     }
   }
 

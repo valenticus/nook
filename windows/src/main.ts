@@ -4,6 +4,8 @@ import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { Bridge, IS_TAURI, onEvent, type BootInfo, type PanelSize } from "./core/bridge";
 import { RoomKeeper, readWithRetry } from "./core/room-sync";
+import { integrationHealth } from "./core/integration-health";
+import { refreshConnectScan } from "./core/connect-runtime";
 import { enableShelfTraceSource, shelfTrace } from "./core/shelf-trace";
 import { Reply } from "./core/reply";
 import { Sound } from "./core/sound";
@@ -115,6 +117,12 @@ async function main() {
   // never said what it is, ask again — it sends no event for a size that did
   // not change — and, failing that, take the window the page finds itself in.
   island.onViewportChange = () => roomKeeper.windowResized();
+  // Whether the integrations are set up is checked now, at start-up, without Settings being opened: the
+  // empty view must not guess from "no sessions". The answer redraws it as soon as it comes. The scan is
+  // the read-only inventory Settings → Connect shows (core/integration-health.ts).
+  integrationHealth.configure(State.nookDev ? "Dev" : State.nookStandalone ? "Standalone" : "Original", refreshConnectScan);
+  integrationHealth.subscribe(() => State.notify());
+  void integrationHealth.verify({ force: true });
   if (boot) {
     roomKeeper.offer(boot);
     State.notify();
@@ -203,6 +211,10 @@ async function main() {
   });
 
   await onEvent<null>("screen-changed", () => void Bridge.reposition());
+
+  // Connect or Disconnect was applied in Settings (Rust sends this only after the files are written):
+  // the empty view checks the integrations again now, past the throttle.
+  await onEvent<string>("integrations-changed", () => void integrationHealth.configurationChanged());
 
   // The window was hidden by the shortcut or the tray, and is on show again (Rust, visibility.rs).
   await onEvent<boolean>("island-shown", (shown) => {
