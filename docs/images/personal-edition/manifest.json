@@ -1,0 +1,128 @@
+[
+  {
+    "id": "approval-diff",
+    "variant": "dark",
+    "file": "approval-diff-dark.webp",
+    "width": 1100,
+    "height": 550,
+    "bytes": 30092,
+    "alt": "An edit request in the island with the changed lines shown as a diff, removed lines in red and added lines in green."
+  },
+  {
+    "id": "approval-diff",
+    "variant": "light",
+    "file": "approval-diff-light.webp",
+    "width": 1100,
+    "height": 550,
+    "bytes": 30746,
+    "alt": "An edit request in the island with the changed lines shown as a diff, removed lines in red and added lines in green."
+  },
+  {
+    "id": "compact-claude",
+    "variant": "dark",
+    "file": "compact-claude-dark.webp",
+    "width": 610,
+    "height": 135,
+    "bytes": 5036,
+    "alt": "The folded Nook island showing Claude's 5-hour and 7-day usage next to the dots of three sessions."
+  },
+  {
+    "id": "compact-claude",
+    "variant": "light",
+    "file": "compact-claude-light.webp",
+    "width": 610,
+    "height": 135,
+    "bytes": 5038,
+    "alt": "The folded Nook island showing Claude's 5-hour and 7-day usage next to the dots of three sessions."
+  },
+  {
+    "id": "compact-codex",
+    "variant": "dark",
+    "file": "compact-codex-dark.webp",
+    "width": 610,
+    "height": 135,
+    "bytes": 4896,
+    "alt": "The folded Nook island showing Codex's 5-hour and 7-day usage next to the dots of three sessions."
+  },
+  {
+    "id": "compact-codex",
+    "variant": "light",
+    "file": "compact-codex-light.webp",
+    "width": 610,
+    "height": 135,
+    "bytes": 4916,
+    "alt": "The folded Nook island showing Codex's 5-hour and 7-day usage next to the dots of three sessions."
+  },
+  {
+    "id": "hero",
+    "variant": "dark",
+    "file": "hero-dark.webp",
+    "width": 2400,
+    "height": 1350,
+    "bytes": 82848,
+    "alt": "Nook open at 125% scaling on the Home view: Claude Code, Codex and Cursor sessions, both integrations connected, and the Claude and Codex 5-hour and 7-day usage limits."
+  },
+  {
+    "id": "hero",
+    "variant": "light",
+    "file": "hero-light.webp",
+    "width": 2400,
+    "height": 1350,
+    "bytes": 84708,
+    "alt": "Nook open at 125% scaling on the Home view: Claude Code, Codex and Cursor sessions, both integrations connected, and the Claude and Codex 5-hour and 7-day usage limits."
+  },
+  {
+    "id": "over-editor",
+    "variant": "dark",
+    "file": "over-editor-dark.webp",
+    "width": 1600,
+    "height": 575,
+    "bytes": 49940,
+    "alt": "A permission request for an edit in the Nook island, with the changed lines as a diff and Deny and Allow buttons, above a code editor."
+  },
+  {
+    "id": "over-editor",
+    "variant": "light",
+    "file": "over-editor-light.webp",
+    "width": 1600,
+    "height": 575,
+    "bytes": 51948,
+    "alt": "A permission request for an edit in the Nook island, with the changed lines as a diff and Deny and Allow buttons, above a code editor."
+  },
+  {
+    "id": "question",
+    "variant": "dark",
+    "file": "question-dark.webp",
+    "width": 1100,
+    "height": 499,
+    "bytes": 31912,
+    "alt": "A question from Claude Code in the island with the answer options as buttons."
+  },
+  {
+    "id": "question",
+    "variant": "light",
+    "file": "question-light.webp",
+    "width": 1100,
+    "height": 499,
+    "bytes": 31938,
+    "alt": "A question from Claude Code in the island with the answer options as buttons."
+  },
+  {
+    "id": "settings-connect",
+    "variant": "dark",
+    "file": "settings-connect-dark.webp",
+    "width": 912,
+    "height": 1144,
+    "bytes": 56074,
+    "alt": "Nook Settings on Connect: Claude Code and Codex both connected and receiving events, Claude usage connected through the status line, and Codex sessions and quota access turned on with 2% (5-hour) and 13% (7-day) used."
+  },
+  {
+    "id": "settings-connect",
+    "variant": "light",
+    "file": "settings-connect-light.webp",
+    "width": 912,
+    "height": 1144,
+    "bytes": 59836,
+    "alt": "Nook Settings on Connect: Claude Code and Codex both connected and receiving events, Claude usage connected through the status line, and Codex sessions and quota access turned on with 2% (5-hour) and 13% (7-day) used."
+  }
+]
