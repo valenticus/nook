@@ -224,6 +224,11 @@ pub fn bring_forward(_window: isize) -> bool {
 /// input region decides click-through (see the top of this file).
 pub const CURSOR_POLL: bool = false;
 
+/// Click-through is the input region here, not a window flag the poll could read back.
+pub fn ignore_cursor_events_applied(_win: &WebviewWindow) -> Option<bool> {
+    None
+}
+
 /// Full-screen apps are not detected on Linux: neither X11 nor a Wayland
 /// compositor is asked. The island behaves as if none were ever in front.
 pub fn fullscreen_in_front(_island: Option<&WebviewWindow>) -> bool {

@@ -14,7 +14,6 @@ use ::windows::core::{BOOL, PWSTR};
 use ::windows::Win32::Foundation::{
     CloseHandle, LocalFree, HANDLE, HLOCAL, HWND, LPARAM, POINT, RECT,
 };
-#[cfg(feature = "nook-dev")]
 use ::windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
 use ::windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -42,11 +41,11 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
     SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WindowFromPoint, CWP_SKIPDISABLED,
     CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE,
-    WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 #[cfg(feature = "nook-dev")]
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetTopWindow, GW_HWNDNEXT, WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    EnumChildWindows, GetTopWindow, GW_HWNDNEXT, WS_EX_LAYERED, WS_EX_TOPMOST,
 };
 
 use super::LocalTime;
@@ -228,13 +227,15 @@ fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
 }
 
 /// Read back the effective WS_EX_TRANSPARENT bit after Tao's queued window update.
-#[cfg(feature = "nook-dev")]
+/// The cursor poll decides click-through from this, not from what it last asked
+/// for: a request made from the poll thread is queued, and one made on the main
+/// thread (a resize, a show) is applied at once, so the two can land in either
+/// order and the last request is not necessarily the window's state.
 pub fn ignore_cursor_events_applied(win: &WebviewWindow) -> Option<bool> {
     let style = read_extended_style(hwnd_of(win)?)?;
     Some(style & WS_EX_TRANSPARENT.0 != 0)
 }
 
-#[cfg(feature = "nook-dev")]
 fn read_extended_style(hwnd: HWND) -> Option<u32> {
     unsafe {
         SetLastError(WIN32_ERROR(0));

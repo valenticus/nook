@@ -5,6 +5,7 @@ dist-standalone/
 target/
 target-nook-dev/
 /target-nook-standalone/
+/target-check-click/
 dev-release/
 standalone-release/
 release/
