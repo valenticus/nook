@@ -16,8 +16,10 @@ use ::windows::Win32::Foundation::{
 };
 use ::windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
 use ::windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+#[cfg(feature = "nook-dev")]
+use ::windows::Win32::Graphics::Gdi::ScreenToClient;
 use ::windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use ::windows::Win32::Security::{
     GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
@@ -36,16 +38,17 @@ use ::windows::Win32::UI::Shell::{
     QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, ChildWindowFromPointEx, EnumWindows, GetAncestor, GetClassNameW,
-    GetCursorPos, GetForegroundWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WindowFromPoint, CWP_SKIPDISABLED,
-    CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE,
-    WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+    GWL_STYLE, GW_OWNER, SW_RESTORE, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT,
 };
 #[cfg(feature = "nook-dev")]
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetTopWindow, GW_HWNDNEXT, WS_EX_LAYERED, WS_EX_TOPMOST,
+    ChildWindowFromPointEx, EnumChildWindows, GetParent, GetTopWindow, GW_HWNDNEXT,
+    CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, WS_EX_LAYERED, WS_EX_TOPMOST,
 };
 
 use super::LocalTime;

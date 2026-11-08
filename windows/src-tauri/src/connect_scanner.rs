@@ -768,6 +768,7 @@ pub fn record_real_delivery(tracker: &DeliveryTracker, payload: &Value, event: &
 
 /// Future event handling can attach real delivery observations without making
 /// filesystem state masquerade as proof that a hook ran.
+#[cfg(test)]
 pub fn record_delivery(scan: &mut ConnectScan, agent: Agent, event: &str, at_ms: u64) {
     if let Some(summary) = scan
         .agents

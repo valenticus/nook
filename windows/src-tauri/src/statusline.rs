@@ -360,6 +360,7 @@ fn project_status_line(root: &Path) -> Result<Option<ProjectStatusLine>, String>
     ))
 }
 
+#[cfg(test)]
 fn project_status_line_from_values(
     root: &Path,
     shared: Option<&Value>,

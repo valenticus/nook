@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 pub const APP_IDENTIFIER: &str = "io.github.valenticus.nook";
 pub const INSTALL_DIR_NAME: &str = "NookStandalone";
 pub const RELAY_FILE_NAME: &str = "nook-hook-standalone.exe";

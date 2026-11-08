@@ -162,11 +162,13 @@ pub(crate) fn without_ours_for_preview(existing: &Value) -> Value {
     without_ours(existing)
 }
 
+#[cfg(test)]
 fn entry_is_dev_command(hook: &Value) -> bool {
     hook.get("command")
         .and_then(Value::as_str)
         .is_some_and(command_is_dev)
 }
+#[cfg(test)]
 fn entry_is_ours_hook(hook: &Value) -> bool {
     hook.get("command")
         .and_then(Value::as_str)

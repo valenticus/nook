@@ -151,17 +151,6 @@ fn without_selected(groups: &[Value], selected: impl Fn(&Value) -> bool) -> Vec<
         .collect()
 }
 
-fn without_ours_for_connect(groups: &[Value], remove_dev: bool) -> Vec<Value> {
-    without_selected(groups, |hook| {
-        is_ours(hook)
-            && (remove_dev
-                || !hook
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(hooks::command_is_dev))
-    })
-}
-
 /// hooks.json as a JSON object: absent or blank is nothing, a BOM is let by,
 /// and comments, trailing commas or anything not an object are refused.
 pub(crate) fn parse(bytes: &[u8], path: &str) -> Result<Value, String> {
