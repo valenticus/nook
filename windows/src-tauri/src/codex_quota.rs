@@ -19,6 +19,11 @@ use tokio::time::timeout;
 use crate::platform;
 
 const MIN_REFRESH: Duration = Duration::from_secs(10 * 60);
+/// After a window's reset the server needs a moment to roll it over; one read is made this long after the reset.
+const RESET_GRACE: Duration = Duration::from_secs(5);
+/// The least the refresh loop sleeps. A read the spacing gate still refuses must never turn into a busy loop.
+const MIN_WAKE: Duration = Duration::from_secs(1);
+
 const SNAPSHOT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_PROTOCOL_LINE: usize = 1024 * 1024;
@@ -82,6 +87,80 @@ struct Cache {
     snapshot: Option<Snapshot>,
     fetched_at: Option<Instant>,
     failures: u32,
+    /// The last read failed for a reason a moment may cure: the next try is made after the backoff, not after the full refresh interval.
+    quick_retry: bool,
+    /// One follow-up read is due: a window that was there is missing from the last answer (after its
+    /// reset the server may not have rolled it over yet). Never more than one in a row.
+    chase: bool,
+    /// What the last read was logged as, so that only a change is written.
+    last_note: String,
+}
+
+/// 1, 2, 4 … minutes after consecutive failures, never more than half an hour.
+fn backoff(failures: u32) -> Duration {
+    Duration::from_secs((60u64.saturating_mul(1u64 << failures.min(5))).min(30 * 60))
+}
+
+/// A failure that waiting can cure. Not finding the CLI, or not being signed in, needs the user.
+fn retry_soon(reason: FailureReason) -> bool {
+    matches!(
+        reason,
+        FailureReason::Timeout
+            | FailureReason::ServerExited
+            | FailureReason::SpawnFailed
+            | FailureReason::ProtocolError
+            | FailureReason::QuotaUnavailable
+    )
+}
+
+/// Some window in the snapshot has already reset: what it says is of a window that is over.
+fn has_expired_window(snapshot: &Snapshot, now: u64) -> bool {
+    snapshot.quotas.as_ref().is_some_and(|quotas| {
+        [quotas.five_hour, quotas.seven_day]
+            .into_iter()
+            .flatten()
+            .any(|window| window.resets_at <= now)
+    })
+}
+
+/// How long to sleep before the next read.
+///
+/// The usual interval — unless a window is over, or is about to be. A reset is read once just after
+/// it (`RESET_GRACE`), but never sooner than the spacing between two reads allows (`spacing`: what
+/// `read_with_at` holds a read back for): a read that spacing would refuse is not worth waking for,
+/// and giving up on it would leave the new window missing for the whole usual interval. So the next
+/// attempt is at the earliest time BOTH permit it.
+///
+/// A window that is already over and not yet replaced is read as soon as the spacing allows. Once
+/// a read has replaced the snapshot, no such window is left, so this never turns into polling; and
+/// a reset still ahead only ever shortens a wait that is capped at the usual interval.
+fn reset_wait(
+    snapshot: Option<&Snapshot>,
+    now: u64,
+    since_read: Option<Duration>,
+    spacing: Duration,
+) -> Duration {
+    let Some(quotas) = snapshot.and_then(|snapshot| snapshot.quotas.as_ref()) else {
+        return MIN_REFRESH;
+    };
+    // When the spacing between two reads next allows one.
+    let spacing_left = since_read.map_or(Duration::ZERO, |since| spacing.saturating_sub(since));
+    let resets: Vec<u64> = [quotas.five_hour, quotas.seven_day]
+        .into_iter()
+        .flatten()
+        .map(|window| window.resets_at)
+        .collect();
+    if resets.iter().any(|at| *at <= now) {
+        return spacing_left.max(MIN_WAKE);
+    }
+    match resets.into_iter().min() {
+        Some(at) => Duration::from_millis(at - now)
+            .saturating_add(RESET_GRACE)
+            .max(spacing_left)
+            .max(MIN_WAKE)
+            .min(MIN_REFRESH),
+        None => MIN_REFRESH,
+    }
 }
 
 #[derive(Default)]
@@ -128,19 +207,67 @@ fn visible_snapshot(snapshot: &Snapshot, now: u64) -> Snapshot {
     visible
 }
 
-fn read_window(value: &Value, now: u64) -> Option<Window> {
+/// A window as the server sent it, or why it is not one. The reason is a fixed phrase — never a
+/// value — so that it can be logged.
+fn window_problem(value: &Value, now: u64) -> Result<Window, &'static str> {
     let used = value
-        .get("usedPercent")?
-        .as_f64()
-        .filter(|v| v.is_finite() && (0.0..=100.0).contains(v))?;
-    let duration = value.get("windowDurationMins")?.as_u64()?;
-    let resets_at = value.get("resetsAt")?.as_u64()?.checked_mul(1000)?;
-    let plausible = resets_at > now && resets_at <= now.saturating_add(35 * 24 * 60 * 60 * 1000);
-    plausible.then_some(Window {
+        .get("usedPercent")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite() && (0.0..=100.0).contains(v))
+        .ok_or("usedPercent missing, null or out of range")?;
+    let duration = value
+        .get("windowDurationMins")
+        .and_then(Value::as_u64)
+        .ok_or("windowDurationMins missing or null")?;
+    let resets_at = value
+        .get("resetsAt")
+        .and_then(Value::as_u64)
+        .and_then(|at| at.checked_mul(1000))
+        .ok_or("resetsAt missing or null")?;
+    if resets_at <= now {
+        return Err("resetsAt not in the future");
+    }
+    if resets_at > now.saturating_add(35 * 24 * 60 * 60 * 1000) {
+        return Err("resetsAt more than 35 days ahead");
+    }
+    Ok(Window {
         used_percent: used,
         window_duration_mins: duration,
         resets_at,
     })
+}
+
+fn read_window(value: &Value, now: u64) -> Option<Window> {
+    window_problem(value, now).ok()
+}
+
+/// What the answer's two windows were, in words, when one of them was not taken. Logged when it
+/// changes, so the next time the dash is up the log says why: no values, only the reasons.
+fn dropped_windows(root: &Value, now: u64) -> String {
+    let mut parts = Vec::new();
+    for name in ["primary", "secondary"] {
+        match root.get("rateLimits").and_then(|limits| limits.get(name)) {
+            None | Some(Value::Null) => parts.push(format!("{name}: absent")),
+            Some(window) => {
+                if let Err(reason) = window_problem(window, now) {
+                    parts.push(format!("{name}: {reason}"));
+                }
+            }
+        }
+    }
+    parts.join("; ")
+}
+
+fn note_dropped(root: &Value, now: u64) {
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let text = dropped_windows(root, now);
+    let mut last = LAST.lock().unwrap();
+    if *last != text {
+        if !text.is_empty() {
+            crate::log::line(format!("codex quota: window not taken ({text})"));
+        }
+        *last = text;
+    }
 }
 
 /// Select windows by their protocol duration rather than their object key/order.
@@ -412,8 +539,9 @@ where
             if message.get("error").is_some() {
                 return Err(failure_from_response(&message));
             }
-            return parse_rate_limits(message.get("result").unwrap_or(&Value::Null), now)
-                .ok_or(FailureReason::QuotaUnavailable);
+            let result = message.get("result").unwrap_or(&Value::Null);
+            note_dropped(result, now);
+            return parse_rate_limits(result, now).ok_or(FailureReason::QuotaUnavailable);
         }
         return Err(FailureReason::ProtocolError);
     }
@@ -598,6 +726,23 @@ impl Provider {
             })
     }
 
+    /// How long the refresh loop sleeps before it reads again (see `reset_wait`, `retry_soon`).
+    pub fn next_wait(&self) -> Duration {
+        let cache = self.cache.lock().unwrap();
+        if cache.quick_retry || cache.chase {
+            return backoff(cache.failures);
+        }
+        let since_read = cache
+            .fetched_at
+            .map(|at| Instant::now().saturating_duration_since(at));
+        reset_wait(
+            cache.snapshot.as_ref(),
+            now_ms(),
+            since_read,
+            backoff(cache.failures),
+        )
+    }
+
     async fn read_with_at<F>(&self, now: Instant, fetch_result: F) -> Snapshot
     where
         F: Future<Output = Result<Quotas, FailureReason>>,
@@ -614,12 +759,24 @@ impl Provider {
         }
         {
             let cache = self.cache.lock().unwrap();
-            let backoff = Duration::from_secs(
-                (60u64.saturating_mul(1u64 << cache.failures.min(5))).min(30 * 60),
-            );
+            let backoff = backoff(cache.failures);
+            // Asked again sooner than the usual interval: after a failure that a moment may cure,
+            // after a window that reset went missing, and once a window has reset (what is cached
+            // is then of a window that is over). The backoff still holds the pace.
+            let sooner = cache.quick_retry
+                || cache.chase
+                || cache
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| has_expired_window(snapshot, now_ms()));
+            let hold = if sooner {
+                backoff
+            } else {
+                MIN_REFRESH.max(backoff)
+            };
             if cache
                 .fetched_at
-                .is_some_and(|at| now.saturating_duration_since(at) < MIN_REFRESH.max(backoff))
+                .is_some_and(|at| now.saturating_duration_since(at) < hold)
             {
                 return cache
                     .snapshot
@@ -640,6 +797,27 @@ impl Provider {
         }
         match result {
             Ok(quotas) => {
+                // A window that was there and is not now: asked again once, soon.
+                let lost = cache
+                    .snapshot
+                    .as_ref()
+                    .and_then(|old| old.quotas.as_ref())
+                    .is_some_and(|old| {
+                        (old.five_hour.is_some() && quotas.five_hour.is_none())
+                            || (old.seven_day.is_some() && quotas.seven_day.is_none())
+                    });
+                cache.chase = lost && !cache.chase;
+                cache.quick_retry = false;
+                let yes_no = |window: &Option<Window>| if window.is_some() { "yes" } else { "no" };
+                let note = format!(
+                    "read ok, 5h={} 7d={}",
+                    yes_no(&quotas.five_hour),
+                    yes_no(&quotas.seven_day)
+                );
+                if cache.last_note != note {
+                    crate::log::line(format!("codex quota: {note}"));
+                    cache.last_note = note;
+                }
                 let snapshot = Snapshot {
                     generation,
                     quotas: Some(quotas),
@@ -655,6 +833,13 @@ impl Provider {
             }
             Err(reason) => {
                 cache.failures = cache.failures.saturating_add(1);
+                cache.quick_retry = retry_soon(reason);
+                cache.chase = false;
+                let note = format!("read failed, {reason:?}");
+                if cache.last_note != note {
+                    crate::log::line(format!("codex quota: {note}"));
+                    cache.last_note = note;
+                }
                 cache.fetched_at = Some(now);
                 let snapshot = cache
                     .snapshot
@@ -683,7 +868,7 @@ pub fn start(app: tauri::AppHandle) {
                 let snapshot = provider.read().await;
                 let _ = app.emit("codex-quota", snapshot);
             }
-            let _ = timeout(MIN_REFRESH, provider.wake.notified()).await;
+            let _ = timeout(provider.next_wait(), provider.wake.notified()).await;
         }
     });
 }
@@ -969,6 +1154,363 @@ mod tests {
         });
     }
 
+    // ── Lifecycle: resets, failures, and what is missing versus what is zero ──────────────────────
+
+    /// A snapshot as the provider holds it, with windows set relative to the real clock
+    /// (`read_with_at` judges expiry by it).
+    fn held(five_in_ms: Option<i64>, seven_in_ms: Option<i64>, five_used: f64) -> Snapshot {
+        let at = |delta: i64| (now_ms() as i64 + delta) as u64;
+        Snapshot {
+            generation: 0,
+            quotas: Some(Quotas {
+                five_hour: five_in_ms.map(|d| Window { used_percent: five_used, window_duration_mins: 300, resets_at: at(d) }),
+                seven_day: seven_in_ms.map(|d| Window { used_percent: 13.0, window_duration_mins: 10_080, resets_at: at(d) }),
+            }),
+            updated_at: Some(now_ms()),
+            stale: false,
+            available: true,
+            failure_reason: None,
+        }
+    }
+
+    fn provider_holding(snapshot: Snapshot, fetched_ago: Duration) -> Provider {
+        let provider = Provider::default();
+        provider.set_enabled(true);
+        {
+            let mut cache = provider.cache.lock().unwrap();
+            cache.snapshot = Some(snapshot);
+            cache.fetched_at = Instant::now().checked_sub(fetched_ago);
+        }
+        provider
+    }
+
+    fn fresh_quotas(five_used: f64) -> Quotas {
+        let at = |delta: i64| (now_ms() as i64 + delta) as u64;
+        Quotas {
+            five_hour: Some(Window { used_percent: five_used, window_duration_mins: 300, resets_at: at(5 * 3_600_000) }),
+            seven_day: Some(Window { used_percent: 13.0, window_duration_mins: 10_080, resets_at: at(4 * 86_400_000) }),
+        }
+    }
+
+    #[test]
+    fn the_refresh_loop_wakes_just_after_a_reset_instead_of_sleeping_the_full_interval() {
+        let now = now_ms();
+        let spacing = backoff(0);
+        let long_ago = Some(Duration::from_secs(3_600));
+        let near = |snap: &Snapshot| reset_wait(Some(snap), now, long_ago, spacing);
+        // A five-hour reset three minutes away: read three minutes and a grace after, not ten minutes from now.
+        let soon = held(Some(3 * 60_000), Some(4 * 86_400_000), 0.0);
+        assert_eq!(near(&soon), Duration::from_secs(3 * 60) + RESET_GRACE);
+        // Either window counts, the nearer one wins.
+        let seven_first = held(Some(3 * 3_600_000), Some(90_000), 0.0);
+        assert_eq!(near(&seven_first), Duration::from_secs(90) + RESET_GRACE);
+        // Resets far away: the usual interval — no polling is added.
+        assert_eq!(near(&held(Some(3 * 3_600_000), Some(4 * 86_400_000), 0.0)), MIN_REFRESH);
+        // Nothing to wait for: no windows, or no snapshot.
+        assert_eq!(near(&held(None, None, 0.0)), MIN_REFRESH);
+        assert_eq!(reset_wait(None, now, None, spacing), MIN_REFRESH);
+    }
+
+    /// The reset-aware wait, from the moment a read has just been made (`since_read` = 0) and a window
+    /// resets `reset_in` later: when may the next read be made?
+    fn wait_for_reset_in(reset_in: Duration, since_read: Duration) -> Duration {
+        let now = now_ms();
+        let snapshot = held(Some(reset_in.as_millis() as i64), Some(4 * 86_400_000), 0.0);
+        reset_wait(Some(&snapshot), now, Some(since_read), backoff(0))
+    }
+
+    #[test]
+    fn a_reset_soon_after_a_read_waits_for_the_spacing_not_for_ten_minutes() {
+        let spacing = Duration::from_secs(60);
+        // Reset 10 s after the read: reset + 5 s is only 15 s, but the spacing allows a read at 60 s — not before, not 10 min later.
+        assert_eq!(wait_for_reset_in(Duration::from_secs(10), Duration::ZERO), spacing);
+        // Reset 55 s after the read: reset + grace is exactly the spacing.
+        assert_eq!(wait_for_reset_in(Duration::from_secs(55), Duration::ZERO), spacing);
+        // Reset 56 s after: the reset is the later of the two.
+        assert_eq!(wait_for_reset_in(Duration::from_secs(56), Duration::ZERO), Duration::from_secs(61));
+        // More than a minute after the read: spacing is long over, only the reset counts.
+        assert_eq!(wait_for_reset_in(Duration::from_secs(120), Duration::ZERO), Duration::from_secs(125));
+        // The sleep counts from now, and the read was made 20 s ago: 40 s of the spacing are left.
+        assert_eq!(wait_for_reset_in(Duration::from_secs(10), Duration::from_secs(20)), Duration::from_secs(40));
+        // Never the usual interval for a reset this close.
+        for secs in [1, 10, 30, 55, 56, 90, 300] {
+            assert!(wait_for_reset_in(Duration::from_secs(secs), Duration::ZERO) < MIN_REFRESH, "{secs}s");
+        }
+    }
+
+    #[test]
+    fn a_reset_that_has_passed_while_the_spacing_still_holds_is_read_the_moment_it_ends() {
+        let now = now_ms();
+        let spacing = backoff(0);
+        let over = held(Some(-2_000), Some(4 * 86_400_000), 40.0);
+        let wait = |since: u64| reset_wait(Some(&over), now, Some(Duration::from_secs(since)), spacing);
+        // The read that found the reset gated was 20 s ago: 40 s more, not ten minutes.
+        assert_eq!(wait(20), Duration::from_secs(40));
+        assert_eq!(wait(59), Duration::from_secs(1));
+        // The read was this very instant: the full spacing.
+        assert_eq!(wait(0), spacing);
+        // Spacing already over: as soon as it can be — a second, never zero (no busy loop).
+        assert_eq!(wait(60), MIN_WAKE);
+        assert_eq!(wait(61), MIN_WAKE);
+        // With failures the spacing is the backoff, and it is the one respected.
+        assert_eq!(
+            reset_wait(Some(&over), now, Some(Duration::from_secs(60)), backoff(2)),
+            Duration::from_secs(180)
+        );
+        // No snapshot to speak of: the usual interval.
+        assert_eq!(reset_wait(Some(&held(None, None, 0.0)), now, Some(Duration::ZERO), spacing), MIN_REFRESH);
+    }
+
+    #[test]
+    fn a_wake_after_sleep_or_a_late_timer_reads_at_once() {
+        let now = now_ms();
+        // The machine slept through the reset: hours past it, hours since the last read.
+        let slept = held(Some(-3 * 3_600_000), Some(-60_000), 40.0);
+        let wait = reset_wait(Some(&slept), now, Some(Duration::from_secs(3 * 3_600)), backoff(0));
+        assert_eq!(wait, MIN_WAKE, "read as soon as the loop runs, with a one-second floor");
+        // Never a zero wait, whatever the inputs: the loop cannot spin.
+        for since in [None, Some(Duration::ZERO), Some(Duration::from_secs(3_600))] {
+            assert!(reset_wait(Some(&slept), now, since, backoff(0)) >= MIN_WAKE);
+        }
+    }
+
+    #[test]
+    fn the_spacing_gated_reset_read_is_retried_at_the_earliest_time_and_brings_the_zero() {
+        runtime().block_on(async {
+            // The five-hour window reset, but the last read was only 20 s ago.
+            let provider = provider_holding(held(Some(-2_000), Some(4 * 86_400_000), 40.0), Duration::from_secs(20));
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let counted = |calls: &std::sync::Arc<AtomicUsize>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(fresh_quotas(0.0))
+                }
+            };
+            // The read at reset + 5 s is refused by the spacing gate: the cached snapshot comes back, no request.
+            let gated = provider.read_with_at(Instant::now(), counted(&calls)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "spacing-gated");
+            assert!(gated.quotas.unwrap().five_hour.is_none(), "the over window is not shown");
+            // The scheduler does not fall back to ten minutes: about 40 s of the spacing are left.
+            let wait = provider.next_wait();
+            assert!(wait > Duration::from_secs(38) && wait <= Duration::from_secs(40), "{wait:?}");
+            // At that time the read is made — and it is the new window: a real 0%.
+            let after = provider
+                .read_with_at(Instant::now() + wait, counted(&calls))
+                .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let five = after.quotas.unwrap().five_hour.unwrap();
+            assert_eq!(five.used_percent, 0.0);
+            assert!(after.available && !after.stale);
+            // And it is over: the loop is back on the usual interval, not hammering.
+            assert_eq!(provider.next_wait(), MIN_REFRESH);
+        });
+    }
+
+    #[test]
+    fn existing_failure_backoff_and_the_one_follow_up_still_win_over_the_reset_schedule() {
+        runtime().block_on(async {
+            // A failure that a moment may cure: the backoff schedules the retry, not the reset logic.
+            let provider = provider_holding(held(Some(-2_000), Some(4 * 86_400_000), 40.0), Duration::from_secs(20));
+            provider.read_with_at(Instant::now() + Duration::from_secs(41), async { Err(FailureReason::Timeout) }).await;
+            assert_eq!(provider.next_wait(), Duration::from_secs(120));
+            // A window missing after the follow-up read: one follow-up, 60 s.
+            let chased = provider_holding(held(Some(-2_000), Some(4 * 86_400_000), 40.0), Duration::from_secs(120));
+            chased
+                .read_with_at(Instant::now(), async {
+                    let mut quotas = fresh_quotas(0.0);
+                    quotas.five_hour = None;
+                    Ok(quotas)
+                })
+                .await;
+            assert_eq!(chased.next_wait(), Duration::from_secs(60));
+        });
+    }
+    #[test]
+    fn a_window_that_has_reset_is_read_again_before_the_usual_interval() {
+        runtime().block_on(async {
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            // The five-hour window reset a minute ago; the last read was two minutes ago.
+            let provider = provider_holding(held(Some(-60_000), Some(4 * 86_400_000), 40.0), Duration::from_secs(120));
+            let seen = calls.clone();
+            let snapshot = provider
+                .read_with_at(Instant::now(), async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(fresh_quotas(0.0))
+                })
+                .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "read, though the ten minutes are not up");
+            let five = snapshot.quotas.unwrap().five_hour.unwrap();
+            assert_eq!(five.used_percent, 0.0, "a real zero, from the server");
+            assert!(snapshot.available && !snapshot.stale);
+        });
+    }
+
+    #[test]
+    fn without_a_reset_the_usual_interval_still_holds_and_the_backoff_floor_holds_after_one() {
+        runtime().block_on(async {
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let counted = |calls: &std::sync::Arc<AtomicUsize>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(fresh_quotas(0.0))
+                }
+            };
+            // Nothing has reset, last read two minutes ago: cached, no request.
+            let live = provider_holding(held(Some(3_600_000), Some(4 * 86_400_000), 40.0), Duration::from_secs(120));
+            let cached = live.read_with_at(Instant::now(), counted(&calls)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(cached.quotas.unwrap().five_hour.unwrap().used_percent, 40.0);
+            // A reset, but the last read was ten seconds ago: the minute's floor still keeps requests apart.
+            let just_read = provider_holding(held(Some(-1_000), Some(4 * 86_400_000), 40.0), Duration::from_secs(10));
+            just_read.read_with_at(Instant::now(), counted(&calls)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn a_temporary_failure_is_retried_after_the_backoff_not_after_ten_minutes() {
+        runtime().block_on(async {
+            let provider = Provider::default();
+            provider.set_enabled(true);
+            let failed = provider.read_with_at(Instant::now(), async { Err(FailureReason::Timeout) }).await;
+            assert_eq!(failed.failure_reason, Some(FailureReason::Timeout));
+            assert_eq!(provider.next_wait(), Duration::from_secs(120), "the first backoff, not MIN_REFRESH");
+            // Two minutes and a second later the retry is made (and, answered, the dash is gone).
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let again = provider
+                .read_with_at(Instant::now() + Duration::from_secs(121), async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(fresh_quotas(0.0))
+                })
+                .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(again.available);
+            assert_eq!(again.quotas.unwrap().five_hour.unwrap().used_percent, 0.0);
+            assert_eq!(provider.next_wait(), MIN_REFRESH, "back to the usual interval once it works");
+        });
+    }
+
+    #[test]
+    fn a_failure_that_needs_the_user_keeps_the_usual_interval() {
+        runtime().block_on(async {
+            for reason in [FailureReason::CliUnavailable, FailureReason::Unauthorized] {
+                let provider = Provider::default();
+                provider.set_enabled(true);
+                provider.read_with_at(Instant::now(), async move { Err(reason) }).await;
+                assert_eq!(provider.next_wait(), MIN_REFRESH, "{reason:?}: the usual interval, not the backoff");
+                let calls = std::sync::Arc::new(AtomicUsize::new(0));
+                let seen = calls.clone();
+                provider
+                    .read_with_at(Instant::now() + Duration::from_secs(121), async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(fresh_quotas(0.0))
+                    })
+                    .await;
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "{reason:?}: not hammered");
+            }
+        });
+    }
+
+    #[test]
+    fn a_transient_failure_keeps_the_last_values_and_does_not_clear_a_valid_zero() {
+        runtime().block_on(async {
+            let provider = provider_holding(held(Some(3_600_000), Some(4 * 86_400_000), 0.0), Duration::from_secs(11 * 60));
+            let failed = provider
+                .read_with_at(Instant::now(), async { Err(FailureReason::ServerExited) })
+                .await;
+            assert!(failed.stale);
+            assert_eq!(failed.failure_reason, Some(FailureReason::ServerExited));
+            let five = failed.quotas.unwrap().five_hour.unwrap();
+            assert_eq!(five.used_percent, 0.0, "the zero is still there, marked stale");
+        });
+    }
+
+    #[test]
+    fn a_window_missing_after_its_reset_is_asked_for_once_more_soon_and_no_more() {
+        runtime().block_on(async {
+            // The five-hour window reset; the answer, a few seconds later, still has only the weekly one.
+            let provider = provider_holding(held(Some(-5_000), Some(4 * 86_400_000), 40.0), Duration::from_secs(120));
+            let only_weekly = || async {
+                let mut quotas = fresh_quotas(0.0);
+                quotas.five_hour = None;
+                Ok(quotas)
+            };
+            let first = provider.read_with_at(Instant::now(), only_weekly()).await;
+            assert!(first.quotas.as_ref().unwrap().five_hour.is_none());
+            assert!(first.quotas.as_ref().unwrap().seven_day.is_some(), "the weekly window is independent of it");
+            assert_eq!(provider.next_wait(), Duration::from_secs(60), "one follow-up soon");
+            // The follow-up gets the rolled-over window.
+            let second = provider
+                .read_with_at(Instant::now() + Duration::from_secs(61), async { Ok(fresh_quotas(0.0)) })
+                .await;
+            assert_eq!(second.quotas.unwrap().five_hour.unwrap().used_percent, 0.0);
+            assert_eq!(provider.next_wait(), MIN_REFRESH);
+            // If it is still missing, the follow-up is the last: no loop.
+            let stuck = provider_holding(held(Some(-5_000), None, 40.0), Duration::from_secs(120));
+            stuck.read_with_at(Instant::now(), only_weekly()).await;
+            assert_eq!(stuck.next_wait(), Duration::from_secs(60));
+            stuck.read_with_at(Instant::now() + Duration::from_secs(61), only_weekly()).await;
+            assert_eq!(stuck.next_wait(), MIN_REFRESH, "after the one follow-up it settles");
+        });
+    }
+
+    #[test]
+    fn windows_reset_independently_and_a_valid_zero_is_not_a_missing_window() {
+        let now = now_ms();
+        // The five-hour window is over; the weekly one is not.
+        let snapshot = held(Some(-1), Some(4 * 86_400_000), 0.0);
+        let visible = visible_snapshot(&snapshot, now + 10);
+        let quotas = visible.quotas.unwrap();
+        assert_eq!(quotas.five_hour, None);
+        assert_eq!(quotas.seven_day.unwrap().used_percent, 13.0);
+        assert!(visible.available);
+        // A zero that has NOT reset stays a window with a zero in it.
+        let zero = visible_snapshot(&held(Some(3_600_000), None, 0.0), now);
+        assert_eq!(zero.quotas.unwrap().five_hour.unwrap().used_percent, 0.0);
+    }
+
+    #[test]
+    fn a_window_without_a_usable_reset_is_dropped_with_a_reason_and_never_turned_into_zero() {
+        let now = NOW;
+        let ok = json!({"usedPercent":0,"windowDurationMins":300,"resetsAt":1800018000});
+        assert_eq!(window_problem(&ok, now).unwrap().used_percent, 0.0);
+        let cases = [
+            (json!({"usedPercent":0,"windowDurationMins":300,"resetsAt":null}), "resetsAt missing or null"),
+            (json!({"usedPercent":0,"windowDurationMins":300}), "resetsAt missing or null"),
+            (json!({"usedPercent":0,"windowDurationMins":300,"resetsAt":1700000000}), "resetsAt not in the future"),
+            (json!({"usedPercent":0,"windowDurationMins":null,"resetsAt":1800018000}), "windowDurationMins missing or null"),
+            (json!({"usedPercent":null,"windowDurationMins":300,"resetsAt":1800018000}), "usedPercent missing, null or out of range"),
+        ];
+        for (window, reason) in cases {
+            assert_eq!(window_problem(&window, now).unwrap_err(), reason, "{window}");
+            assert_eq!(read_window(&window, now), None);
+        }
+        // An idle account: the five-hour window is not usable, the weekly one is — the weekly one is kept.
+        let idle = json!({"rateLimits":{
+            "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":null},
+            "secondary":{"usedPercent":13,"windowDurationMins":10080,"resetsAt":1800600000}}});
+        let quotas = parse_rate_limits(&idle, now).unwrap();
+        assert_eq!(quotas.five_hour, None);
+        assert_eq!(quotas.seven_day.unwrap().used_percent, 13.0);
+        // What is logged says which and why — no values, no identifiers.
+        let text = dropped_windows(&idle, now);
+        assert_eq!(text, "primary: resetsAt missing or null");
+        assert!(!text.contains("13") && !text.contains("1800"));
+        assert_eq!(dropped_windows(&json!({"rateLimits":{"primary":null}}), now), "primary: absent; secondary: absent");
+        assert_eq!(dropped_windows(&quota_result(), NOW), "");
+    }
+
+    #[test]
+    fn the_loading_state_is_not_unavailable() {
+        let provider = Provider::default();
+        provider.set_enabled(true);
+        let loading = provider.last_snapshot();
+        assert!(!loading.available && loading.failure_reason.is_none() && loading.quotas.is_none() && loading.updated_at.is_none());
+        assert_eq!(provider.next_wait(), MIN_REFRESH);
+    }
     #[test]
     fn disabling_clears_snapshot_and_discards_an_in_flight_read() {
         runtime().block_on(async {
