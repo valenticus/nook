@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.2.2
+This changelog has two clearly separated histories. The Personal Edition entry is maintained by this fork. The Original Nook entries below are preserved project history and are not claims of work by the Personal Edition maintainers.
+
+## Nook Personal Edition
+
+### 0.1.0
+
+- First standalone Nook Personal Edition release with its own application identity, executable, relay, and per-user data locations.
+- Settings → Connect for Claude Code and Codex hook setup, with configuration preview, ownership checks, backups, and explicit confirmation.
+- Claude Code 5-hour and 7-day usage through its status line, and opt-in Codex 5-hour and 7-day usage through the local Codex App Server provider.
+- Separate Claude and Codex session activity, permission requests, completion cards, sounds, and session navigation.
+- Compact quota indicators rotate between available Claude and Codex data every five seconds; idle Clock/Battery appears after five minutes without relevant activity.
+- Gullu, appearance controls, English/Ukrainian localization including the Windows tray, and optional Windows sign-in startup.
+- Original Nook automatic updater is disabled; Personal Edition updates are installed manually from this fork's releases.
+
+## Original Nook history
+
+The following release notes are retained from Original Nook. Their descriptions refer to the original project, not to Personal Edition 0.1.0.
+
+### Original Nook 0.2.2
 
 - Codex's sessions in the island, with Allow / Deny for what Codex asks
   permission for. Hooks installed from Settings into `~/.codex/hooks.json`
@@ -26,7 +44,7 @@
 - A line of Nook's log no longer shows two timestamps when two things are
   logged in the same second.
 
-## 0.2.1
+### Original Nook 0.2.1
 
 - The uninstaller and the installer pages now use the Nook icon and artwork: the
   uninstall window, its header logo and the welcome and finish pages no longer
@@ -40,7 +58,7 @@
   longer mistakes the Start menu, Search, the notification centre, Alt+Tab,
   the lock screen or the moment of switching windows for a full-screen app.
 
-## 0.2.0
+### Original Nook 0.2.0
 
 - Cursor's agent sessions in the island, next to Claude Code's, for their
   status only (no approvals). Hooks installed from Settings into
@@ -71,7 +89,7 @@
 - The installer uses the Nook icon.
 - Fixed: the island no longer ends up shifted after it is hidden and shown
   again.
-## 0.1.0
+### Original Nook 0.1.0
 
 First release of Nook, a fork of Coucou for Windows.
 
