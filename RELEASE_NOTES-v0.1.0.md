@@ -2,7 +2,17 @@
 
 Nook Personal Edition is an independent Windows fork of [Original Nook](https://github.com/zubairbinshaukat/nook), created by Zubair Bin Shaukat. This first Personal Edition release uses a separate app identity, relay location, and per-user data paths.
 
-This document describes the Standalone release candidate built from commit `1d5d403`.
+Release tag: `personal-v0.1.0`. The tag is separate from the `v*` tags inherited from Original Nook, which are unchanged.
+
+## Build provenance
+
+The installer in this release is the Standalone release candidate that was built and tested on Windows 11 from commit `1d5d403`. It was not rebuilt afterwards, and the file was copied under its final name without being modified.
+
+After that build, the commit messages of the Personal Edition history were rewritten to remove co-author trailers, which gave every rewritten commit a new SHA. `1d5d403` became `a274467`. The two commits have the identical source tree (`c2e36252d6e470557be0f85a008d3f81798b87d1`), so the source code is the same, but the installer was built from `1d5d403` and not directly from `a274467`. The only changes after `a274467` are to documentation: `README.md`, these release notes and the images in `docs/images/personal-edition/`.
+
+- Installer: `Nook-Personal-Edition-0.1.0-setup.exe`
+- SHA-256: `a2eb447dad17b3695224c3f81d6d31fe0b520a75e5c0767f9214a0ce0f241fa8` (also in `SHA256SUMS.txt`)
+- The installer is unsigned, and it contains no updater.
 
 ## Highlights
 
@@ -22,7 +32,7 @@ This document describes the Standalone release candidate built from commit `1d5d
 - Codex usage quotas require Codex CLI 0.165.0 or newer, an available Codex session/quota response, and the quota opt-in in Settings.
 - Claude usage requires Claude Code's status line to be connected to Nook.
 
-## Fixes in this release candidate
+## Fixes in this release
 
 - The island's clickable area follows the window it is drawn in, and Windows click-through state is reconciled with the real window, so clicks no longer miss the island or land on whatever sits beside it.
 - Codex quota is read again shortly after a window resets instead of waiting for the usual ten-minute interval, and transient failures retry sooner. A window without a usable reset time is never shown as zero.
