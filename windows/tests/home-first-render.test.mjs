@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 
 test("persisted settings and locale are applied before the Island is constructed", () => {
-  const boot = source.indexOf("const boot = await Bridge.boot();");
+  const boot = source.indexOf("const boot = await bootWithRetry();");
   const applySettings = source.indexOf("State.settings = { ...State.settings, ...boot.settings };", boot);
   const applyLocale = source.indexOf('setLanguage(resolveLanguage(State.settings.language), "island.boot");', applySettings);
   const construct = source.indexOf("const island = new Island(root);", applyLocale);

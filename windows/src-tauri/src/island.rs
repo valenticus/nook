@@ -5,9 +5,7 @@
 // centre of the main display (or at another edge: dock.rs) inside a borderless,
 // transparent, always-on-top window that never takes focus.
 
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,6 +119,10 @@ pub struct PollGate {
     pub rect: Mutex<IslandRect>,
     /// The full window's size, as last worked out for the display.
     pub panel: Mutex<PanelSize>,
+    /// Counts the changes of `panel`, bumped under its lock. The page takes the
+    /// size from a read, never from the order things arrive in: of two answers,
+    /// the one with the higher count is the newer, however they were delayed.
+    pub panel_rev: AtomicU64,
     /// Last requested window flag. Not the window's state — the poll reads that
     /// back from the Win32 style (see `set_ignore_if_changed`).
     ignoring: AtomicBool,
@@ -140,6 +142,7 @@ impl PollGate {
                 height: PANEL_MIN_H,
                 dock: Dock::Top,
             }),
+            panel_rev: AtomicU64::new(0),
             ignoring: AtomicBool::new(false),
         }
     }
@@ -380,6 +383,7 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, dock: Dock, collapsed: bool) 
         let mut known = shared.gate.panel.lock().unwrap();
         if *known != panel {
             *known = panel;
+            shared.gate.panel_rev.fetch_add(1, Ordering::SeqCst);
             let _ = app.emit_to(WINDOW_LABEL, "panel-size", panel);
         }
     }

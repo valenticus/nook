@@ -2,7 +2,8 @@
 
 import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
-import { Bridge, IS_TAURI, onEvent, type PanelSize } from "./core/bridge";
+import { Bridge, IS_TAURI, onEvent, type BootInfo, type PanelSize } from "./core/bridge";
+import { RoomKeeper, readWithRetry } from "./core/room-sync";
 import { enableShelfTraceSource, shelfTrace } from "./core/shelf-trace";
 import { Reply } from "./core/reply";
 import { Sound } from "./core/sound";
@@ -39,6 +40,24 @@ async function readUsageInstalled() {
   if (typeof installed === "boolean") State.usageInstalled = installed;
 }
 
+/**
+ * `boot` is what the island is told of the window it is in (its size, its edge,
+ * its settings). The bridge turns any failure into null, and at the start of a
+ * Windows session the first call can fail while the app is still coming up:
+ * with no answer the page would keep its defaults (a 720-wide window) for good.
+ * So it is asked again a few times, a little later each time, and then given
+ * up on (core/room-sync.ts `readWithRetry`) — never in a loop. Outside the app
+ * there is nobody to ask.
+ */
+const BOOT_RETRIES = 4;
+/** The reads that follow a `panel-size` event: fewer, the page already has an answer. */
+const REFRESH_RETRIES = 2;
+const RETRY_STEP_MS = 150;
+const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+function bootWithRetry(retries = BOOT_RETRIES) {
+  return readWithRetry(() => Bridge.boot(), IS_TAURI ? retries : 0, RETRY_STEP_MS, sleep, (attempt) => void Bridge.log(`boot answered on retry ${attempt}`));
+}
+
 async function main() {
   const root = document.getElementById("root");
   if (!root) return;
@@ -47,7 +66,7 @@ async function main() {
   setLanguage(resolveLanguage(State.settings.language), "island.pre-boot");
 
   void Sound.preload();
-  const boot = await Bridge.boot();
+  const boot = await bootWithRetry();
   const codexQuotaGate = new QuotaSnapshotGate();
   if (boot) {
     State.settings = { ...State.settings, ...boot.settings };
@@ -61,6 +80,17 @@ async function main() {
   clearLegacyCompletionNotifications();
   if (__NOOK_DEV_BUILD__) shelfTrace("locale-after-boot", { locale: currentLanguage(), languagePreference: State.settings.language, source: boot ? "island.boot" : "island.boot-unavailable" });
 
+  // The window's size comes from reads, ordered by Rust's own count of its
+  // changes (core/room-sync.ts), never by the order things arrive in. A
+  // `panel-size` event is only a reason to read again: what it carries is not
+  // used, because an event can reach the page before or after an answer that
+  // was asked for earlier, and nothing in that order says which is newer.
+  // Listened to before anything else is awaited, and before the island exists;
+  // one that comes before the island is built finds nobody to tell, and the read
+  // below — made once the page is listening — has what it announced.
+  let keeper: RoomKeeper<BootInfo> | null = null;
+  await onEvent<PanelSize>("panel-size", () => void keeper?.refresh(REFRESH_RETRIES));
+
   // Build the Island only after the persisted locale and settings are known.
   // Views render synchronously from state; constructing them before `boot`
   // makes the default English UI visible before the saved language arrives.
@@ -68,11 +98,32 @@ async function main() {
   // The constructor has now attached every view. Translate it in this same
   // task so its first painted frame uses the persisted locale too.
   setLanguage(resolveLanguage(State.settings.language), "island.after-create");
+  const roomKeeper = new RoomKeeper<BootInfo>({
+    read: () => Bridge.boot(),
+    viewport: () => island.viewportNow(),
+    wait: sleep,
+    sink: {
+      setRoom: (width, height, dock) => island.setRoom(width, height, dock),
+      setScreenWidth: (width, height) => island.setScreenWidth(width, height),
+      adoptObserved: (width, height) => island.adoptObservedRoom(width, height),
+    },
+    // Where Rust's poll owns click-through (Windows) the ears are part of what takes the pointer.
+    onAnswer: (answer) => island.setHitEars(answer.cursorPoll === true),
+  });
+  keeper = roomKeeper;
+  // When the window grows (the wake strip to the island's window) and Rust has
+  // never said what it is, ask again — it sends no event for a size that did
+  // not change — and, failing that, take the window the page finds itself in.
+  island.onViewportChange = () => roomKeeper.windowResized();
   if (boot) {
-    island.setRoom(boot.panel.width, boot.panel.height, boot.panel.dock);
-    island.setScreenWidth(boot.screen.width, boot.screen.height);
+    roomKeeper.offer(boot);
     State.notify();
   }
+  // Now that the page is listening: the window as Rust has it. Whatever changed
+  // between the first answer and the listener has a higher count and wins; an
+  // answer older than one already applied is dropped; with no answer at all the
+  // window as drawn stands in, and a few bounded reads follow in the background.
+  await roomKeeper.start(REFRESH_RETRIES);
   if (CODEX_QUOTA_BUILD && (boot?.nookDev || boot?.nookStandalone)) {
     await Bridge.onCodexQuota((snapshot) => {
       const accepted = codexQuotaGate.acceptEvent(snapshot);
@@ -92,13 +143,6 @@ async function main() {
       });
     }
   }
-  // Another display, or the same one at another size: the window was sized again.
-  await onEvent<PanelSize>("panel-size", ({ width, height, dock }) => {
-    island.setRoom(width, height, dock);
-    // The display's own width caps the folded island (its height, on a side): asked again, it may be another display.
-    void Bridge.boot().then((again) => again && island.setScreenWidth(again.screen.width, again.screen.height));
-  });
-
   // Claude's usage limits arrive only when Claude Code reports them.
   await onEvent<unknown>("usage", (payload) => {
     const usage = readUsage(payload);

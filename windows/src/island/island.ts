@@ -8,6 +8,10 @@ import { isShelfTraceSourceRecording, shelfTrace } from "../core/shelf-trace";
 import { currentLanguage, localizeSubtree } from "../core/i18n";
 import { wipe } from "../core/canvas";
 import {
+  describeMismatch, effectiveEar, geometryMismatch, interactiveRegion, measuredBody, nearBox, viewportIsFullWindow,
+  type Box, type Viewport,
+} from "../core/hit-region";
+import {
   type Dock, Display, EAR_COMPACT, EAR_EXPANDED, EXPANDED_CORNER, EXPANDED_W, homeContentSize, LARGE_H, LARGE_W, NOTCH_H, NOTCH_W, OVERSHOOT_H, OVERSHOOT_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, Room, botGlowColor, botGlowOpacity, botPosition, islandOrigin, sideDock, viewLayout,
   islandSize, shelfWidth,
@@ -321,6 +325,20 @@ export class Island {
   private lastNotch = -Infinity;
   /** Set when the island's rectangle must be told to Rust again though it looks unchanged: a page has settled. */
   private forceRect = false;
+  /**
+   * The window the page is drawn in, as last read — on construction, on every `resize` (which comes
+   * before the next frame) and when a check runs. Frames place the island from this, never from a read.
+   */
+  private vp: Viewport = (() => {
+    const zoom = Display.zoom > 0 ? Display.zoom : 1;
+    return { w: window.innerWidth / zoom, h: window.innerHeight / zoom };
+  })();
+  /** Whether the rectangle handed to Rust takes in the ears (`setHitEars`): off until Rust says its poll owns click-through. */
+  private hitEars = false;
+  /** The check of the island against what is drawn, armed by each push of its shape; and the one last reported. */
+  private geometryTimer: number | null = null;
+  private geometryReported = "";
+  private geometryLogs = 0;
   /** How far the bot is carried sideways with Home's page, px (zero unless paging). */
   private pageShift = 0;
   /** The Shelf's row comes to rest on a card once the swipe that moves it has paused: the one timer of it. */
@@ -1938,18 +1956,21 @@ export class Island {
     // screen's edge — never wider than what the window has beside the island.
     // An ear at rest ends on a whole pixel too: 11 px is 13.75 at 125 %, and
     // its tip would be drawn a soft quarter of a pixel past the island.
-    const ear = this.ear.animating ? this.ear.value : Math.round(this.ear.value * dpr) / dpr;
-    this.shape.draw({ w, h: hh, ear: Math.min(ear, Math.max(0, side ? y : x)), corner: r, dock });
+    const body: Box = { x, y, w, h: hh };
+    const earDrawn = this.earFor(body, dpr);
+    this.shape.draw({ w, h: hh, ear: earDrawn, corner: r, dock });
     // This follows the island as it resizes, so it belongs here rather than in
     // the state-driven DOM sync.
     put(this.greetingCanvas, "left", `${(w - EXPANDED_W) / 2}px`);
 
-    // What takes the mouse is the body. The ears are decoration, and are not
-    // counted: Rust takes the mouse a few pixels around the rectangle anyway
-    // (HIT_MARGIN), which covers all of a folded island's ears and most of an
-    // open one's — and a click on one does nothing, like a click on the rest
-    // of that margin.
-    const rect = { x, y, w, h: hh };
+    // What takes the mouse is what is drawn: the body, and — where Rust's poll
+    // owns click-through — the ears, the very ones the outline was just given.
+    // The place is worked out from the style written above and the window the
+    // page is really drawn in (`windowW`), not measured: reading a box back
+    // here would make the browser lay the page out in the middle of every
+    // frame of an animation. Rust takes the mouse a few pixels around the
+    // rectangle besides (HIT_MARGIN), once.
+    const rect = interactiveRegion(body, this.hitEars ? earDrawn : 0, side);
     const p = this.pushedRect;
     if (
       this.forceRect ||
@@ -1958,27 +1979,132 @@ export class Island {
       this.forceRect = false;
       this.pushedRect = rect;
       void Bridge.setIslandRect(rect.x, rect.y, rect.w, rect.h);
+      // Whatever just moved is checked against the drawing once it has stopped (`verifyGeometry`).
+      this.armVerify();
     }
   }
 
-  /** Island rect in window coordinates (origin top-left of the full window). */
-  private islandRect(): { x: number; y: number; w: number; h: number } {
+  /** The ear as drawn on this body: the outline's and the pointer's region's, one value (`effectiveEar`). */
+  private earFor(body: Box, dpr: number): number {
+    const wanted = this.ear.animating ? this.ear.value : Math.round(this.ear.value * dpr) / dpr;
+    return effectiveEar(wanted, body, sideDock(Room.dock), { w: this.windowW, h: this.windowH });
+  }
+
+  /**
+   * Island body in window coordinates (origin top-left of the full window),
+   * where the style `applyGeometry` writes draws it.
+   */
+  private islandRect(): Box {
     const { x, y, w, h: hh } = this.snapped();
     return { x, y, w, h: hh };
   }
 
-  /**
-   * The width the island is centred in: its window's, at full size — the size
-   * Rust gave it, not what the page measures, which is the wake strip's while
-   * the island is hidden. In a plain browser, the page's.
-   */
-  private get windowW(): number {
-    return IS_TAURI ? Room.w : window.innerWidth / Display.zoom;
+  /** The window as the page is drawn in it, in the page's layout units: read now, which makes the browser lay out. */
+  private readViewport(): Viewport {
+    const zoom = Display.zoom > 0 ? Display.zoom : 1;
+    return { w: window.innerWidth / zoom, h: window.innerHeight / zoom };
   }
 
-  /** The height of the same window: Rust's, at full size; in a plain browser, the page's. */
+  /**
+   * Rust's poll decides click-through from the rectangle `applyGeometry` pushes
+   * and, where it does (Windows), the ears are part of it. Where the OS makes
+   * the input region from it instead (Linux), the rectangle stays the body, as
+   * it was: the region there is cut to it, ears left to the margin.
+   */
+  setHitEars(on: boolean) {
+    if (this.hitEars === on) return;
+    this.hitEars = on;
+    this.forceRect = true;
+    this.dirty = true;
+    this.ensureRunning();
+  }
+
+  /**
+   * Rust has not said what the window is, so `Room` is still the page's default
+   * (the normal panel); the window the page is drawn in does (core/room-sync.ts
+   * decides when that stands in). Take its size, so that nothing is placed for a
+   * window of 720 in one of 1136. The first real answer still counts as the
+   * first (`roomKnown` stays false).
+   */
+  adoptObservedRoom(width: number, height: number) {
+    if (this.roomKnown) return;
+    this.setRoom(width, height);
+    this.roomKnown = false;
+  }
+
+  /** The window the page is drawn in, as the page last saw it (kept by the `resize` event; nothing is laid out for it). */
+  viewportNow(): Viewport {
+    return this.vp;
+  }
+
+  /** Told after each `resize`, once the island has the new window: main.ts uses it to recover a Room Rust never answered for. */
+  onViewportChange: (() => void) | null = null;
+
+  /**
+   * The window as the page is drawn in it, for frames that must not read it
+   * back: kept up to date by the `resize` event, which comes before the next
+   * frame. The wake strip is not a window the island is placed in: there, and
+   * only there, `Room` (Rust's word for the window at full size) stands in.
+   */
+  private get windowW(): number {
+    if (!IS_TAURI) return this.vp.w;
+    return viewportIsFullWindow(this.vp) ? this.vp.w : Room.w;
+  }
+
+  /** The height of the same window. */
   private get windowH(): number {
-    return IS_TAURI ? Room.h : window.innerHeight / Display.zoom;
+    if (!IS_TAURI) return this.vp.h;
+    return viewportIsFullWindow(this.vp) ? this.vp.h : Room.h;
+  }
+
+  /**
+   * The island is checked against what is really on screen once, after it has
+   * stopped moving — not every frame. Re-armed by each push, so a change just
+   * before the loop goes idle is still checked; it reads the DOM only when the
+   * timer fires.
+   */
+  private armVerify() {
+    if (this.geometryTimer != null) window.clearTimeout(this.geometryTimer);
+    this.geometryTimer = window.setTimeout(() => {
+      this.geometryTimer = null;
+      this.verifyGeometry();
+    }, 600);
+  }
+
+  /**
+   * Does what the page worked out agree with what is drawn, and with the
+   * window Rust says it is? `Room` is Rust's word for the window and the
+   * viewport the window it is really in; the island's computed place is held
+   * against its measured box. If they stay apart there is one line in the log
+   * (sizes and rectangles, nothing else), at most a few per run: the cause of a
+   * dead patch beside the island in one line. Also the one place the cache of
+   * the viewport is checked against a read.
+   */
+  private verifyGeometry() {
+    const vp = this.readViewport();
+    // A `resize` that was missed would leave the cache, and so the shape Rust holds, for another window.
+    const moved = Math.abs(vp.w - this.vp.w) > 0.5 || Math.abs(vp.h - this.vp.h) > 0.5;
+    this.vp = vp;
+    if (moved && State.mode !== "hidden") {
+      this.forceRect = true;
+      this.dirty = true;
+      this.ensureRunning();
+    }
+    if (!viewportIsFullWindow(vp)) return;
+    const now = this.snapped();
+    const placed: Box = { x: now.x, y: now.y, w: now.w, h: now.h };
+    const drawn = measuredBody(this.islandEl.getBoundingClientRect(), Display.zoom, vp);
+    const room = { w: Room.w, h: Room.h };
+    const mismatch = geometryMismatch(room, vp, drawn, placed);
+    if (!mismatch) {
+      this.geometryReported = "";
+      return;
+    }
+    const key = `${Math.round(vp.w)}x${Math.round(vp.h)}|${Math.round(room.w)}x${Math.round(room.h)}|${Math.round(mismatch.placedDx)}`;
+    if (key === this.geometryReported || this.geometryLogs >= 6) return;
+    this.geometryReported = key;
+    this.geometryLogs += 1;
+    void Bridge.log(describeMismatch(mismatch, room, vp, interactiveRegion(placed, this.hitEars ? this.earFor(placed, now.dpr) : 0, sideDock(Room.dock))));
   }
 
   /**
@@ -2096,6 +2222,8 @@ export class Island {
 
   /** The window is whole again: the folded slots are built anew in it, and the island drawn again. */
   private redrawGrown() {
+    // The window has a new size, and the shape Rust holds was told in the old one.
+    this.forceRect = true;
     if (State.mode === "hidden") return;
     this.compact.redraw(compactPlan());
     this.dirty = true;
@@ -2105,6 +2233,20 @@ export class Island {
   // ── Input ───────────────────────────────────────────────────────────────────
 
   private wireInput() {
+    // The window changed size or scale (a display, the taskbar, the zoom): the
+    // island is drawn again where it now is, and its shape is told to Rust
+    // anew. Hidden, nothing is drawn and no frame is woken for it; the shape
+    // goes with the first one after.
+    window.addEventListener("resize", () => {
+      // First, and before any other `resize` listener or the next frame: the window the island is placed in.
+      this.vp = this.readViewport();
+      this.forceRect = true;
+      this.onViewportChange?.();
+      if (State.mode === "hidden") return;
+      this.dirty = true;
+      this.ensureRunning();
+    });
+
     // The wake strip is the only thing the OS can hit while the island is hidden.
     this.wakeStrip.addEventListener("mouseenter", () => {
       Sound.resume();
@@ -2304,12 +2446,15 @@ export class Island {
   /** Cursor in window-logical coordinates. `gone`: it has no position any more (it left the page, with no global cursor). */
   onCursor(x: number, y: number, gone = false) {
     State.mouse = { x, y };
-    const rect = this.islandRect();
+    const placed = this.snapped();
+    const rect: Box = { x: placed.x, y: placed.y, w: placed.w, h: placed.h };
     State.mouseInIsland = { x: x - rect.x, y: y - rect.y };
 
-    const inIsland =
-      x >= rect.x - HIT_MARGIN && x <= rect.x + rect.w + HIT_MARGIN &&
-      y >= rect.y - HIT_MARGIN && y <= rect.y + rect.h + HIT_MARGIN;
+    // The same region Rust takes the mouse over, margin included (island.rs `near`).
+    const inIsland = nearBox(
+      interactiveRegion(rect, this.hitEars ? this.earFor(rect, placed.dpr) : 0, sideDock(Room.dock)),
+      x, y, HIT_MARGIN,
+    );
 
     if (NOOK_DEV_BUILD && this.wasInIsland !== inIsland) {
       shelfTrace("pointer-region", { source: `${inIsland ? "enter" : "leave"}.${State.mode}.${State.view}` });

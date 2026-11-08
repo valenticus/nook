@@ -168,6 +168,9 @@ pub struct BootInfo {
     /// The full window's logical size: what the island is centred in, and the
     /// most the large panel can be on this display.
     panel: PanelSize,
+    /// Which change of `panel` this is (island.rs `PollGate::panel_rev`): of two
+    /// answers, the higher is the newer.
+    panel_rev: u64,
     version: String,
     hook_path: String,
     /// False where the OS has no global cursor (Wayland): the page then reports
@@ -188,11 +191,16 @@ fn boot(app: AppHandle, window: tauri::Window, shared: State<Shared>) -> BootInf
     // The real state of ~/.claude/settings.json wins over whatever we stored.
     settings.hooks_installed = !is_nook_dev() && hooks::status().installed;
     let screen = island::screen_info(&app, &settings.screen);
-    let panel = *shared.gate.panel.lock().unwrap();
+    // Size and count read together: the count is bumped under this same lock.
+    let (panel, panel_rev) = {
+        let known = shared.gate.panel.lock().unwrap();
+        (*known, shared.gate.panel_rev.load(Ordering::SeqCst))
+    };
     BootInfo {
         settings,
         screen,
         panel,
+        panel_rev,
         version: app_version().to_string(),
         hook_path: settings::hook_exe_path().to_string_lossy().to_string(),
         cursor_poll: platform::CURSOR_POLL,

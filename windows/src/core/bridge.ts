@@ -34,6 +34,8 @@ export interface BootInfo {
   screen: { x: number; y: number; width: number; height: number; scale: number };
   /** The window's own logical size on that monitor: see layout.ts `Room`. */
   panel: PanelSize;
+  /** Which change of the window's size this is: of two answers, the higher count is the newer (core/room-sync.ts). */
+  panelRev?: number;
   version: string;
   hookPath: string;
   /** False where the OS has no global cursor (Wayland): see Island.followPageCursor. */
