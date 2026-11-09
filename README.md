@@ -40,9 +40,29 @@ Nook Personal Edition 0.1.0 is a personal fork of [Nook](https://github.com/zuba
 - **Usage limits:** Claude Code 5-hour and 7-day limits through Claude's status line; Codex 5-hour and 7-day limits through the local Codex App Server provider. Codex quota access is opt-in in Settings.
 - **Compact quota indicators:** when both providers have usable data, the compact island rotates between Claude and Codex every five seconds. Missing values are not shown as zero.
 - **Idle clock and battery:** after five minutes without relevant activity, the compact island can show local time and available battery/charging status. Nook does not estimate time to full charge when Windows provides no reliable value.
+- **The Shelf:** six small widgets—To-do, Timer, Reminders, Media, Mirror and Projects—on a separate island tab. See [The Shelf](#the-shelf).
 - **Gullu, themes, and colors:** the animated companion and appearance options are available in Settings.
 - **Completion and important alerts:** completed turns use a temporary card and sound; permission requests and important errors remain visible for attention.
 - **English and Ukrainian:** choose a language in Settings or follow the system language.
+
+## The Shelf
+
+<picture><source media="(prefers-color-scheme: light)" srcset="site/assets/img/shots/shelf-light.webp"><img src="site/assets/img/shots/shelf-dark.webp" alt="The Shelf tab of the Nook island, showing the To-do, Timer, Reminders, Media, Mirror and Projects widgets." width="760"></picture>
+
+Open **Shelf** from the island header. Widgets appear as small cards; expand a card to see more or use its controls. Choose which widgets appear and set their order in **Settings → Shelf widgets**. A widget that is turned off does not run. Shelf data stays on your computer.
+
+| Widget | What it does |
+|---|---|
+| **To-do** | A checklist with a notes area. |
+| **Timer** | A countdown with 5, 15, 25 and 45 minute presets or a custom duration. It plays a sound when it ends, and a running timer survives a restart. |
+| **Reminders** | Set a message and time. Reminders fire only while Nook is running; reminders that became due while it was closed are marked missed at the next start. |
+| **Media** | Controls for players that report to Windows: title, artist, previous, play/pause and next. The expanded card also shows artwork, progress and volume. |
+| **Mirror** | A camera preview that runs only while Mirror is expanded. It stops when you close it or leave Shelf; nothing is recorded or saved. |
+| **Projects** | Recent folders from Claude Code sessions. Open a folder in VS Code or start a new Claude session there in Windows Terminal. |
+
+<picture><source media="(prefers-color-scheme: light)" srcset="site/assets/img/shots/settings-shelf-light.webp"><img src="site/assets/img/shots/settings-shelf-dark.webp" alt="Nook Settings, Shelf widgets page, with switches for To-do, Timer, Reminders, Media, Mirror and Projects." width="520"></picture>
+
+For more detail, see the [Shelf widgets guide](site/guides/shelf-widgets/index.html).
 
 ## Screenshots
 
