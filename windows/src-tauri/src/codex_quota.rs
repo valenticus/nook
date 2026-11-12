@@ -2,6 +2,7 @@
 //! The opt-in provider is shared by Dev and Standalone. Only normalized percentages and timestamps survive a read; protocol payloads
 //! and account identifiers are deliberately discarded.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -19,9 +20,16 @@ use tokio::time::timeout;
 use crate::platform;
 
 const MIN_REFRESH: Duration = Duration::from_secs(10 * 60);
+const ACTIVE_INTERVAL: Duration = Duration::from_secs(3 * 60);
+/// A turn with no hook activity is presumed lost after this lease.
+const INACTIVITY_LEASE: Duration = Duration::from_secs(10 * 60);
+/// Keep recently expired turns long enough to associate late terminal/tool hooks.
+const EXPIRED_TURN_TTL: Duration = Duration::from_secs(20 * 60);
 /// After a window's reset the server needs a moment to roll it over; one read is made this long after the reset.
+#[cfg(test)]
 const RESET_GRACE: Duration = Duration::from_secs(5);
 /// The least the refresh loop sleeps. A read the spacing gate still refuses must never turn into a busy loop.
+#[cfg(test)]
 const MIN_WAKE: Duration = Duration::from_secs(1);
 
 const SNAPSHOT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -134,6 +142,7 @@ fn has_expired_window(snapshot: &Snapshot, now: u64) -> bool {
 /// A window that is already over and not yet replaced is read as soon as the spacing allows. Once
 /// a read has replaced the snapshot, no such window is left, so this never turns into polling; and
 /// a reset still ahead only ever shortens a wait that is capped at the usual interval.
+#[cfg(test)]
 fn reset_wait(
     snapshot: Option<&Snapshot>,
     now: u64,
@@ -170,6 +179,410 @@ pub struct Provider {
     enabled: std::sync::atomic::AtomicBool,
     enabled_generation: std::sync::atomic::AtomicU64,
     wake: tokio::sync::Notify,
+    activity: Mutex<Activity>,
+    read_abort: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+#[derive(Default)]
+struct Activity {
+    sessions: HashMap<String, SessionActivity>,
+    expired_turns: VecDeque<ExpiredTurn>,
+    last_read: Option<Instant>,
+    pending: bool,
+    final_pending: bool,
+    failed_turns: HashSet<TurnKey>,
+    closed_turns: VecDeque<TurnKey>,
+}
+
+type TurnKey = (String, String);
+
+struct ExpiredTurn {
+    session: String,
+    activity: SessionActivity,
+    expired_at: Instant,
+}
+
+impl Activity {
+    fn close_turn(&mut self, session: &str, turn: &str) -> bool {
+        self.remember_closed(session, turn);
+        !self
+            .failed_turns
+            .remove(&(session.to_owned(), turn.to_owned()))
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        let removed: Vec<_> = self
+            .expired_turns
+            .iter()
+            .filter(|expired| now.saturating_duration_since(expired.expired_at) >= EXPIRED_TURN_TTL)
+            .map(|expired| (expired.session.clone(), expired.activity.turn.clone()))
+            .collect();
+        self.expired_turns
+            .retain(|expired| now.saturating_duration_since(expired.expired_at) < EXPIRED_TURN_TTL);
+        for key in removed {
+            self.failed_turns.remove(&key);
+        }
+    }
+
+    fn remember_closed(&mut self, session: &str, turn: &str) {
+        if turn == "?" {
+            return;
+        }
+        let key = (session.to_owned(), turn.to_owned());
+        if !self.closed_turns.contains(&key) {
+            self.closed_turns.push_back(key);
+            if self.closed_turns.len() > 128 {
+                self.closed_turns.pop_front();
+            }
+        }
+    }
+
+    fn expired_index(&self, session: &str, turn: &str) -> Option<usize> {
+        self.expired_turns.iter().rposition(|expired| {
+            expired.session == session && (turn == "?" || expired.activity.turn == turn)
+        })
+    }
+
+    fn end_session(&mut self, session: &str) {
+        let mut should_refresh = false;
+        if let Some(active) = self.sessions.remove(session) {
+            should_refresh |= self.close_turn(session, &active.turn);
+        }
+        let expired_turns: Vec<_> = self
+            .expired_turns
+            .iter()
+            .filter(|expired| expired.session == session)
+            .map(|expired| expired.activity.turn.clone())
+            .collect();
+        if !expired_turns.is_empty() {
+            self.expired_turns
+                .retain(|expired| expired.session != session);
+            for turn in expired_turns {
+                should_refresh |= self.close_turn(session, &turn);
+            }
+        }
+        self.final_pending |= should_refresh;
+    }
+
+    fn restore_late_event(
+        &mut self,
+        event: &str,
+        session: &str,
+        turn: &str,
+        agent: Option<&str>,
+        now: Instant,
+    ) -> bool {
+        if event == "SubagentStop" && turn == "?" {
+            return false;
+        }
+        if turn == "?"
+            && matches!(event, "Stop" | "Interrupt")
+            && self
+                .sessions
+                .get(session)
+                .is_some_and(|active| active.turn != "?")
+        {
+            self.final_pending = true;
+            return true;
+        }
+        let Some(index) = self.expired_index(session, turn) else {
+            return false;
+        };
+        let mut expired = self.expired_turns.remove(index).unwrap();
+        if event == "SubagentStop" {
+            if let Some(agent) = agent {
+                expired.activity.background.remove(agent);
+            }
+            if expired.activity.stopping && expired.activity.background.is_empty() {
+                self.final_pending |= self.close_turn(session, &expired.activity.turn);
+                return true;
+            }
+        }
+        if event == "Stop" && !expired.activity.background.is_empty() {
+            expired.activity.stopping = true;
+        }
+        if event == "Interrupt" || (event == "Stop" && expired.activity.background.is_empty()) {
+            self.final_pending |= self.close_turn(session, &expired.activity.turn);
+            return true;
+        }
+        if self
+            .sessions
+            .get(session)
+            .is_some_and(|active| active.turn != expired.activity.turn)
+        {
+            // The event belongs to an old turn; never replace a newer active turn.
+            self.expired_turns.push_back(expired);
+            return true;
+        }
+        let mut activity = expired.activity;
+        activity.last_event = now;
+        self.sessions.insert(session.to_owned(), activity);
+        true
+    }
+}
+
+struct SessionActivity {
+    turn: String,
+    last_event: Instant,
+    background: HashSet<String>,
+    stopping: bool,
+}
+
+impl Default for SessionActivity {
+    fn default() -> Self {
+        Self {
+            turn: String::new(),
+            last_event: Instant::now(),
+            background: HashSet::new(),
+            stopping: false,
+        }
+    }
+}
+
+impl Activity {
+    fn event(
+        &mut self,
+        event: &str,
+        session: Option<&str>,
+        turn: Option<&str>,
+        agent: Option<&str>,
+        now: Instant,
+    ) {
+        self.prune_expired(now);
+        let session = session
+            .filter(|id| !id.is_empty())
+            .unwrap_or("@unknown-session");
+        let turn = turn.filter(|id| !id.is_empty()).unwrap_or("?").to_owned();
+        if event == "SessionEnd" {
+            self.end_session(session);
+            return;
+        }
+        if !matches!(event, "UserPromptSubmit")
+            && self.restore_late_event(event, session, &turn, agent, now)
+            && (matches!(event, "Stop" | "Interrupt" | "SessionEnd")
+                || self
+                    .sessions
+                    .get(session)
+                    .is_some_and(|active| active.turn != turn && turn != "?"))
+        {
+            return;
+        }
+        match event {
+            "UserPromptSubmit" => {
+                if turn != "?"
+                    && self
+                        .closed_turns
+                        .contains(&(session.to_owned(), turn.clone()))
+                {
+                    return;
+                }
+                if let Some((existing_turn, last_event)) = self
+                    .sessions
+                    .get(session)
+                    .map(|entry| (entry.turn.clone(), entry.last_event))
+                {
+                    if existing_turn == turn
+                        && now.saturating_duration_since(last_event) < INACTIVITY_LEASE
+                    {
+                        return;
+                    }
+                    if existing_turn != turn {
+                        self.remember_closed(session, &existing_turn);
+                        self.failed_turns
+                            .remove(&(session.to_owned(), existing_turn));
+                    }
+                }
+                let entry = self.sessions.entry(session.to_owned()).or_default();
+                *entry = SessionActivity {
+                    turn: turn.clone(),
+                    last_event: now,
+                    ..Default::default()
+                };
+                self.failed_turns.remove(&(session.to_owned(), turn));
+                self.pending = true;
+            }
+            "SubagentStart" => {
+                if let Some(entry) = self.sessions.get_mut(session) {
+                    if entry.turn == turn {
+                        entry.last_event = now;
+                        entry.background.insert(agent.unwrap_or("?").to_owned());
+                    }
+                }
+            }
+            "SubagentStop" => {
+                let close_turn = if let Some(entry) = self.sessions.get_mut(session) {
+                    if entry.turn == turn {
+                        entry.last_event = now;
+                        if let Some(agent) = agent {
+                            entry.background.remove(agent);
+                        }
+                        if entry.stopping && entry.background.is_empty() {
+                            Some(entry.turn.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(turn) = close_turn {
+                    self.sessions.remove(session);
+                    self.final_pending |= self.close_turn(session, &turn);
+                }
+            }
+            "Stop" => {
+                let close_turn = if let Some(entry) = self.sessions.get_mut(session) {
+                    if entry.turn == turn || turn == "?" {
+                        entry.last_event = now;
+                        if entry.background.is_empty() {
+                            Some(entry.turn.clone())
+                        } else {
+                            entry.stopping = true;
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(turn) = close_turn {
+                    self.sessions.remove(session);
+                    self.final_pending |= self.close_turn(session, &turn);
+                }
+            }
+            "Interrupt" | "SessionEnd" => {
+                let matches = self.sessions.get(session).is_some_and(|entry| {
+                    event == "SessionEnd" || entry.turn == turn || turn == "?"
+                });
+                if matches {
+                    if let Some(turn) = self.sessions.get(session).map(|entry| entry.turn.clone()) {
+                        self.final_pending |= self.close_turn(session, &turn);
+                    }
+                    self.sessions.remove(session);
+                }
+            }
+            _ => {
+                if let Some(entry) = self.sessions.get_mut(session) {
+                    entry.last_event = now;
+                }
+            }
+        }
+    }
+
+    fn requesting_turns(&self) -> HashSet<TurnKey> {
+        self.sessions
+            .iter()
+            .map(|(session, turn)| (session.clone(), turn.turn.clone()))
+            .collect()
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.prune_expired(now);
+        let needs_final = self.sessions.iter().any(|(session, item)| {
+            now.saturating_duration_since(item.last_event) >= INACTIVITY_LEASE
+                && !self
+                    .failed_turns
+                    .contains(&(session.clone(), item.turn.clone()))
+        });
+        let before = self.sessions.len();
+        let expired: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, item)| now.saturating_duration_since(item.last_event) >= INACTIVITY_LEASE)
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in expired {
+            if let Some(activity) = self.sessions.remove(&session) {
+                if self.expired_turns.len() == 128 {
+                    if let Some(oldest) = self.expired_turns.pop_front() {
+                        self.failed_turns
+                            .remove(&(oldest.session, oldest.activity.turn));
+                    }
+                }
+                self.expired_turns.push_back(ExpiredTurn {
+                    session,
+                    activity,
+                    expired_at: now,
+                });
+            }
+        }
+        self.failed_turns.retain(|(session, turn)| {
+            self.sessions
+                .get(session)
+                .is_some_and(|item| item.turn == *turn)
+                || self
+                    .expired_turns
+                    .iter()
+                    .any(|expired| expired.session == *session && expired.activity.turn == *turn)
+        });
+        if self.sessions.len() != before && needs_final {
+            self.final_pending = true;
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScheduleAction {
+    Idle,
+    Wait(Duration),
+    Refresh,
+}
+
+fn schedule_action(activity: &mut Activity, now: Instant) -> ScheduleAction {
+    activity.expire(now);
+    let active = !activity.sessions.is_empty();
+    let has_work = active || activity.pending || activity.final_pending;
+    if !has_work {
+        return ScheduleAction::Idle;
+    }
+    let failed = activity.sessions.iter().all(|(session, turn)| {
+        activity
+            .failed_turns
+            .contains(&(session.clone(), turn.turn.clone()))
+    });
+    let spacing_left = activity.last_read.map_or(Duration::ZERO, |at| {
+        ACTIVE_INTERVAL.saturating_sub(now.saturating_duration_since(at))
+    });
+    if spacing_left.is_zero() && (activity.pending || activity.final_pending || (active && !failed))
+    {
+        return ScheduleAction::Refresh;
+    }
+    if spacing_left > Duration::ZERO
+        && (activity.pending || activity.final_pending || (active && !failed))
+    {
+        return ScheduleAction::Wait(spacing_left);
+    }
+    let until_lease = activity
+        .sessions
+        .values()
+        .map(|turn| INACTIVITY_LEASE.saturating_sub(now.saturating_duration_since(turn.last_event)))
+        .min()
+        .unwrap_or(INACTIVITY_LEASE);
+    ScheduleAction::Wait(until_lease.max(Duration::from_millis(1)))
+}
+
+fn record_read_result(
+    activity: &mut Activity,
+    snapshot: &Snapshot,
+    requesting_turns: &HashSet<TurnKey>,
+) {
+    if snapshot.failure_reason.is_none() {
+        return;
+    }
+    let still_active: Vec<_> = requesting_turns
+        .iter()
+        .filter(|(session, turn)| {
+            activity
+                .sessions
+                .get(session)
+                .is_some_and(|active| active.turn == *turn)
+        })
+        .cloned()
+        .collect();
+    activity.failed_turns.extend(still_active);
 }
 
 fn now_ms() -> u64 {
@@ -482,7 +895,10 @@ where
     W: AsyncWrite + Unpin,
 {
     let initialize = format!("{{\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"name\":\"nook\",\"version\":\"{}\"}},\"capabilities\":{{}}}}}}\n", crate::app_version());
-    writer.write_all(initialize.as_bytes()).await.map_err(|_| FailureReason::ProtocolError)?;
+    writer
+        .write_all(initialize.as_bytes())
+        .await
+        .map_err(|_| FailureReason::ProtocolError)?;
     for _ in 0..32 {
         let line = reader
             .next_line()
@@ -675,6 +1091,10 @@ impl Provider {
             let generation = self.enabled_generation.fetch_add(1, Ordering::SeqCst) + 1;
             if !enabled {
                 *self.cache.lock().unwrap() = Cache::default();
+                *self.activity.lock().unwrap() = Activity::default();
+                if let Some(read) = self.read_abort.lock().unwrap().as_ref() {
+                    read.abort();
+                }
             } else {
                 let mut cache = self.cache.lock().unwrap();
                 cache.snapshot = Some(Snapshot {
@@ -702,8 +1122,30 @@ impl Provider {
         self.enabled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Record a verified Codex relay event. This method never performs I/O.
+    pub fn note_event(
+        &self,
+        event: &str,
+        session: Option<&str>,
+        turn: Option<&str>,
+        agent: Option<&str>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        let mut activity = self.activity.lock().unwrap();
+        activity.event(event, session, turn, agent, Instant::now());
+        self.wake.notify_one();
+    }
+
+    #[cfg(test)]
     pub async fn read(&self) -> Snapshot {
         self.read_with_at(Instant::now(), fetch()).await
+    }
+
+    async fn read_for_event(&self) -> Snapshot {
+        self.read_with_at_policy(Instant::now(), fetch(), true)
+            .await
     }
 
     /// Return the current in-memory snapshot without triggering a CLI or app-server read.
@@ -727,6 +1169,7 @@ impl Provider {
     }
 
     /// How long the refresh loop sleeps before it reads again (see `reset_wait`, `retry_soon`).
+    #[cfg(test)]
     pub fn next_wait(&self) -> Duration {
         let cache = self.cache.lock().unwrap();
         if cache.quick_retry || cache.chase {
@@ -743,7 +1186,20 @@ impl Provider {
         )
     }
 
+    #[cfg(test)]
     async fn read_with_at<F>(&self, now: Instant, fetch_result: F) -> Snapshot
+    where
+        F: Future<Output = Result<Quotas, FailureReason>>,
+    {
+        self.read_with_at_policy(now, fetch_result, false).await
+    }
+
+    async fn read_with_at_policy<F>(
+        &self,
+        now: Instant,
+        fetch_result: F,
+        event_refresh: bool,
+    ) -> Snapshot
     where
         F: Future<Output = Result<Quotas, FailureReason>>,
     {
@@ -769,7 +1225,17 @@ impl Provider {
                     .snapshot
                     .as_ref()
                     .is_some_and(|snapshot| has_expired_window(snapshot, now_ms()));
-            let hold = if sooner {
+            let hold = if event_refresh {
+                // The event scheduler is the single source of the normal three-minute
+                // cadence. Rechecking that interval against cache.fetched_at can suppress
+                // an allowed final refresh because the two timestamps are sampled apart.
+                // Failures still retain their cache-level backoff.
+                if cache.failures > 0 {
+                    backoff
+                } else {
+                    Duration::ZERO
+                }
+            } else if sooner {
                 backoff
             } else {
                 MIN_REFRESH.max(backoff)
@@ -864,11 +1330,56 @@ pub fn start(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             let provider = app.state::<Provider>();
-            if provider.is_enabled() {
-                let snapshot = provider.read().await;
-                let _ = app.emit("codex-quota", snapshot);
+            if !provider.is_enabled() {
+                let _ = provider.wake.notified().await;
+                continue;
             }
-            let _ = timeout(provider.next_wait(), provider.wake.notified()).await;
+            let (decision, requesting_turns) = {
+                let mut activity = provider.activity.lock().unwrap();
+                let decision = schedule_action(&mut activity, Instant::now());
+                let requesting_turns = if matches!(decision, ScheduleAction::Refresh) {
+                    activity.requesting_turns()
+                } else {
+                    HashSet::new()
+                };
+                if matches!(decision, ScheduleAction::Refresh) {
+                    activity.pending = false;
+                    activity.final_pending = false;
+                    activity.last_read = Some(Instant::now());
+                }
+                (decision, requesting_turns)
+            };
+            match decision {
+                ScheduleAction::Idle => {
+                    let _ = provider.wake.notified().await;
+                }
+                ScheduleAction::Wait(duration) => {
+                    let _ = timeout(duration, provider.wake.notified()).await;
+                }
+                ScheduleAction::Refresh => {
+                    let read_app = app.clone();
+                    let read =
+                        tokio::spawn(
+                            async move { read_app.state::<Provider>().read_for_event().await },
+                        );
+                    let abort = read.abort_handle();
+                    *provider.read_abort.lock().unwrap() = Some(abort.clone());
+                    if !provider.is_enabled() {
+                        abort.abort();
+                    }
+                    let Ok(snapshot) = read.await else {
+                        *provider.read_abort.lock().unwrap() = None;
+                        continue;
+                    };
+                    *provider.read_abort.lock().unwrap() = None;
+                    record_read_result(
+                        &mut provider.activity.lock().unwrap(),
+                        &snapshot,
+                        &requesting_turns,
+                    );
+                    let _ = app.emit("codex-quota", snapshot);
+                }
+            }
         }
     });
 }
@@ -883,6 +1394,575 @@ mod tests {
     const NOW: u64 = 1_800_000_000_000;
     const RATE_LIMITS_FIXTURE: &str =
         include_str!("../tests/fixtures/codex_app_server_rate_limits.json");
+
+    fn quota_event(
+        state: &mut Activity,
+        event: &str,
+        session: &str,
+        turn: &str,
+        agent: Option<&str>,
+        at: Instant,
+    ) {
+        state.event(event, Some(session), Some(turn), agent, at);
+    }
+
+    #[test]
+    fn event_coordinator_starts_once_coalesces_duplicates_and_respects_three_minute_cadence() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "s", "t", None, t);
+        assert!(state.pending);
+        state.pending = false;
+        state.last_read = Some(t);
+        quota_event(
+            &mut state,
+            "UserPromptSubmit",
+            "s",
+            "t",
+            None,
+            t + Duration::from_secs(5),
+        );
+        assert!(
+            !state.pending,
+            "duplicate hook delivery must not schedule another read"
+        );
+        assert_eq!(
+            schedule_action(&mut state, t + Duration::from_secs(179)),
+            ScheduleAction::Wait(Duration::from_secs(1))
+        );
+        assert_eq!(
+            schedule_action(&mut state, t + ACTIVE_INTERVAL),
+            ScheduleAction::Refresh
+        );
+    }
+
+    #[test]
+    fn final_refresh_coalesces_stops_after_cooldown_and_waits_for_background_agents() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "s", "t", None, t);
+        state.pending = false;
+        state.last_read = Some(t);
+        quota_event(
+            &mut state,
+            "SubagentStart",
+            "s",
+            "t",
+            Some("a"),
+            t + Duration::from_secs(5),
+        );
+        quota_event(
+            &mut state,
+            "Stop",
+            "s",
+            "t",
+            None,
+            t + Duration::from_secs(10),
+        );
+        assert!(!state.final_pending);
+        assert!(state.sessions.contains_key("s"));
+        quota_event(
+            &mut state,
+            "SubagentStop",
+            "s",
+            "t",
+            Some("a"),
+            t + Duration::from_secs(20),
+        );
+        assert!(state.final_pending);
+        assert_eq!(
+            schedule_action(&mut state, t + Duration::from_secs(179)),
+            ScheduleAction::Wait(Duration::from_secs(1))
+        );
+        assert_eq!(
+            schedule_action(&mut state, t + ACTIVE_INTERVAL),
+            ScheduleAction::Refresh
+        );
+        state.final_pending = false;
+        assert_eq!(
+            schedule_action(&mut state, t + ACTIVE_INTERVAL),
+            ScheduleAction::Idle,
+            "one coalesced final read, no launch storm"
+        );
+    }
+
+    #[test]
+    fn interrupt_session_end_multiple_sessions_lost_stop_and_inactivity_lease_are_bounded() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "a", "ta", None, t);
+        quota_event(&mut state, "UserPromptSubmit", "b", "tb", None, t);
+        state.pending = false;
+        quota_event(
+            &mut state,
+            "Interrupt",
+            "a",
+            "ta",
+            None,
+            t + Duration::from_secs(1),
+        );
+        assert!(!state.sessions.contains_key("a"));
+        assert!(state.sessions.contains_key("b"));
+        state.final_pending = false;
+        quota_event(
+            &mut state,
+            "SessionEnd",
+            "b",
+            "?",
+            None,
+            t + Duration::from_secs(2),
+        );
+        assert!(state.sessions.is_empty());
+        assert!(state.final_pending);
+
+        quota_event(&mut state, "UserPromptSubmit", "lost-stop", "tl", None, t);
+        state.pending = false;
+        state.final_pending = false;
+        assert_eq!(
+            schedule_action(&mut state, t + INACTIVITY_LEASE),
+            ScheduleAction::Refresh
+        );
+        assert!(state.sessions.is_empty());
+        assert!(state.final_pending);
+        state.final_pending = false;
+        assert_eq!(
+            schedule_action(&mut state, t + INACTIVITY_LEASE + Duration::from_secs(1)),
+            ScheduleAction::Idle
+        );
+    }
+
+    #[test]
+    fn stale_or_unknown_turn_endings_do_not_close_a_newer_turn_and_idle_never_polls() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "s", "old", None, t);
+        quota_event(
+            &mut state,
+            "UserPromptSubmit",
+            "s",
+            "new",
+            None,
+            t + Duration::from_secs(1),
+        );
+        state.pending = false;
+        quota_event(
+            &mut state,
+            "Stop",
+            "s",
+            "old",
+            None,
+            t + Duration::from_secs(2),
+        );
+        assert!(state.sessions.contains_key("s"));
+        quota_event(
+            &mut state,
+            "Stop",
+            "s",
+            "new",
+            None,
+            t + Duration::from_secs(3),
+        );
+        assert!(state.sessions.is_empty());
+        quota_event(
+            &mut state,
+            "UserPromptSubmit",
+            "s",
+            "old",
+            None,
+            t + Duration::from_secs(4),
+        );
+        assert!(
+            state.sessions.is_empty(),
+            "a delayed prompt for a closed turn is ignored"
+        );
+        state.final_pending = false;
+        state.last_read = Some(t);
+        assert_eq!(
+            schedule_action(&mut state, t + Duration::from_secs(3600)),
+            ScheduleAction::Idle
+        );
+    }
+
+    #[test]
+    fn delayed_subagent_stop_from_old_turn_does_not_touch_new_turn_state() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "s", "t1", None, t);
+        quota_event(
+            &mut state,
+            "SubagentStart",
+            "s",
+            "t1",
+            Some("agent-old"),
+            t + Duration::from_secs(1),
+        );
+        quota_event(
+            &mut state,
+            "UserPromptSubmit",
+            "s",
+            "t2",
+            None,
+            t + Duration::from_secs(2),
+        );
+        quota_event(
+            &mut state,
+            "SubagentStart",
+            "s",
+            "t2",
+            Some("agent-new"),
+            t + Duration::from_secs(3),
+        );
+        let last_event = state.sessions["s"].last_event;
+        quota_event(
+            &mut state,
+            "SubagentStop",
+            "s",
+            "t1",
+            Some("agent-new"),
+            t + Duration::from_secs(4),
+        );
+        let current = &state.sessions["s"];
+        assert_eq!(current.turn, "t2");
+        assert_eq!(current.last_event, last_event);
+        assert!(current.background.contains("agent-new"));
+    }
+
+    #[test]
+    fn stop_or_interrupt_without_turn_id_does_not_close_a_known_newer_turn() {
+        let t = Instant::now();
+        for event in ["Stop", "Interrupt"] {
+            let mut state = Activity::default();
+            quota_event(&mut state, "UserPromptSubmit", "s", "t1", None, t);
+            quota_event(
+                &mut state,
+                "UserPromptSubmit",
+                "s",
+                "t2",
+                None,
+                t + Duration::from_secs(1),
+            );
+            state.final_pending = false;
+            state.event(event, Some("s"), None, None, t + Duration::from_secs(2));
+            assert_eq!(state.sessions["s"].turn, "t2", "{event} leaves the known current turn active");
+            assert!(state.final_pending, "ambiguous terminal event requests a coalesced final read");
+        }
+    }
+
+    #[test]
+    fn failed_turn_is_not_retried_until_a_new_turn_and_anonymous_ids_are_bounded() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "s", "t", None, t);
+        state.pending = false;
+        state.last_read = Some(t);
+        state.failed_turns.insert(("s".into(), "t".into()));
+        assert_eq!(
+            schedule_action(&mut state, t + Duration::from_secs(3600)),
+            ScheduleAction::Idle
+        );
+        quota_event(
+            &mut state,
+            "UserPromptSubmit",
+            "s",
+            "next",
+            None,
+            t + Duration::from_secs(3601),
+        );
+        assert!(state.pending);
+        state.event(
+            "UserPromptSubmit",
+            None,
+            None,
+            None,
+            t + Duration::from_secs(3602),
+        );
+        assert!(state.sessions.contains_key("@unknown-session"));
+    }
+
+    #[test]
+    fn expired_turn_tombstone_restores_late_work_and_its_stop_requests_final_read() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "s", "t1", None, t);
+        state.pending = false;
+        state.last_read = Some(t);
+        quota_event(
+            &mut state,
+            "PermissionRequest",
+            "s",
+            "t1",
+            None,
+            t + Duration::from_secs(1),
+        );
+
+        let expired_at = t + Duration::from_secs(1) + INACTIVITY_LEASE;
+        assert_eq!(
+            schedule_action(&mut state, expired_at),
+            ScheduleAction::Refresh
+        );
+        state.final_pending = false; // the lease-triggered final read completed
+        state.last_read = Some(expired_at);
+        assert_eq!(state.expired_turns.len(), 1);
+
+        quota_event(
+            &mut state,
+            "PostToolUse",
+            "s",
+            "t1",
+            None,
+            expired_at + Duration::from_secs(10),
+        );
+        assert_eq!(
+            state.sessions.get("s").map(|turn| turn.turn.as_str()),
+            Some("t1")
+        );
+        quota_event(
+            &mut state,
+            "Stop",
+            "s",
+            "t1",
+            None,
+            expired_at + Duration::from_secs(11),
+        );
+        assert!(!state.sessions.contains_key("s"));
+        assert!(state.final_pending, "late Stop schedules a final refresh");
+        assert_eq!(
+            schedule_action(&mut state, expired_at + Duration::from_secs(11)),
+            ScheduleAction::Wait(ACTIVE_INTERVAL - Duration::from_secs(11))
+        );
+    }
+
+    #[test]
+    fn late_old_turn_stop_does_not_close_newer_turn_but_keeps_final_refresh() {
+        let t = Instant::now();
+        let mut state = Activity::default();
+        quota_event(&mut state, "UserPromptSubmit", "s", "t1", None, t);
+        state.pending = false;
+        state.last_read = Some(t);
+        let expired_at = t + INACTIVITY_LEASE;
+        assert_eq!(
+            schedule_action(&mut state, expired_at),
+            ScheduleAction::Refresh
+        );
+        state.final_pending = false;
+        state.last_read = Some(expired_at);
+        quota_event(
+            &mut state,
+            "UserPromptSubmit",
+            "s",
+            "t2",
+            None,
+            expired_at + Duration::from_secs(1),
+        );
+        state.pending = false;
+        quota_event(
+            &mut state,
+            "Stop",
+            "s",
+            "t1",
+            None,
+            expired_at + Duration::from_secs(2),
+        );
+        assert_eq!(
+            state.sessions.get("s").map(|turn| turn.turn.as_str()),
+            Some("t2")
+        );
+        assert!(state.final_pending);
+    }
+
+    #[test]
+    fn cached_success_then_unauthorized_suppresses_same_turn_until_new_prompt() {
+        runtime().block_on(async {
+            let t = Instant::now();
+            let provider = Provider::default();
+            provider.set_enabled(true);
+            let mut activity = Activity::default();
+            quota_event(&mut activity, "UserPromptSubmit", "s", "t1", None, t);
+            activity.pending = false;
+            activity.last_read = Some(t);
+
+            let success = provider
+                .read_with_at(t, async { Ok(fresh_quotas(18.0)) })
+                .await;
+            assert!(success.available);
+            let requesting_turns = activity.requesting_turns();
+            let failed = provider
+                .read_with_at_policy(
+                    t + ACTIVE_INTERVAL,
+                    async { Err(FailureReason::Unauthorized) },
+                    true,
+                )
+                .await;
+            assert!(failed.available, "last good cache remains visible");
+            assert!(failed.stale);
+            assert_eq!(failed.failure_reason, Some(FailureReason::Unauthorized));
+            activity.last_read = Some(t + ACTIVE_INTERVAL);
+            record_read_result(&mut activity, &failed, &requesting_turns);
+            assert!(activity.failed_turns.contains(&("s".into(), "t1".into())));
+            assert!(matches!(
+                schedule_action(&mut activity, t + ACTIVE_INTERVAL + Duration::from_secs(1)),
+                ScheduleAction::Wait(_)
+            ));
+
+            quota_event(
+                &mut activity,
+                "Stop",
+                "s",
+                "t1",
+                None,
+                t + ACTIVE_INTERVAL + Duration::from_secs(2),
+            );
+            assert!(
+                !activity.final_pending,
+                "failed turn does not trigger an automatic final retry"
+            );
+            assert_eq!(
+                schedule_action(&mut activity, t + ACTIVE_INTERVAL + Duration::from_secs(2)),
+                ScheduleAction::Idle
+            );
+            quota_event(
+                &mut activity,
+                "UserPromptSubmit",
+                "s",
+                "t2",
+                None,
+                t + ACTIVE_INTERVAL + Duration::from_secs(3),
+            );
+            assert!(
+                activity.pending,
+                "a new turn clears suppression for its own check"
+            );
+            assert_eq!(
+                schedule_action(&mut activity, t + 2 * ACTIVE_INTERVAL),
+                ScheduleAction::Refresh
+            );
+        });
+    }
+
+    #[test]
+    fn scheduler_decision_handles_pending_events_during_fetch_and_failed_turn_lease_without_short_wakes(
+    ) {
+        let t = Instant::now();
+        let mut activity = Activity::default();
+        assert_eq!(schedule_action(&mut activity, t), ScheduleAction::Idle);
+        quota_event(&mut activity, "UserPromptSubmit", "a", "ta", None, t);
+        assert_eq!(schedule_action(&mut activity, t), ScheduleAction::Refresh);
+        activity.pending = false; // scheduler has started the single in-flight read
+        activity.last_read = Some(t);
+        quota_event(
+            &mut activity,
+            "UserPromptSubmit",
+            "b",
+            "tb",
+            None,
+            t + Duration::from_secs(1),
+        );
+        assert_eq!(
+            schedule_action(&mut activity, t + Duration::from_secs(2)),
+            ScheduleAction::Wait(ACTIVE_INTERVAL - Duration::from_secs(2))
+        );
+        // Completion of the first fetch leaves the second turn pending; it coalesces at cooldown.
+        assert_eq!(
+            schedule_action(&mut activity, t + ACTIVE_INTERVAL),
+            ScheduleAction::Refresh
+        );
+        activity.pending = false;
+        activity.last_read = Some(t + ACTIVE_INTERVAL);
+        let requesting_turns = activity.requesting_turns();
+        quota_event(
+            &mut activity,
+            "Stop",
+            "a",
+            "ta",
+            None,
+            t + ACTIVE_INTERVAL + Duration::from_secs(1),
+        );
+        assert!(activity.final_pending);
+        record_read_result(
+            &mut activity,
+            &Snapshot::unavailable(Some(FailureReason::Timeout)),
+            &requesting_turns,
+        );
+        assert!(
+            activity.final_pending,
+            "a failure must not erase another session's pending final refresh"
+        );
+        assert_eq!(
+            schedule_action(&mut activity, t + 2 * ACTIVE_INTERVAL),
+            ScheduleAction::Refresh
+        );
+        let provider = Provider::default();
+        provider.set_enabled(true);
+        provider.note_event("UserPromptSubmit", Some("s"), Some("turn"), None);
+        provider.set_enabled(false);
+        assert_eq!(
+            schedule_action(&mut provider.activity.lock().unwrap(), t),
+            ScheduleAction::Idle
+        );
+    }
+
+    #[test]
+    fn failure_does_not_suppress_a_parallel_session_that_started_during_fetch() {
+        let t = Instant::now();
+        let mut activity = Activity::default();
+        quota_event(&mut activity, "UserPromptSubmit", "a", "ta", None, t);
+        activity.pending = false;
+        activity.last_read = Some(t);
+        let requesting_turns = activity.requesting_turns(); // captured when the read starts
+
+        quota_event(
+            &mut activity,
+            "UserPromptSubmit",
+            "b",
+            "tb",
+            None,
+            t + Duration::from_secs(1),
+        );
+        let failed = Snapshot::unavailable(Some(FailureReason::Unauthorized));
+        record_read_result(&mut activity, &failed, &requesting_turns);
+
+        assert!(activity.failed_turns.contains(&("a".into(), "ta".into())));
+        assert!(!activity.failed_turns.contains(&("b".into(), "tb".into())));
+        assert!(activity.pending, "the newer session retains its pending check");
+        assert_eq!(
+            schedule_action(&mut activity, t + ACTIVE_INTERVAL),
+            ScheduleAction::Refresh
+        );
+    }
+
+    #[test]
+    fn scheduler_waits_for_failed_turn_lease_deadline_instead_of_waking_every_quarter_second() {
+        let t = Instant::now();
+        let mut activity = Activity::default();
+        quota_event(&mut activity, "UserPromptSubmit", "s", "t", None, t);
+        activity.pending = false;
+        activity.last_read = Some(t);
+        activity.failed_turns.insert(("s".into(), "t".into()));
+        assert_eq!(
+            schedule_action(&mut activity, t + ACTIVE_INTERVAL),
+            ScheduleAction::Wait(INACTIVITY_LEASE - ACTIVE_INTERVAL),
+        );
+    }
+
+    #[test]
+    fn opt_out_aborts_the_in_flight_fetch_and_removes_scheduler_activity() {
+        runtime().block_on(async {
+            let provider = Provider::default();
+            provider.set_enabled(true);
+            provider.note_event("UserPromptSubmit", Some("s"), Some("t"), None);
+            let task = tokio::spawn(std::future::pending::<()>());
+            *provider.read_abort.lock().unwrap() = Some(task.abort_handle());
+            provider.set_enabled(false);
+            assert!(
+                task.await.is_err(),
+                "disable aborts the outstanding fetch task"
+            );
+            assert_eq!(
+                schedule_action(&mut provider.activity.lock().unwrap(), Instant::now()),
+                ScheduleAction::Idle
+            );
+        });
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -1806,6 +2886,53 @@ mod tests {
             assert!(stale.available && stale.stale);
             assert_eq!(stale.quotas, fresh.quotas);
             assert_eq!(calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn final_event_refresh_at_scheduler_boundary_fetches_instead_of_reusing_cache() {
+        runtime().block_on(async {
+            let provider = Provider::default();
+            provider.set_enabled(true);
+            let base = Instant::now();
+            let calls = AtomicUsize::new(0);
+            let quotas = parse_rate_limits(&quota_result(), NOW).unwrap();
+
+            let initial = provider
+                .read_with_at_policy(base, async { Ok(quotas.clone()) }, true)
+                .await;
+            assert!(initial.available && !initial.stale);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Scheduler clears final_pending and admits the final read exactly at its
+            // three-minute boundary. Cache's fetched_at is intentionally one tick newer
+            // than scheduler's last_read to reproduce their former boundary race.
+            let mut activity = Activity::default();
+            quota_event(&mut activity, "UserPromptSubmit", "s", "t", None, base);
+            activity.pending = false;
+            activity.final_pending = true;
+            activity.last_read = Some(base);
+            assert_eq!(
+                schedule_action(&mut activity, base + ACTIVE_INTERVAL),
+                ScheduleAction::Refresh
+            );
+            activity.final_pending = false;
+            activity.last_read = Some(base + ACTIVE_INTERVAL);
+
+            let fetched = provider
+                .read_with_at_policy(
+                    base + ACTIVE_INTERVAL - Duration::from_nanos(1),
+                    async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(quotas)
+                    },
+                    true,
+                )
+                .await;
+            assert!(fetched.available && !fetched.stale);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "event read performed a real fetch");
+            assert!(!activity.final_pending);
+            assert!(!activity.pending);
         });
     }
 

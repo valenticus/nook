@@ -518,7 +518,19 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
         &event,
     );
     if let Some(agent) = real_delivery {
-        let _ = app.emit("connect-activity", serde_json::json!({ "agent": agent, "event": event }));
+        let _ = app.emit(
+            "connect-activity",
+            serde_json::json!({ "agent": agent, "event": event }),
+        );
+    }
+    #[cfg(feature = "codex-quota")]
+    if real_delivery == Some(connect_scanner::Agent::Codex) {
+        app.state::<crate::codex_quota::Provider>().note_event(
+            &event,
+            payload.get("session_id").and_then(Value::as_str),
+            payload.get("turn_id").and_then(Value::as_str),
+            payload.get("agent_id").and_then(Value::as_str),
+        );
     }
 
     // Where the session runs: kept here for the island's ↗, and told to the page

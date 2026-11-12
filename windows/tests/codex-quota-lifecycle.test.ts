@@ -126,14 +126,14 @@ test("an idle provider (answered, nothing usable in it) is unavailable, not 0%",
   assert.match(s.compact5.more ?? "", /Quota data unavailable/);
 });
 
-test("initial loading is Loading, not Unavailable, and not a zero", () => {
+test("initial null response is Loading but an enabled empty provider is idle, not a zero", () => {
   const nothingYet = screen(null);
   assert.equal(nothingYet.expanded.status, "Loading");
   assert.equal(nothingYet.compact5.text, "—");
   assert.match(nothingYet.compact5.more ?? "", /Loading/);
   // The provider was just switched on: a snapshot with no quotas, no time and no reason.
   const justEnabled = screen(snap(null, null, { quotas: null, available: false, updatedAt: null, failureReason: null }));
-  assert.equal(justEnabled.expanded.status, "Loading");
+  assert.equal(justEnabled.expanded.status, "Idle");
   assert.equal(justEnabled.compact5.text, "—");
 });
 
@@ -146,17 +146,12 @@ test("a window whose reset time is unknown (0) still shows its percentage, witho
   assert.equal(s.expanded.fiveHour?.resetCountdown, "");
 });
 
-test("the refresh loop is armed for the reset, not left to the ten-minute tick (wiring)", async () => {
+test("the refresh scheduler waits for hooks or due event work without idle polling", async () => {
   const rust = await readFile(new URL("../src-tauri/src/codex_quota.rs", import.meta.url), "utf8");
-  assert.match(rust, /timeout\(provider\.next_wait\(\), provider\.wake\.notified\(\)\)/);
-  assert.doesNotMatch(rust, /timeout\(MIN_REFRESH, provider\.wake\.notified\(\)\)/);
-  assert.match(rust, /fn reset_wait\(/);
-  assert.match(rust, /fn retry_soon\(/);
-  // No new polling: the shorter waits are bounded by a reset still ahead (and never above the usual interval),
-  // the spacing between reads, or the failure backoff — and never zero.
-  const resetWait = rust.slice(rust.indexOf("fn reset_wait("), rust.indexOf("pub struct Provider"));
-  assert.match(resetWait, /\.max\(spacing_left\)/, "the reset read waits for the spacing too");
-  assert.match(resetWait, /\.min\(MIN_REFRESH\)/, "and is never longer than the usual interval");
-  assert.match(resetWait, /spacing_left\.max\(MIN_WAKE\)/, "a window already over is read as soon as the spacing allows");
-  assert.match(rust, /const MIN_WAKE: Duration = Duration::from_secs\(1\)/, "with a floor, so the loop cannot spin");
+  assert.match(rust, /fn schedule_action\(/);
+  assert.match(rust, /ScheduleAction::Idle\s*=>\s*\{\s*let _ = provider\.wake\.notified\(\)\.await;/);
+  assert.match(rust, /ScheduleAction::Wait\(duration\)\s*=>\s*\{\s*let _ = timeout\(duration, provider\.wake\.notified\(\)\)\.await;/);
+  assert.match(rust, /ScheduleAction::Refresh\s*=>/);
+  assert.doesNotMatch(rust, /timeout\(provider\.next_wait\(\), provider\.wake\.notified\(\)\)/);
+  assert.match(rust, /INACTIVITY_LEASE\.saturating_sub\(/, "failed active turns wait for their lease deadline");
 });

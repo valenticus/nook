@@ -20,7 +20,7 @@
     "test:dev-hook-relay": "cargo test -p nook-hook --no-default-features --features nook-dev-relay --bin nook-hook-dev && node --experimental-strip-types --experimental-loader ./tests/resolve-ts-loader.mjs --test tests/real-hook-event-state.test.ts tests/island-autoclose.test.ts",
     "test:dev-hook-ipc": "cargo test -p nook-hook --no-default-features --features nook-dev-relay --test dev_relay",
     "test:dev-build-artifact": "node scripts/test-dev-build-artifact.mjs",
-    "test:codex-quota-view": "node --experimental-strip-types --test tests/codex-quota-view.test.ts tests/quota-layout-smoke.test.ts && node scripts/test-settings-simulator-layout.mjs home-usage-layout.html",
+    "test:codex-quota-view": "node --experimental-strip-types --experimental-loader ./tests/resolve-ts-loader.mjs --test tests/codex-quota-view.test.ts tests/quota-layout-smoke.test.ts && node scripts/test-settings-simulator-layout.mjs home-usage-layout.html",
     "preview": "vite preview",
     "icons": "node scripts/gen-icons.mjs",
     "fake-session": "node scripts/fake-session.mjs",

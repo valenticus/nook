@@ -23,8 +23,10 @@ test("Claude-only hides Codex; Codex-only exposes its two independent windows", 
   assert.equal(formatQuotaPercent(snapshot().quotas!.fiveHour!.usedPercent), "6%");
 });
 
-test("fresh, stale, unavailable, and disabled are distinct and never invent zeros", () => {
-  assert.equal(quotaProviderDisplay(true, { generation: 1, quotas: null, updatedAt: null, stale: false, available: false, failureReason: null }, NOW).status, "Loading");
+test("idle, fresh, stale, unavailable, and disabled are distinct and never invent zeros", () => {
+  const idle = quotaProviderDisplay(true, { generation: 1, quotas: null, updatedAt: null, stale: false, available: false, failureReason: null }, NOW);
+  assert.equal(idle.status, "Idle");
+  assert.equal(idle.fiveHour, null);
   assert.equal(quotaProviderDisplay(true, snapshot(), NOW).status, "Fresh");
   const stale = quotaProviderDisplay(true, snapshot({ stale: true }), NOW);
   assert.equal(stale.status, "Stale");
@@ -78,6 +80,13 @@ test("a reset window is unavailable while an unexpired sibling remains displayab
 test("disabled provider result cannot mask a re-enabled provider as Disabled", () => {
   const view = quotaProviderDisplay(true, snapshot({ quotas: null, available: false, updatedAt: null, failureReason: "disabled" }), NOW);
   assert.equal(view.status, "Loading");
+});
+
+test("reset snapshot waits for Codex activity without retaining the previous quota", () => {
+  const reset = quotaProviderDisplay(true, { generation: 2, quotas: null, updatedAt: null, stale: false, available: false, failureReason: null }, NOW);
+  assert.equal(reset.status, "Idle");
+  assert.equal(reset.fiveHour, null);
+  assert.equal(reset.lastSuccessfulUpdate, null);
 });
 
 test("real provider failures leave Loading and show Unavailable", () => {

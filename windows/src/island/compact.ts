@@ -104,7 +104,7 @@ export function reading(kind: CompactMetric, { usage, waiting, codexQuota, codex
         const win = kind === "usage5h" ? display.fiveHour : display.sevenDay;
         const agentName = compactAgentName("codex");
         if (!win || win.state === "unavailable") {
-          const state = win?.state === "unavailable" ? message(USAGE_RESET_WORDS) : message(display.status);
+          const state = win?.state === "unavailable" ? message(USAGE_RESET_WORDS) : display.status === "Idle" ? message("Waiting for Codex activity") : message(display.status);
           const reason = display.failureReason ? quotaFailureReasonLabel(display.failureReason) : "";
           return { text: "—", more: [agentName, state, reason].filter(Boolean).join(" · "), dim: true };
         }

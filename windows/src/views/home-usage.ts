@@ -143,11 +143,11 @@ export function buildHomeUsage() {
     });
     setHiddenIfChanged(codex.empty, hasCodexWindow);
     if (!hasCodexWindow) {
-      const emptyMessage = message(quota.status === "Loading" ? "Waiting for quota update" : "Quota data is unavailable");
+      const emptyMessage = message(quota.status === "Idle" ? "Waiting for Codex activity" : quota.status === "Loading" ? "Waiting for quota update" : "Quota data is unavailable");
       if (codex.empty.dataset.why !== emptyMessage) {
         codex.empty.dataset.why = emptyMessage;
         clear(codex.empty);
-        codex.empty.append(h("b", { text: message(quota.status) }), h("span", { text: emptyMessage }));
+        codex.empty.append(h("b", { text: quota.status === "Idle" ? message("Waiting for Codex activity") : message(quota.status) }), h("span", { text: emptyMessage }));
       }
     }
     paintAge(codex.age, codex.ageWhat, codex.ageWhen, quota.updatedAt, message("as of Codex quota update"), now, quota.status === "Stale");

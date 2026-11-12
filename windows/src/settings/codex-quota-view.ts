@@ -1,7 +1,7 @@
 import { currentLanguage, message } from "../core/i18n";
 import { resetCountdown } from "../core/state";
 
-export type QuotaProviderStatus = "Disabled" | "Loading" | "Fresh" | "Stale" | "Unavailable";
+export type QuotaProviderStatus = "Disabled" | "Loading" | "Idle" | "Fresh" | "Stale" | "Unavailable";
 
 export interface QuotaWindowValue {
   usedPercent: number;
@@ -76,7 +76,7 @@ export function quotaProviderDisplay(enabled: boolean, snapshot: CodexQuotaInput
   else if (snapshot.available && (snapshot.quotas?.fiveHour || snapshot.quotas?.sevenDay)) {
     const windows = [snapshot.quotas?.fiveHour, snapshot.quotas?.sevenDay].filter((window): window is QuotaWindowValue => !!window && (window.resetsAt <= 0 || window.resetsAt > now));
     status = windows.length ? "Fresh" : "Unavailable";
-  } else if (!snapshot.failureReason && snapshot.quotas == null && snapshot.updatedAt == null) status = "Loading";
+  } else if (!snapshot.failureReason && snapshot.quotas == null && snapshot.updatedAt == null) status = "Idle";
   else status = "Unavailable";
 
   const showWindows = enabled && (status === "Fresh" || status === "Stale");

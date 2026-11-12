@@ -1508,7 +1508,7 @@ function quotaWindowRow(label: string, window: QuotaWindowDisplay | null, status
       h("span", { class: "sp-codex-quota-empty", text: "Unavailable" }));
   }
   if (!window) {
-    const emptyLabel = status === "Loading" ? "Waiting for provider update" : status === "Disabled" ? "Provider is disabled" : "Unavailable";
+    const emptyLabel = status === "Idle" ? "Waiting for Codex activity" : status === "Loading" ? "Waiting for provider update" : status === "Disabled" ? "Provider is disabled" : "Unavailable";
     return h("div", { class: "sp-codex-quota-row" },
       h("strong", { text: message(label) }),
       h("span", { class: "sp-codex-quota-empty", text: message(emptyLabel) }));
@@ -1527,7 +1527,7 @@ function paintCodexQuota() {
   codexQuotaPanel.append(
     h("div", { class: "sp-codex-quota-heading" },
       h("strong", { text: message("Status") }),
-      h("span", { class: "sp-codex-quota-state", text: display.status })),
+      h("span", { class: "sp-codex-quota-state", text: display.status === "Idle" ? message("Waiting for Codex activity") : display.status })),
     quotaWindowRow("Codex 5h", display.fiveHour, display.status),
     quotaWindowRow("Codex 7d", display.sevenDay, display.status),
     h("div", { class: "sp-codex-quota-meta" },

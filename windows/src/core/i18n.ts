@@ -778,6 +778,7 @@ export const MESSAGES = {
   "Configured": { en: "Configured", uk: "Налаштовано" },
   "Receiving events": { en: "Receiving events", uk: "Отримує події" },
   "Waiting for activity": { en: "Waiting for activity", uk: "Очікує на активність" },
+  "Waiting for Codex activity": { en: "Waiting for Codex activity", uk: "Очікування активності Codex" },
   "No events received": { en: "No events received", uk: "Подій ще не отримано" },
   "Original Nook hooks were found. Review a migration preview to move them safely.": { en: "Original Nook hooks were found. Review a migration preview to move them safely.", uk: "Знайдено hooks оригінального Nook. Перегляньте попередній перегляд міграції." },
   "Nook Dev hooks were found. They are left untouched unless you approve each scope.": { en: "Nook Dev hooks were found. They are left untouched unless you approve each scope.", uk: "Знайдено hooks Nook Dev. Їх не буде змінено без окремого підтвердження для кожної області." },
