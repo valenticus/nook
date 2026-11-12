@@ -6,11 +6,13 @@ import { COMPACT_AGENT_ICON_W, COMPACT_CELL_H, COMPACT_MAX_VISIBLE, COMPACT_USAG
 import { BRANDS, CLAUDE_BRAND_MARK, CLAUDE_MARK, OPENAI_BRAND_MARK } from "../src/views/iconset.ts";
 import { toolMarkAsset } from "../src/views/tool.ts";
 import { message, setLanguage } from "../src/core/i18n.ts";
+import { newSession, State } from "../src/core/state.ts";
+import { roster } from "../src/views/roster.ts";
 import type { QuotaProviderSnapshot } from "../src/settings/codex-quota-view.ts";
 
 Object.assign(globalThis, { __nookDevBuildFlag: true });
-const { availableCompactUsageAgents, compactAgentName, compactAgentPath, compactReducedMotion, reading, waitingSignal } = await import("../src/island/compact.ts");
-const { COMPACT_USAGE_ROTATION_MS, createCompactUsageCycle } = await import("../src/island/compact-usage-cycle.ts");
+const { activeCompactUsageAgents, availableCompactUsageAgents, compactAgentName, compactAgentPath, compactReducedMotion, reading, waitingSignal } = await import("../src/island/compact.ts");
+const { COMPACT_USAGE_ROTATION_MS, compactUsageAgentsForActivity, compactUsageAgentsWhileHovered, createCompactUsageCycle } = await import("../src/island/compact-usage-cycle.ts");
 
 const NOW = 1_800_000_000_000;
 const codex = (patch: Partial<QuotaProviderSnapshot> = {}): QuotaProviderSnapshot => ({
@@ -132,6 +134,161 @@ test("expanded view stops rotation and re-entering compact starts a single timer
   assert.equal(clock.pending.size, 1);
   clock.cycle.destroy();
   assert.equal(clock.pending.size, 0);
+});
+
+test("context selection pins a sole active agent and rotates for both or neither", () => {
+  const both = ["claude", "codex"] as const;
+  assert.deepEqual(compactUsageAgentsForActivity(both, ["codex"]), ["codex"]);
+  assert.deepEqual(compactUsageAgentsForActivity(both, ["claude"]), ["claude"]);
+  assert.deepEqual(compactUsageAgentsForActivity(both, both), both);
+  assert.deepEqual(compactUsageAgentsForActivity(both, []), both);
+  assert.deepEqual(compactUsageAgentsForActivity(["codex"], ["claude"]), ["codex"]);
+  assert.deepEqual(compactUsageAgentsForActivity([], ["claude"]), []);
+});
+
+test("one live session among several keeps its provider active; ended and quiet sessions do not", () => {
+  const claude = newSession("claude-live", "claude");
+  claude.state = "thinking";
+  claude.heardAt = NOW;
+  const claudeEnded = newSession("claude-ended", "claude");
+  claudeEnded.state = "finished";
+  claudeEnded.restedAt = NOW - 60_000;
+  const codexQuiet = newSession("codex-quiet", "codex");
+  codexQuiet.state = "working";
+  codexQuiet.heardAt = NOW - 10 * 60_000;
+  State.sessions = [claude, claudeEnded, codexQuiet];
+  assert.deepEqual(activeCompactUsageAgents(roster(NOW).live, NOW), ["claude"]);
+
+  const codexEnded = newSession("codex-ended", "codex");
+  codexEnded.state = "idle";
+  codexEnded.restedAt = NOW - 6 * 60_000;
+  State.sessions = [claudeEnded, codexEnded];
+  assert.deepEqual(activeCompactUsageAgents(roster(NOW).live, NOW), []);
+  State.sessions = [];
+});
+
+test("context changes do not rotate a sole active provider, then resume stable five-second rotation", () => {
+  const clock = fakeClock();
+  const cycle = createCompactUsageCycle(() => {}, (callback, delay) => {
+    const id = clock.pending.size + 1;
+    clock.pending.set(id, { callback, delay });
+    return id;
+  }, (id) => { clock.pending.delete(id); });
+  const update = (active: readonly ("claude" | "codex")[]) =>
+    cycle.configure(compactUsageAgentsForActivity(["claude", "codex"], active), true, false);
+
+  update(["codex"]);
+  assert.equal(cycle.current(), "codex");
+  assert.equal(clock.pending.size, 0);
+  for (let i = 0; i < 12; i++) update(["codex"]);
+  assert.equal(clock.pending.size, 0, "repeated activity events do not restart rotation");
+
+  update(["claude", "codex"]);
+  assert.equal(clock.pending.size, 1);
+  assert.equal([...clock.pending.values()][0]?.delay, COMPACT_USAGE_ROTATION_MS);
+  const timer = [...clock.pending.entries()][0]!;
+  clock.pending.delete(timer[0]);
+  timer[1].callback();
+  assert.equal(cycle.current(), "claude");
+  assert.equal(clock.pending.size, 1);
+
+  update(["claude"]);
+  assert.equal(cycle.current(), "claude");
+  assert.equal(clock.pending.size, 0);
+  cycle.configure(["codex"], true, false);
+  assert.equal(cycle.current(), "codex", "one available quota source wins even if the other agent is active");
+  assert.equal(clock.pending.size, 0);
+  cycle.configure([], true, false);
+  assert.equal(cycle.current(), "claude", "no source retains the existing Claude fallback");
+  assert.equal(clock.pending.size, 0);
+  cycle.destroy();
+  State.sessions = [];
+});
+
+/** The folded Island's selection step, in the order writeValues applies it. */
+function hoverHarness() {
+  const clock = fakeClock();
+  const update = (usable: readonly ("claude" | "codex")[], active: readonly ("claude" | "codex")[], hovered: boolean) =>
+    clock.cycle.configure(
+      compactUsageAgentsWhileHovered(compactUsageAgentsForActivity(usable, active), usable, clock.cycle.current(), hovered),
+      true,
+      hovered,
+    );
+  return { ...clock, update };
+}
+
+test("an activity change during hover keeps the shown provider until the pointer leaves", () => {
+  const both = ["claude", "codex"] as const;
+  const { cycle, pending, update } = hoverHarness();
+  update(both, both, false);
+  assert.equal(cycle.current(), "claude");
+  assert.equal(pending.size, 1);
+
+  update(both, both, true);
+  assert.equal(pending.size, 0, "hover stops the rotation");
+  update(both, ["codex"], true);
+  assert.equal(cycle.current(), "claude", "Codex alone working does not switch the provider under the pointer");
+  for (let i = 0; i < 12; i++) update(both, ["codex"], true);
+  assert.equal(cycle.current(), "claude");
+  assert.equal(pending.size, 0, "repeated events during hover schedule nothing");
+
+  update(both, ["codex"], false);
+  assert.equal(cycle.current(), "codex", "the remembered state applies once hover ends");
+  assert.equal(pending.size, 0, "a sole active provider does not rotate");
+  cycle.destroy();
+});
+
+test("hover end applies the current activity: Claude alone, or rotation for both or neither", () => {
+  const both = ["claude", "codex"] as const;
+  for (const [active, expected, timers] of [
+    [["claude"], "claude", 0],
+    [both, "codex", 1],
+    [[], "codex", 1],
+  ] as const) {
+    const { cycle, pending, update } = hoverHarness();
+    update(both, ["codex"], false);
+    assert.equal(cycle.current(), "codex");
+    update(both, ["codex"], true);
+    update(both, active, true);
+    assert.equal(cycle.current(), "codex", "nothing changes while hovered");
+    assert.equal(pending.size, 0);
+
+    update(both, active, false);
+    assert.equal(cycle.current(), expected);
+    assert.equal(pending.size, timers, "exactly one rotation timer, or none");
+    if (timers) {
+      assert.equal([...pending.values()][0]?.delay, COMPACT_USAGE_ROTATION_MS);
+      const [id, timer] = [...pending.entries()][0]!;
+      pending.delete(id);
+      timer.callback();
+      assert.equal(cycle.current(), "claude", "rotation resumes from the provider that was shown");
+      assert.equal(pending.size, 1);
+    }
+    cycle.destroy();
+  }
+});
+
+test("if the shown provider's quota becomes unusable during hover, the fallback applies at once", () => {
+  const both = ["claude", "codex"] as const;
+  const { cycle, pending, update } = hoverHarness();
+  update(both, ["codex"], false);
+  update(both, ["codex"], true);
+  assert.equal(cycle.current(), "codex");
+
+  update(["claude"], ["codex"], true);
+  assert.equal(cycle.current(), "claude", "an unusable Codex snapshot is not kept on show");
+  assert.equal(pending.size, 0);
+
+  update([], ["codex"], true);
+  assert.equal(cycle.current(), "claude", "with no usable source the existing Claude fallback stays");
+  assert.equal(pending.size, 0);
+
+  update(both, ["codex"], true);
+  assert.equal(cycle.current(), "claude", "a source coming back during hover does not switch either");
+  update(both, ["codex"], false);
+  assert.equal(cycle.current(), "codex");
+  assert.equal(pending.size, 0);
+  cycle.destroy();
 });
 
 test("agent name and both readings use the same selected provider snapshot", () => {

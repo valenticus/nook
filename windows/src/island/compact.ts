@@ -25,7 +25,7 @@ import { wear } from "../views/palette";
 import { DOT_LEGEND, TOOL_NAME } from "../views/tool";
 import { labelText, roster, stateWords, waitingCount, type Entry } from "../views/roster";
 import { quotaFailureReasonLabel, quotaProviderDisplay } from "../settings/codex-quota-view";
-import { createCompactUsageCycle, type UsageAgent } from "./compact-usage-cycle";
+import { compactUsageAgentsForActivity, compactUsageAgentsWhileHovered, createCompactUsageCycle, type UsageAgent } from "./compact-usage-cycle";
 import { Bridge, type DevBatteryStatus } from "../core/bridge";
 import { advanceBatteryAlertGate, batteryLevel, batteryPollDelay, cancelIdleTimers, EMPTY_BATTERY_ALERT_CYCLE, EMPTY_BATTERY_ALERT_GATE, formatLocalClock, hasKnownBattery, IDLE_AFTER_MS, idleStatusExtent, latestActivityAt, shouldShowIdle, updateBatteryAlertCycle, type BatteryAlert, type BatteryAlertCycle, type BatteryAlertGate } from "./idle-mode";
 import { isQuiet } from "../core/state";
@@ -92,6 +92,18 @@ export function availableCompactUsageAgents(from: Gauges, now = from.now ?? Date
     }
   }
   return available;
+}
+
+/** Live Claude/Codex turns from the same roster the Island displays; quiet and completed sessions do not count. */
+export function activeCompactUsageAgents(entries: readonly Entry[], now = Date.now()): UsageAgent[] {
+  const active = new Set<UsageAgent>();
+  for (const { session, lane } of entries) {
+    if (!session || lane !== "working" || (session.agent !== "claude" && session.agent !== "codex")) continue;
+    if ((session.state !== "working" && session.state !== "thinking" && session.state !== "searching")
+      || session.approval || session.question || isQuiet(session, now)) continue;
+    active.add(session.agent);
+  }
+  return (["claude", "codex"] as const).filter((agent) => active.has(agent));
 }
 
 /** What one cell says, from the gauges alone: nothing here looks at the island. */
@@ -472,7 +484,10 @@ export function buildCompact(devFixture?: CompactDevFixture, batteryAlertHandler
     }
     previousWaiting = base.waiting;
     if (cycle) {
-      cycle.configure(availableCompactUsageAgents(base), State.mode === "compact", hovered);
+      const usable = availableCompactUsageAgents(base);
+      const active = activeCompactUsageAgents(roster(base.now).live, base.now);
+      const preferred = compactUsageAgentsForActivity(usable, active);
+      cycle.configure(compactUsageAgentsWhileHovered(preferred, usable, cycle.current(), hovered), State.mode === "compact", hovered);
       usageAgent = cycle.current();
     }
     const from = { ...base, usageAgent };

@@ -3,6 +3,36 @@ export type UsageAgent = "claude" | "codex";
 export const COMPACT_USAGE_ROTATION_MS = 5_000;
 const ORDER: readonly UsageAgent[] = ["claude", "codex"];
 
+/**
+ * When both quota snapshots are usable, pin the folded Island to the sole
+ * provider with a live turn. With both or neither active, keep the normal
+ * rotation. Availability takes precedence, so a single usable provider never
+ * rotates and an empty set leaves the caller's existing fallback untouched.
+ */
+export function compactUsageAgentsForActivity(
+  available: readonly UsageAgent[],
+  active: readonly UsageAgent[],
+): UsageAgent[] {
+  const usable = ORDER.filter((agent) => available.includes(agent));
+  if (usable.length !== 2) return usable;
+  const activeUsable = ORDER.filter((agent) => active.includes(agent) && usable.includes(agent));
+  return activeUsable.length === 1 ? activeUsable : usable;
+}
+
+/**
+ * While the folded Island is hovered, hold the provider on show: a change in
+ * activity takes effect once the pointer leaves. If the shown provider's quota
+ * stops being usable, the regular selection and its fallback apply at once.
+ */
+export function compactUsageAgentsWhileHovered(
+  next: readonly UsageAgent[],
+  usable: readonly UsageAgent[],
+  shown: UsageAgent,
+  hovered: boolean,
+): readonly UsageAgent[] {
+  return hovered && usable.includes(shown) ? [shown] : next;
+}
+
 export interface CompactUsageCycle {
   configure(available: readonly UsageAgent[], visible: boolean, hovered: boolean): void;
   current(): UsageAgent;
