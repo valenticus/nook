@@ -27,8 +27,8 @@ import { labelText, roster, stateWords, waitingCount, type Entry } from "../view
 import { quotaFailureReasonLabel, quotaProviderDisplay } from "../settings/codex-quota-view";
 import { compactUsageAgentsForActivity, compactUsageAgentsWhileHovered, createCompactUsageCycle, type UsageAgent } from "./compact-usage-cycle";
 import { Bridge, type DevBatteryStatus } from "../core/bridge";
-import { advanceBatteryAlertGate, batteryLevel, batteryPollDelay, cancelIdleTimers, EMPTY_BATTERY_ALERT_CYCLE, EMPTY_BATTERY_ALERT_GATE, formatLocalClock, hasKnownBattery, IDLE_AFTER_MS, idleStatusExtent, latestActivityAt, shouldShowIdle, updateBatteryAlertCycle, type BatteryAlert, type BatteryAlertCycle, type BatteryAlertGate } from "./idle-mode";
-import { isQuiet } from "../core/state";
+import { advanceBatteryAlertGate, batteryLevel, batteryPollDelay, cancelIdleTimers, createQuietDeadlineTimer, EMPTY_BATTERY_ALERT_CYCLE, EMPTY_BATTERY_ALERT_GATE, formatLocalClock, hasKnownBattery, IDLE_AFTER_MS, idleStatusExtent, latestActivityAt, shouldShowIdle, updateBatteryAlertCycle, type BatteryAlert, type BatteryAlertCycle, type BatteryAlertGate } from "./idle-mode";
+import { isQuiet, quietAt } from "../core/state";
 
 /** A cell's icon, and its number's size: the icons of the set, on their 24 px grid. */
 const COMPACT_ICON = 14;
@@ -345,6 +345,10 @@ export function buildCompact(devFixture?: CompactDevFixture, batteryAlertHandler
   let activityTimer: number | null = null;
   let idleOn = false;
   let disposed = false;
+  const quietDeadlineTimer = createQuietDeadlineTimer(
+    (callback, delay) => window.setTimeout(callback, delay),
+    (id) => window.clearTimeout(id),
+  );
   let batteryCycle: BatteryAlertCycle = EMPTY_BATTERY_ALERT_CYCLE;
   let batteryAlertGate: BatteryAlertGate = EMPTY_BATTERY_ALERT_GATE;
   let batterySimulated = false;
@@ -429,6 +433,10 @@ export function buildCompact(devFixture?: CompactDevFixture, batteryAlertHandler
     if (waitingCount() > 0 || importantNotification || (now >= due && !activeWork)) { activityTimer = null; return; }
     const delay = now < due ? due - now : 60_000;
     activityTimer = window.setTimeout(() => { activityTimer = null; State.notify(); }, delay + 1);
+  };
+  const scheduleQuietCheck = () => {
+    const now = Date.now();
+    quietDeadlineTimer.reschedule(State.sessions.map(quietAt), now, USAGE_ROTATION_BUILD && !disposed && State.mode === "compact", () => State.notify());
   };
   const scheduleClock = () => {
     if (!idleOn || disposed) return;
@@ -534,6 +542,7 @@ export function buildCompact(devFixture?: CompactDevFixture, batteryAlertHandler
   const unsubscribeState = IDLE_CLOCK_BUILD ? State.subscribe(() => {
     writeValues();
     renderBattery();
+    scheduleQuietCheck();
     if (NOOK_DEV_BUILD) maybePresentBatteryAlert();
   }) : null;
   const pageHide = () => dispose();
@@ -552,6 +561,7 @@ export function buildCompact(devFixture?: CompactDevFixture, batteryAlertHandler
     unsubscribeGauges();
     unsubscribeState?.();
     cancelIdleTimers({ activity: activityTimer, clock: clockTimer, battery: batteryTimer }, (id) => window.clearTimeout(id));
+    quietDeadlineTimer.cancel();
     activityTimer = clockTimer = batteryTimer = null;
     if (IDLE_CLOCK_BUILD) {
       window.removeEventListener("pagehide", pageHide);
@@ -571,6 +581,7 @@ export function buildCompact(devFixture?: CompactDevFixture, batteryAlertHandler
     sync(plan) {
       setIdle(plan.idle && State.mode === "compact");
       if (IDLE_CLOCK_BUILD) scheduleActivityCheck();
+      scheduleQuietCheck();
       const slots = compactSlots(plan, gauges());
       const more = slots.more;
       const nextDots = `${slots.dots.map((d) => `${d.id}:${d.color}:${d.calls}:${d.rest}:${d.decision}:${d.cursor}:${d.title}`).join("|")}#${more ? `${more.count}:${more.color}:${more.calls}` : ""}`;

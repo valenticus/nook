@@ -5,6 +5,34 @@ export const IDLE_AFTER_MS = 300_000;
 export const BATTERY_STATUS_POLL_MS = 60_000;
 export const NO_SYSTEM_BATTERY_RECHECK_MS = 5 * 60_000;
 
+/** One replaceable timer for the nearest active session quiet deadline. */
+export function createQuietDeadlineTimer(
+  schedule: (callback: () => void, delay: number) => number,
+  cancel: (id: number) => void,
+) {
+  let timer: number | null = null;
+  const clear = () => {
+    if (timer != null) cancel(timer);
+    timer = null;
+  };
+  return {
+    reschedule(deadlines: readonly (number | null)[], now: number, enabled: boolean, onDue: () => void) {
+      clear();
+      if (!enabled) return;
+      let nearest: number | null = null;
+      for (const deadline of deadlines) {
+        if (deadline != null && deadline > now && (nearest == null || deadline < nearest)) nearest = deadline;
+      }
+      if (nearest == null) return;
+      timer = schedule(() => {
+        timer = null;
+        onDue();
+      }, nearest - now + 1);
+    },
+    cancel: clear,
+  };
+}
+
 export function formatLocalClock(hour: number, minute: number): string {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }

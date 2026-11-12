@@ -6,7 +6,8 @@ import { COMPACT_AGENT_ICON_W, COMPACT_CELL_H, COMPACT_MAX_VISIBLE, COMPACT_USAG
 import { BRANDS, CLAUDE_BRAND_MARK, CLAUDE_MARK, OPENAI_BRAND_MARK } from "../src/views/iconset.ts";
 import { toolMarkAsset } from "../src/views/tool.ts";
 import { message, setLanguage } from "../src/core/i18n.ts";
-import { newSession, State } from "../src/core/state.ts";
+import { newSession, quietAt, State } from "../src/core/state.ts";
+import { createQuietDeadlineTimer } from "../src/island/idle-mode.ts";
 import { roster } from "../src/views/roster.ts";
 import type { QuotaProviderSnapshot } from "../src/settings/codex-quota-view.ts";
 
@@ -164,6 +165,105 @@ test("one live session among several keeps its provider active; ended and quiet 
   codexEnded.restedAt = NOW - 6 * 60_000;
   State.sessions = [claudeEnded, codexEnded];
   assert.deepEqual(activeCompactUsageAgents(roster(NOW).live, NOW), []);
+  State.sessions = [];
+});
+
+function quietTimerHarness() {
+  let nextId = 1;
+  const pending = new Map<number, { callback: () => void; delay: number }>();
+  const timer = createQuietDeadlineTimer(
+    (callback, delay) => { const id = nextId++; pending.set(id, { callback, delay }); return id; },
+    (id) => { pending.delete(id); },
+  );
+  return { timer, pending };
+}
+
+test("Codex and Claude selection refresh automatically when the sole active session gets quiet", () => {
+  for (const agent of ["codex", "claude"] as const) {
+    const session = newSession(`${agent}-quiet-deadline`, agent);
+    session.state = "working";
+    session.heardAt = NOW;
+    State.sessions = [session];
+    const { timer, pending } = quietTimerHarness();
+    const rotation = fakeClock();
+    let now = NOW;
+    let quotaFetches = 0;
+    rotation.cycle.configure(["claude", "codex"], true, false);
+    rotation.cycle.configure([agent], true, false);
+    assert.equal(rotation.pending.size, 0, "a sole active provider does not rotate before quiet");
+    const onQuiet = () => {
+      const active = activeCompactUsageAgents(roster(now).live, now);
+      assert.deepEqual(active, []);
+      rotation.cycle.configure(compactUsageAgentsForActivity(["claude", "codex"], active), true, false);
+      assert.equal(rotation.pending.size, 1, "quiet transition starts the existing 5-second rotation");
+      assert.equal(quotaFetches, 0, "the quiet timer only recomputes selection");
+    };
+    timer.reschedule(State.sessions.map(quietAt), now, true, onQuiet);
+    assert.equal(pending.size, 1);
+    const scheduled = [...pending.entries()][0]!;
+    now = NOW + 10 * 60_000 + 1;
+    pending.delete(scheduled[0]);
+    scheduled[1].callback();
+    assert.equal(pending.size, 0);
+    rotation.cycle.destroy();
+    timer.cancel();
+  }
+  State.sessions = [];
+});
+
+test("quiet deadlines keep one nearest timer and a new event replaces the old deadline", () => {
+  const first = newSession("quiet-first", "codex");
+  first.state = "thinking";
+  first.heardAt = NOW;
+  const second = newSession("quiet-second", "claude");
+  second.state = "working";
+  second.heardAt = NOW + 5 * 60_000;
+  const { timer, pending } = quietTimerHarness();
+  timer.reschedule([quietAt(first), quietAt(second)], NOW, true, () => {});
+  assert.equal(pending.size, 1);
+  assert.equal([...pending.values()][0]?.delay, 10 * 60_000 + 1);
+
+  first.heardAt = NOW + 4 * 60_000;
+  timer.reschedule([quietAt(first), quietAt(second)], NOW + 4 * 60_000, true, () => {});
+  assert.equal(pending.size, 1, "reschedule replaces, never adds, a timer");
+  assert.equal([...pending.values()][0]?.delay, 10 * 60_000 + 1);
+
+  timer.reschedule([], NOW + 4 * 60_000, true, () => {}); // Stop / no eligible sessions
+  assert.equal(pending.size, 0);
+  timer.reschedule([quietAt(first)], NOW + 4 * 60_000, false, () => {}); // hidden Island
+  assert.equal(pending.size, 0);
+  timer.reschedule([quietAt(first)], NOW + 4 * 60_000, true, () => {});
+  timer.cancel(); // disposed Island
+  assert.equal(pending.size, 0);
+});
+
+test("quiet recomputation honors hover freeze and resumes selection after hover", () => {
+  const session = newSession("codex-hover-quiet", "codex");
+  session.state = "working";
+  session.heardAt = NOW;
+  State.sessions = [session];
+  const { timer, pending } = quietTimerHarness();
+  const rotationPending = new Map<number, { callback: () => void; delay: number }>();
+  const cycle = createCompactUsageCycle(() => {}, (callback, delay) => { rotationPending.set(1, { callback, delay }); return 1; }, (id) => { rotationPending.delete(id); });
+  cycle.configure(["claude", "codex"], true, false);
+  cycle.configure(["codex"], true, false);
+  const shown = cycle.current();
+  cycle.configure(["claude", "codex"], true, true);
+  let now = NOW + 10 * 60_000 + 1;
+  timer.reschedule(State.sessions.map(quietAt), NOW, true, () => {
+    const active = activeCompactUsageAgents(roster(now).live, now);
+    cycle.configure(compactUsageAgentsWhileHovered(compactUsageAgentsForActivity(["claude", "codex"], active), ["claude", "codex"], cycle.current(), true), true, true);
+  });
+  const [id, scheduled] = [...pending.entries()][0]!;
+  pending.delete(id);
+  scheduled.callback();
+  assert.equal(cycle.current(), shown, "quiet transition does not switch provider under hover");
+  assert.equal(rotationPending.size, 0);
+  cycle.configure(["claude", "codex"], true, false);
+  assert.equal(cycle.current(), shown, "after hover, neither-active rotation resumes from shown provider");
+  assert.equal(rotationPending.size, 1);
+  cycle.destroy();
+  timer.cancel();
   State.sessions = [];
 });
 
