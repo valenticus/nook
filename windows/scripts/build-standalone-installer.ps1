@@ -9,10 +9,10 @@ $env:NOOK_DEV_BUILD = '0'
 $configPath = Join-Path $windowsRoot 'src-tauri\tauri.nook-standalone.conf.json'
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
 if ($config.productName -ne 'Nook Personal Edition' -or
-    $config.version -ne '0.1.0' -or
+    $config.version -ne '0.2.0' -or
     $config.identifier -ne 'io.github.valenticus.nook' -or
     $config.mainBinaryName -ne 'nook-standalone') {
-  throw 'Standalone product identity/version is not the approved Nook Personal Edition 0.1.0 identity.'
+  throw 'Standalone product identity/version is not the approved Nook Personal Edition 0.2.0 identity.'
 }
 if ($config.build.beforeBuildCommand -ne 'npm run build:standalone' -or
     $config.build.frontendDist -ne '../dist-standalone') {
@@ -82,14 +82,14 @@ try {
   $relayInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($relay)
   if ($appInfo.ProductName -ne 'Nook Personal Edition' -or
       $appInfo.FileDescription -ne 'Nook Personal Edition' -or
-      $appInfo.ProductVersion -notlike '0.1.0*' -or
+      $appInfo.ProductVersion -notlike '0.2.0*' -or
       $appInfo.LegalCopyright -notlike '*Zubair Bin Shaukat and contributors*') {
     throw "App metadata mismatch: Product='$($appInfo.ProductName)', Description='$($appInfo.FileDescription)', Version='$($appInfo.ProductVersion)'"
   }
   if ($relayInfo.ProductName -ne 'Nook Personal Edition' -or
       $relayInfo.FileDescription -ne 'Nook Personal Edition' -or
       $relayInfo.OriginalFilename -ne 'nook-hook-standalone.exe' -or
-      $relayInfo.ProductVersion -notlike '0.1.0*' -or
+      $relayInfo.ProductVersion -notlike '0.2.0*' -or
       $relayInfo.LegalCopyright -notlike '*Zubair Bin Shaukat and contributors*') {
     throw "Relay metadata mismatch: Product='$($relayInfo.ProductName)', Description='$($relayInfo.FileDescription)', Filename='$($relayInfo.OriginalFilename)', Version='$($relayInfo.ProductVersion)'"
   }
@@ -100,7 +100,7 @@ try {
   $installerInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($installer.FullName)
   if ($installerInfo.ProductName -ne 'Nook Personal Edition' -or
       $installerInfo.FileDescription -ne 'Nook Personal Edition' -or
-      $installerInfo.ProductVersion -notlike '0.1.0*' -or
+      $installerInfo.ProductVersion -notlike '0.2.0*' -or
       $installerInfo.LegalCopyright -notlike '*Zubair Bin Shaukat and contributors*') {
     throw "Installer metadata mismatch: Product='$($installerInfo.ProductName)', Description='$($installerInfo.FileDescription)', Version='$($installerInfo.ProductVersion)'"
   }
@@ -116,7 +116,7 @@ try {
 
   $output = Join-Path $windowsRoot 'standalone-release\installer'
   $null = [IO.Directory]::CreateDirectory($output)
-  $destination = Join-Path $output 'Nook-Personal-Edition-0.1.0-setup.exe'
+  $destination = Join-Path $output 'Nook-Personal-Edition-0.2.0-setup.exe'
   [IO.File]::Copy($installer.FullName, $destination, $true)
   $sourceHash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash
   $outputHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash

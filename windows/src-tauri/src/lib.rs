@@ -67,7 +67,7 @@ const STANDALONE_IDENTIFIER: &str = "io.github.valenticus.nook";
 /// Original app; the separate Standalone product has its own release cadence.
 pub fn app_version() -> &'static str {
     if cfg!(feature = "nook-standalone") {
-        "0.1.0"
+        "0.2.0"
     } else {
         env!("CARGO_PKG_VERSION")
     }
@@ -152,7 +152,7 @@ mod isolation_tests {
         assert_eq!(
             app_version(),
             if cfg!(feature = "nook-standalone") {
-                "0.1.0"
+                "0.2.0"
             } else {
                 "0.2.2"
             }

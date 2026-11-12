@@ -28,17 +28,18 @@ Monitor sessions, usage limits, permission requests and notifications from a lig
 
 - **See every session:** Claude Code and Codex activity, waiting requests, errors and finished turns in one island.
 - **Answer from the island:** review and answer supported permission requests; edits show a diff.
-- **Watch your limits:** Claude Code and Codex 5-hour and 7-day usage, rotating in the folded island.
+- **Watch your limits:** Claude Code and Codex 5-hour and 7-day usage in the folded island, refreshed through their local integrations.
 - **Stay local:** no account of its own; Connect previews every change and backs up files first.
 
-Nook Personal Edition 0.1.0 is a personal fork of [Nook](https://github.com/zubairbinshaukat/nook), created by **Zubair Bin Shaukat**. It has its own application identity and per-user data paths, so it can be installed separately from Original Nook. See the [0.1.0 release notes](RELEASE_NOTES-v0.1.0.md).
+Nook Personal Edition 0.2.0 is a personal fork of [Nook](https://github.com/zubairbinshaukat/nook), created by **Zubair Bin Shaukat**. It has its own application identity and per-user data paths, so it can be installed separately from Original Nook. See the [0.2.0 release notes](RELEASE_NOTES-v0.2.0.md).
 
 ## Features
 
-- **Claude Code and Codex sessions:** see activity, waiting requests, errors, and completed turns in the island.
+- **Claude Code integration:** connect Claude Code hooks and its status line to see sessions, permission requests, completion, errors, and 5-hour/7-day usage.
+- **Codex integration:** opt in to local Codex hooks and the Codex App Server quota provider for sessions and 5-hour/7-day usage. Quotas update from real lifecycle events while Codex works; Nook does not poll quotas while Codex is idle.
 - **Permission requests:** review and answer supported requests from Nook. Codex may require a separate trust approval in Codex itself.
 - **Usage limits:** Claude Code 5-hour and 7-day limits through Claude's status line; Codex 5-hour and 7-day limits through the local Codex App Server provider. Codex quota access is opt-in in Settings.
-- **Compact quota indicators:** when both providers have usable data, the compact island rotates between Claude and Codex every five seconds. Missing values are not shown as zero.
+- **Contextual compact usage:** when one agent is active, its usable quotas stay selected. When both agents are active or neither is active, available Claude and Codex usage rotates every five seconds. Hover freezes the displayed provider. If only one provider has usable data, it stays selected.
 - **Idle clock and battery:** after five minutes without relevant activity, the compact island can show local time and available battery/charging status. Nook does not estimate time to full charge when Windows provides no reliable value.
 - **The Shelf:** six small widgets—To-do, Timer, Reminders, Media, Mirror and Projects—on a separate island tab. See [The Shelf](#the-shelf).
 - **Gullu, themes, and colors:** the animated companion and appearance options are available in Settings.
@@ -97,11 +98,11 @@ Nook does not require an account of its own. It does not provide Claude or Codex
 
 ## Install
 
-1. Download `Nook-Personal-Edition-0.1.0-setup.exe` and `SHA256SUMS.txt` from the [Nook Personal Edition releases](https://github.com/valenticus/nook/releases/latest).
+1. Download `Nook-Personal-Edition-0.2.0-setup.exe` and `SHA256SUMS.txt` from the [Nook Personal Edition releases](https://github.com/valenticus/nook/releases/latest).
 2. Verify the installer hash in PowerShell:
 
    ```powershell
-   Get-FileHash .\Nook-Personal-Edition-0.1.0-setup.exe -Algorithm SHA256
+   Get-FileHash .\Nook-Personal-Edition-0.2.0-setup.exe -Algorithm SHA256
    ```
 
    Compare the SHA-256 value with the installer entry in `SHA256SUMS.txt`.
@@ -116,8 +117,8 @@ Claude sessions and usage statistics are separate Connect options. Claude usage 
 Open **Settings → Connect**, choose Claude Code or Codex, review the preview and confirm only the changes you want. Nook backs up the files it changes and preserves third-party and unknown entries.
 
 - **Claude usage:** 5-hour and 7-day limits come through Claude Code's status line. A project or managed status-line setting may take precedence; Connect reports the conflict for review.
-- **Codex usage:** 5-hour and 7-day limits come from the local Codex App Server. This is opt-in in Settings.
-- **Compact island:** when both providers have usable data, it rotates between Claude and Codex every five seconds. Missing values are never shown as zero.
+- **Codex usage:** 5-hour and 7-day limits come from the local Codex App Server. This is opt-in in Settings. Real Codex turn events request updates; there is no idle quota polling.
+- **Compact island:** a sole active agent gets priority. Both-active and all-idle states rotate available providers every five seconds; hover freezes the displayed provider. Missing values are never shown as zero.
 - **Codex trust:** Codex may ask you to trust the newly detected hooks. Approve that in Codex itself; Nook does not bypass it.
 
 ## Settings and personalization
@@ -136,7 +137,7 @@ Gullu, the animated companion, themes and colors, English or Ukrainian (or follo
 
 ## Privacy and security
 
-Nook runs locally and connects to agent integrations through their supported hooks and local Codex App Server. Connect shows a preview and takes a backup before applying supported changes. Use **Settings → Connect** to connect or disconnect Nook; do not remove hook entries by hand. Codex usage access is optional.
+Nook runs locally and connects to agent integrations through their supported hooks and local Codex App Server. Connect shows a preview and takes a backup before applying supported changes. Use **Settings → Connect** to connect or disconnect Nook; do not remove hook entries by hand. Codex usage access is optional. Claude status-line data and Codex quota reads are processed locally; Nook does not send usage data to a Nook service.
 
 ### Windows security notice
 

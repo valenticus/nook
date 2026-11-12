@@ -430,7 +430,7 @@ mod isolation_tests {
         assert_eq!(production["productName"], "Nook");
         assert_eq!(production["identifier"], "io.github.zubairbinshaukat.nook");
         assert_eq!(standalone["productName"], "Nook Personal Edition");
-        assert_eq!(standalone["version"], "0.1.0");
+        assert_eq!(standalone["version"], "0.2.0");
         assert_eq!(standalone["identifier"], "io.github.valenticus.nook");
         assert_eq!(standalone["mainBinaryName"], "nook-standalone");
         assert_ne!(standalone["identifier"], "io.github.zubairbinshaukat.nook");

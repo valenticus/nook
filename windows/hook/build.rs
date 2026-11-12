@@ -86,8 +86,8 @@ fn version_info() {
     );
     res.set("OriginalFilename", filename);
     if standalone {
-        res.set("FileVersion", "0.1.0");
-        res.set("ProductVersion", "0.1.0");
+        res.set("FileVersion", "0.2.0");
+        res.set("ProductVersion", "0.2.0");
     }
     if let Err(err) = res.compile() {
         println!("cargo:warning=nook-hook: no version information ({err})");

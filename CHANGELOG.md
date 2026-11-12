@@ -4,6 +4,14 @@ This changelog has two clearly separated histories. The Personal Edition entry i
 
 ## Nook Personal Edition
 
+### 0.2.0
+
+- Codex quota snapshots refresh from real Codex lifecycle events while a turn is active, with a shared three-minute scheduler, final refreshes, failure suppression and no idle polling.
+- Compact usage now follows active Claude/Codex sessions. A sole active agent stays selected; when both agents are active or idle, available usage rotates every five seconds. Hover freezes the shown provider.
+- Quiet sessions automatically leave active-provider selection after ten minutes without lifecycle events, without triggering a quota fetch.
+- Improved Codex quota states for idle, stale, reset, disabled and unavailable snapshots.
+- Fixed event ordering, duplicate and delayed lifecycle handling across concurrent Codex sessions.
+
 ### 0.1.0
 
 - First standalone Nook Personal Edition release with its own application identity, executable, relay, and per-user data locations.
