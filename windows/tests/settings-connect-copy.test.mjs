@@ -94,7 +94,7 @@ test("Connect open only scans; delivery refresh comes from supported real relay 
   assert.match(rust, /original_migration_approved/);
   const pipe = await readFile(new URL("../src-tauri/src/pipe.rs", import.meta.url), "utf8");
   assert.match(pipe, /real_delivery\(&payload, &event\)/);
-  assert.match(pipe, /app\.emit\("connect-activity"/);
+  assert.match(pipe, /app\.emit\(\s*"connect-activity"/);
 });
 
 test("Connect previews replace per-agent content and reject stale requests", () => {
