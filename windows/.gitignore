@@ -3,6 +3,7 @@ dist/
 dist-dev/
 dist-standalone/
 target/
+target-*/
 target-nook-dev/
 /target-nook-standalone/
 /target-check-click/
